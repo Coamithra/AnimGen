@@ -1,0 +1,20 @@
+# virtual environment
+.venv/
+
+# runtime data (db, generated results, bin, exports, thumbnails, baked keyposes)
+data/
+
+# secrets - token comes from the environment or the source project's .env
+.env
+*.env
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# os / editor
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
