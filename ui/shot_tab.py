@@ -19,13 +19,14 @@ from PySide6.QtCore import QSize, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
-    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QInputDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+    QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 import library
+from backends import replicate_client
 from pipeline import framing
-from store import schema_cache
+from store import prompt_library, schema_cache
 from store.project import Project
 from ui.asset_picker import AssetPickerDialog
 from ui.placement_widget import PlacementCanvas, pil_to_pixmap
@@ -35,6 +36,7 @@ _PARAM_ORDER = ["duration", "resolution", "seed", "camera_fixed", "mode", "lengt
 _DEFAULT_PLACEMENT = {"scale": 0.65, "cx": 0.5, "cy": 0.6}
 _WAN_FPS = 16                                          # local Wan renders at a fixed 16 fps
 _OUTPUT_PARAMS = {"resolution", "duration", "length"}  # go in the output_form, not the Model settings group
+_NEG_UNSUPPORTED_MSG = "This model does not support negative prompting."
 
 
 class _KeyframeButton(QPushButton):
@@ -64,6 +66,7 @@ class ShotTab(QWidget):
         self._keyed_cache: dict = {}   # asset path -> keyed PIL sprite (thumb reuse)
         self._active = "start"
         self._dirty = False
+        self._neg_stash: Optional[str] = None  # real negative text, held while masked (unsupported model)
         self._suppress = True          # block dirty-marking while building/loading widgets
         self._build()
         if shot:
@@ -148,23 +151,25 @@ class ShotTab(QWidget):
         self.negative = QPlainTextEdit(); self.negative.setPlaceholderText("Negative prompt…")
         self.negative.textChanged.connect(self._mark_dirty)
         self.negative.setPlainText(library.default_negative_prompt())
+        self.negative_label = QLabel("Negative")
         prompt_box = QGroupBox("Prompt")
         pv = QVBoxLayout(prompt_box)
+        pv.addLayout(self._build_template_row())
         pv.addWidget(QLabel("Positive")); pv.addWidget(self.prompt)
-        pv.addWidget(QLabel("Negative")); pv.addWidget(self.negative)
+        pv.addWidget(self.negative_label); pv.addWidget(self.negative)
 
-        self.params_box = QGroupBox("Model settings")
-        self.params_form = QFormLayout(self.params_box)
+        self.params_form = QFormLayout()
 
-        # Output tab: resolution + duration (model-aware) + the Model settings group +
-        # read-only fps and est. price.
+        # Settings tab: resolution + duration (model-aware), then the remaining model params,
+        # then read-only fps and est. price. The whole tab is the model's settings, so the
+        # two form sections flow together with no inner group-box label.
         self.output_form = QFormLayout()
         self.fps_value = QLabel("—"); self.fps_value.setStyleSheet("color: gray;")
         self.price_value = QLabel("—"); self.price_value.setStyleSheet("font-weight: bold;")
         output_tab = QWidget()
         ov = QVBoxLayout(output_tab)
         ov.addLayout(self.output_form)
-        ov.addWidget(self.params_box)
+        ov.addLayout(self.params_form)
         fps_line = QHBoxLayout()
         fps_line.addWidget(QLabel("Output FPS")); fps_line.addWidget(self.fps_value, 1)
         ov.addLayout(fps_line)
@@ -174,7 +179,7 @@ class ShotTab(QWidget):
 
         tabs = QTabWidget()
         tabs.addTab(self.canvas, "Framing")
-        tabs.addTab(output_tab, "Output")
+        tabs.addTab(output_tab, "Settings")
         prompt_tab = QWidget()
         sv = QVBoxLayout(prompt_tab)
         sv.addWidget(prompt_box)
@@ -182,6 +187,11 @@ class ShotTab(QWidget):
 
         self._takes_host = QWidget()
         self._takes_layout = QVBoxLayout(self._takes_host)
+        # The Export-takes (whole-shot) action lives here, in the Takes subtab, beside the
+        # takes grid - not in the always-visible bottom row.
+        self.export_btn = QPushButton("Export takes"); self.export_btn.clicked.connect(self._export)
+        takes_head = QHBoxLayout(); takes_head.addStretch(1); takes_head.addWidget(self.export_btn)
+        self._takes_layout.addLayout(takes_head)
         self._takes_placeholder = QLabel("Save the shot, then Generate to create takes.")
         self._takes_placeholder.setStyleSheet("color: gray;")
         self._takes_layout.addWidget(self._takes_placeholder); self._takes_layout.addStretch(1)
@@ -189,10 +199,9 @@ class ShotTab(QWidget):
 
         self.save_btn = QPushButton("Save"); self.save_btn.clicked.connect(self._save)
         self.gen_btn = QPushButton("Generate"); self.gen_btn.clicked.connect(self._generate)
-        self.export_btn = QPushButton("Export takes"); self.export_btn.clicked.connect(self._export)
         self.status_lbl = QLabel(""); self.status_lbl.setStyleSheet("color: gray;")
         btn_row = QHBoxLayout()
-        for b in (self.save_btn, self.gen_btn, self.export_btn):
+        for b in (self.save_btn, self.gen_btn):
             btn_row.addWidget(b)
         btn_row.addWidget(self.status_lbl); btn_row.addStretch(1)
 
@@ -248,6 +257,65 @@ class ShotTab(QWidget):
         card = QWidget(); card.setLayout(box)
         return card
 
+    # ---- prompt templates ----------------------------------------------
+    def _build_template_row(self) -> QHBoxLayout:
+        """Apply/save/delete row for the app-global prompt prefab library."""
+        self.template_combo = QComboBox()
+        self.template_combo.setToolTip("Reusable prompt prefabs, shared across all projects")
+        apply_btn = QPushButton("Apply"); apply_btn.clicked.connect(self._apply_template)
+        save_btn = QPushButton("Save as…"); save_btn.clicked.connect(self._save_template)
+        del_btn = QPushButton("Delete"); del_btn.clicked.connect(self._delete_template)
+        row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel("Template")); row.addWidget(self.template_combo, 1)
+        for b in (apply_btn, save_btn, del_btn):
+            row.addWidget(b)
+        self._reload_templates()
+        return row
+
+    def _reload_templates(self, select: Optional[str] = None) -> None:
+        self.template_combo.blockSignals(True)
+        self.template_combo.clear()
+        for t in prompt_library.all_templates():
+            self.template_combo.addItem(t["name"], t)
+        if select is not None:
+            i = self.template_combo.findText(select)
+            if i >= 0:
+                self.template_combo.setCurrentIndex(i)
+        self.template_combo.blockSignals(False)
+
+    def _apply_template(self) -> None:
+        t = self.template_combo.currentData()
+        if not t:
+            return
+        self.prompt.setPlainText(t["positive"])
+        self.negative.setPlainText(t["negative"])
+
+    def _save_template(self) -> None:
+        suggested = self.template_combo.currentText()
+        name, ok = QInputDialog.getText(self, "Save prompt template",
+                                        "Template name:", text=suggested)
+        name = name.strip()
+        if not (ok and name):
+            return
+        if prompt_library.get(name) is not None:
+            if QMessageBox.question(self, "Overwrite template?",
+                                    f"A template named “{name}” already exists. Overwrite it?"
+                                    ) != QMessageBox.StandardButton.Yes:
+                return
+        prompt_library.save(name, self.prompt.toPlainText(), self.negative.toPlainText())
+        self._reload_templates(select=name)
+
+    def _delete_template(self) -> None:
+        name = self.template_combo.currentText()
+        if not name:
+            return
+        if QMessageBox.question(self, "Delete template?",
+                                f"Delete the prompt template “{name}”?"
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+        prompt_library.delete(name)
+        self._reload_templates()
+
     def _update_action_state(self) -> None:
         self.export_btn.setEnabled(self.shot is not None)
 
@@ -256,7 +324,7 @@ class ShotTab(QWidget):
             self._takes_placeholder.hide()
             self._takes_view = TakesView(self.project, self.shot.id)
             self._takes_view.export_requested.connect(self.export_requested)
-            self._takes_layout.insertWidget(0, self._takes_view, 1)
+            self._takes_layout.insertWidget(1, self._takes_view, 1)
 
     def refresh_takes(self) -> None:
         if self._takes_view is not None:
@@ -418,9 +486,61 @@ class ShotTab(QWidget):
         return library.get_model(self.model_combo.currentData())
 
     def _on_model_changed(self) -> None:
-        self.negative.setPlainText(self.negative.toPlainText() or library.default_negative_prompt())
-        self._rebuild_params()
+        self._rebuild_params()        # re-reads the schema -> re-masks the negative box
         self._populate_aspects()      # offer this model's aspects; flag if current is invalid
+
+    # ---- negative prompt (schema-gated) ---------------------------------
+    def _negative_value(self) -> str:
+        """The logical negative prompt, whether or not it's currently masked/hidden."""
+        return self._neg_stash if self._neg_stash is not None else self.negative.toPlainText()
+
+    def _set_negative_text(self, text: str) -> None:
+        """Set the box text programmatically (no dirty mark)."""
+        self.negative.blockSignals(True)
+        self.negative.setPlainText(text)
+        self.negative.blockSignals(False)
+
+    def _set_negative(self, text: str) -> None:
+        """Write the logical negative value, respecting the masked state (no dirty mark)."""
+        if self._neg_stash is not None:
+            self._neg_stash = text
+        else:
+            self._set_negative_text(text)
+
+    def _negative_supported(self) -> Optional[bool]:
+        """Does the current model accept a negative prompt? True/False, or None when the
+        Replicate schema hasn't been fetched yet (so we can't tell — leave it editable).
+
+        Authoritative source is the live input schema (mirrors replicate_client._pick_field
+        over ALIASES["negative"]); local models declare it via comfy_nodes.negative."""
+        model = self._current_model()
+        if not model:
+            return None
+        if model.get("backend") == "comfyui":
+            return bool((model.get("comfy_nodes") or {}).get("negative"))
+        if self._schema is None:           # never fetched -> unknown
+            return None
+        return any(name in self._schema for name in replicate_client.ALIASES["negative"])
+
+    def _refresh_negative_state(self) -> None:
+        """Grey out + disable the Negative box for models that ignore it, replacing the text
+        with an explanatory placeholder. The real text is stashed and restored when a model
+        that does support negatives is selected again (so it's never silently lost)."""
+        supported = self._negative_supported()
+        enabled = supported is not False     # True or unknown -> editable
+        if enabled:
+            if self._neg_stash is not None:          # leaving masked state -> restore text
+                self._set_negative_text(self._neg_stash)
+                self._neg_stash = None
+            self.negative.setPlaceholderText("Negative prompt…")
+        else:
+            if self._neg_stash is None:              # entering masked state -> stash + clear
+                self._neg_stash = self.negative.toPlainText()
+                self._set_negative_text("")
+            self.negative.setPlaceholderText(_NEG_UNSUPPORTED_MSG)
+        self.negative.setEnabled(enabled)
+        self.negative_label.setStyleSheet("" if enabled else "color: gray;")
+        self.negative.setToolTip("" if enabled else _NEG_UNSUPPORTED_MSG)
 
     def _rebuild_params(self, values: Optional[dict] = None) -> None:
         for form in (self.params_form, self.output_form):
@@ -439,7 +559,7 @@ class ShotTab(QWidget):
         if values:
             merged.update(values)
         merged.pop("aspect_ratio", None)   # owned by the Aspect dropdown, not the form
-        # Output tab gets resolution + duration/length; the rest stay in Model settings.
+        # Settings tab: resolution + duration/length lead (output_form); the rest follow.
         for name, label in (("resolution", "Resolution"), ("duration", "Duration"),
                             ("length", "Duration")):
             if name in merged:
@@ -455,6 +575,7 @@ class ShotTab(QWidget):
             self._param_getters[name] = getter
             self._wire_dirty(widget)
         self._refresh_price()
+        self._refresh_negative_state()
 
     def _refresh_fps_label(self) -> None:
         if self._is_local():
@@ -484,7 +605,7 @@ class ShotTab(QWidget):
             self.price_value.setText(f"~ ${cost:.2f}")
 
     def _make_output_widget(self, name, value, model):
-        """Resolution / duration / length widgets for the Output tab. Hosted duration is
+        """Resolution / duration / length widgets for the Settings tab. Hosted duration is
         seconds (enum dropdown if the model has fixed options, else a bounded spin); local
         'length' is a 4n+1 frame count with a seconds hint."""
         schema_prop = (self._schema or {}).get(name, {})
@@ -536,6 +657,8 @@ class ShotTab(QWidget):
     def _make_param_widget(self, name, value, model):
         schema_prop = (self._schema or {}).get(name, {})
         enum = schema_prop.get("enum")
+        if name == "seed":
+            return self._make_seed_widget(value)
         if name == "resolution" and (enum or model.get("resolution_options")):
             opts = enum or model["resolution_options"]
             w = QComboBox(); w.addItems([str(o) for o in opts])
@@ -561,8 +684,6 @@ class ShotTab(QWidget):
             w = QSpinBox(); w.setRange(-2147483648, 2147483647)
             if name == "duration" and model.get("duration_range"):
                 lo, hi = model["duration_range"]; w.setRange(int(lo), int(hi))
-            elif name == "seed":
-                w.setRange(0, 2147483647)
             w.setValue(value)
             return w, lambda: w.value()
         if isinstance(value, float):
@@ -570,6 +691,24 @@ class ShotTab(QWidget):
             return w, lambda: w.value()
         w = QLineEdit(str(value))
         return w, lambda: w.text()
+
+    def _make_seed_widget(self, value):
+        """Seed entry with a 'Random' toggle. Checked -> the shot stores SEED_RANDOM and
+        every generated take (including future batch members) gets a fresh random seed;
+        unchecked -> the fixed spin value. The concrete per-take seed is resolved at launch
+        (library.resolve_seed) and recorded on the take, so a good result stays reproducible."""
+        random_on = value == library.SEED_RANDOM
+        spin = QSpinBox(); spin.setRange(0, 2147483647)
+        spin.setValue(0 if random_on else int(value))
+        chk = QCheckBox("Random")
+        chk.setToolTip("Use a new random seed for every generation (each take in a batch differs)")
+        chk.setChecked(random_on)
+        spin.setEnabled(not random_on)
+        chk.toggled.connect(spin.setDisabled)
+        row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(spin, 1); row.addWidget(chk)
+        host = QWidget(); host.setLayout(row)
+        return host, lambda: library.SEED_RANDOM if chk.isChecked() else spin.value()
 
     def _params(self) -> dict:
         return {name: getter() for name, getter in self._param_getters.items()}

@@ -85,6 +85,25 @@ def test_schema_cache() -> None:
     print("schema_cache OK: put/get/entry round-trip, missing-key tolerant")
 
 
+def test_prompt_library() -> None:
+    """Round-trip the app-global prompt-template store (seed + save/get/delete)."""
+    from store import prompt_library
+
+    paths.PROMPT_TEMPLATES = Path(tempfile.mkdtemp()) / "prompt_templates.json"
+    names = [t["name"] for t in prompt_library.all_templates()]   # missing file -> seeds
+    assert "Camera-locked action" in names, f"expected seeded templates, got {names}"
+    prompt_library.save("My move", "spinning kick", "blurry")
+    got = prompt_library.get("My move")
+    assert got and got["positive"] == "spinning kick" and got["negative"] == "blurry"
+    prompt_library.save("My move", "updated", "")                 # save is upsert by name
+    assert prompt_library.get("My move")["positive"] == "updated"
+    assert sum(t["name"] == "My move" for t in prompt_library.all_templates()) == 1
+    assert prompt_library.delete("My move") is True
+    assert prompt_library.get("My move") is None
+    assert prompt_library.delete("My move") is False             # already gone
+    print("prompt_library OK: seeds, upsert-by-name, get/delete round-trip")
+
+
 def test_library_window() -> None:
     from PySide6.QtWidgets import QApplication, QPushButton, QTableWidget
 
@@ -108,5 +127,6 @@ def test_library_window() -> None:
 if __name__ == "__main__":
     test_seed()
     test_schema_cache()
+    test_prompt_library()
     test_library_window()
     print("PHASE 6 SMOKE: PASS")

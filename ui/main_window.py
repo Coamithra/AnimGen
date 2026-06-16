@@ -449,6 +449,11 @@ class MainWindow(QMainWindow):
             self._log("generation cancelled (project not saved)")
             return
 
+        # A 'random' shot rolls a fresh concrete seed per take (so a batch varies); record
+        # it on the take/snapshot for reproducibility. A fixed seed passes through unchanged.
+        if settings.get("seed") == library.SEED_RANDOM:
+            settings = {**settings, "seed": library.resolve_seed(library.SEED_RANDOM)}
+
         snapshot = {
             "model_id": shot.model_id, "backend": model["backend"],
             "replicate_model_id": model.get("replicate_model_id"),

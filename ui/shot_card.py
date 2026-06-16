@@ -110,7 +110,7 @@ class ShotCard(QFrame):
         dur = shot.settings.get("duration")
         res = shot.settings.get("resolution")
         summary = "  ".join(s for s in (
-            f"seed {seed}" if seed is not None else "",
+            f"seed {library.seed_label(seed)}" if seed is not None else "",
             f"{dur}s" if dur else "",
             str(res) if res else "") if s)
 

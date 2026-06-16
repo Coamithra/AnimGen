@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QLabel, QPlainTextEdit, QVBoxLayout,
 )
 
+import library
+
 # An "item" is a dict: {name, model_display, backend, est_cost (float|None), params}.
 
 
@@ -36,7 +38,8 @@ def build_summary(items: list[dict]) -> tuple[str, float, bool]:
             total += c
         params = it.get("params") or {}
         psum = ", ".join(
-            f"{k}={params[k]}" for k in ("duration", "resolution", "seed", "aspect_ratio")
+            f"{k}={library.seed_label(params[k]) if k == 'seed' else params[k]}"
+            for k in ("duration", "resolution", "seed", "aspect_ratio")
             if k in params
         )
         lines.append(

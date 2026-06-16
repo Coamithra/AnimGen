@@ -23,6 +23,7 @@ import paths  # noqa: E402
 
 paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
 
+import library  # noqa: E402
 from pipeline import framing  # noqa: E402
 from store.project import Project  # noqa: E402
 
@@ -147,7 +148,8 @@ def test_shot_tab() -> None:
     assert aspects == ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"], aspects
     assert ed.aspect_valid()
     assert "aspect_ratio" not in ed._params()    # owned by the Aspect dropdown now
-    assert ed._params()["resolution"] == "720p" and ed._params()["seed"] == 7
+    assert ed._params()["resolution"] == "720p"
+    assert ed._params()["seed"] == library.SEED_RANDOM, "new shots default to a random seed"
 
     ed._set_asset("start", asset); ed._select("start")
     ed.aspect_combo.setCurrentText("16:9")
@@ -195,6 +197,49 @@ def test_shot_tab() -> None:
     print("ShotTab OK: aspect dropdown, asset pick, save/load, dirty *, copy start->end")
 
 
+def test_negative_and_templates() -> None:
+    """Negative box is greyed for models whose schema lacks negative_prompt (left editable
+    when the schema's unknown); the prompt-template combo applies a prefab into both boxes."""
+    from PySide6.QtWidgets import QApplication
+
+    from store import prompt_library, schema_cache
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    # Self-contained schema cache: Seedance lacks negative_prompt, Veo has it; Wan local is
+    # declared via comfy_nodes (no schema needed); leave one Replicate model uncached.
+    paths.SCHEMA_CACHE = Path(tempfile.mkdtemp()) / "schema_cache.json"
+    paths.PROMPT_TEMPLATES = Path(tempfile.mkdtemp()) / "prompt_templates.json"
+    schema_cache.put(library.get_model("seedance-2.0-std")["replicate_model_id"],
+                     {"prompt": {"type": "string"}, "duration": {"type": "integer"}})
+    schema_cache.put(library.get_model("veo-3.1-fast")["replicate_model_id"],
+                     {"prompt": {"type": "string"}, "negative_prompt": {"type": "string"}})
+
+    project = Project.new()
+    ed = ShotTab(project)
+
+    def neg_enabled(model_id: str) -> bool:
+        ed.model_combo.setCurrentIndex(ed.model_combo.findData(model_id))
+        return ed.negative.isEnabled()
+
+    assert neg_enabled("seedance-2.0-std") is False, "Seedance ignores negatives -> greyed"
+    assert neg_enabled("veo-3.1-fast") is True, "Veo accepts a negative prompt"
+    assert neg_enabled("local-flf-wan14b") is True, "local Wan declares a negative node"
+    assert ed._negative_supported() is True
+    # An uncached Replicate model is unknown -> stay editable rather than hide the feature.
+    ed.model_combo.setCurrentIndex(ed.model_combo.findData("wan-2.7-i2v"))
+    assert ed._negative_supported() is None and ed.negative.isEnabled()
+
+    # Template combo: seeded prefabs present; Apply replaces both prompt boxes.
+    names = [ed.template_combo.itemText(i) for i in range(ed.template_combo.count())]
+    assert "Camera-locked action" in names, names
+    prompt_library.save("Probe", "POS-PROBE", "NEG-PROBE")
+    ed._reload_templates(select="Probe")
+    ed._apply_template()
+    assert ed.prompt.toPlainText() == "POS-PROBE" and ed.negative.toPlainText() == "NEG-PROBE"
+    print("ShotTab OK: negative greyed per-schema, prompt templates apply into both boxes")
+
+
 def test_render_keyposes() -> None:
     tmp = Path(tempfile.mkdtemp())
     src = tmp / "char.png"
@@ -222,5 +267,6 @@ if __name__ == "__main__":
     test_framing()
     test_placement_canvas()
     test_shot_tab()
+    test_negative_and_templates()
     test_render_keyposes()
     print("PHASE 3 SMOKE: PASS")
