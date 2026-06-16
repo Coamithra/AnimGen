@@ -126,17 +126,20 @@ def test_shot_tab() -> None:
     assert ed2.name.text() == "kick_heavy" and ed2._assets["start"] == asset
     assert ed2.selected_aspect() == "16:9"
 
-    # Copy Start -> End: disabled with no start, mirrors asset + placement once set
+    # Copy Start -> End: disabled with no start; copies the LIVE start framing (driven
+    # through the canvas, start active) + the asset onto the end slot, without aliasing.
     ed3 = ShotTab(project)
     assert not ed3.copy_se_btn.isEnabled(), "copy disabled until a start frame exists"
-    ed3._set_asset("start", asset)
+    ed3._set_asset("start", asset); ed3._select("start")   # start active, like the UI
     assert ed3.copy_se_btn.isEnabled()
-    ed3._frames["start"] = {"scale": 0.42, "cx": 0.3, "cy": 0.7}
-    ed3._select("end")   # end active: the live-capture path won't clobber the start frame
+    ed3.canvas.set_placement({"scale": 0.42, "cx": 0.3, "cy": 0.7})  # frame on the canvas
     ed3._copy_start_to_end()
     assert ed3._assets["end"] == asset, "end frame should mirror start asset"
-    assert ed3._frames["end"] == {"scale": 0.42, "cx": 0.3, "cy": 0.7}
+    assert ed3._frames["end"] == ed3._frames["start"], "end must equal the captured start frame"
     assert ed3._frames["end"] is not ed3._frames["start"], "must copy, not alias"
+    got = ed3._frames["end"]                                # captured live off the canvas
+    assert abs(got["scale"] - 0.42) < 0.05 and abs(got["cx"] - 0.3) < 0.05 \
+        and abs(got["cy"] - 0.7) < 0.05, got
     print("ShotTab OK: per-model aspect dropdown + validation, asset pick, save/load, copy start->end")
 
 

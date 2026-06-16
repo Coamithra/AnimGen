@@ -293,8 +293,8 @@ class ShotTab(QWidget):
         """Mirror the start keyframe (image + placement) onto the end slot."""
         if not self._assets["start"]:
             return
-        if self._active in ("start", "end"):
-            self._frames[self._active] = self.canvas.get_placement()  # capture live edits
+        if self._active == "start":
+            self._frames["start"] = self.canvas.get_placement()  # flush live start edits
         self._set_asset("end", self._assets["start"])
         self._frames["end"] = dict(self._frames["start"])
         if self._active == "end":
