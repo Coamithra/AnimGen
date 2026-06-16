@@ -79,6 +79,39 @@ def test_placement_canvas() -> None:
         and abs(got["cy"] - 0.6) < 0.03, got
     print("PlacementCanvas OK: aspect + keyed sprite + placement round-trip")
 
+    # --- editable numeric readout (precise-control entry) ----------------
+    edits = []
+    pc.changed.connect(lambda: edits.append(1))
+
+    # Editing a percentage drives the uniform sprite scale; center stays put.
+    # (get_placement returns the canvas-normalized scale, not the native %.)
+    before = pc.get_placement()
+    pc.w_pct_box.setValue(80)
+    after = pc.get_placement()
+    assert abs(pc.w_pct_box.value() - 80) < 1, pc.w_pct_box.value()       # round-trips
+    assert abs(pc.h_pct_box.value() - 80) < 1, pc.h_pct_box.value()       # H% linked to W%
+    assert abs(after["scale"] - before["scale"]) > 0.05, (before, after)  # scale actually changed
+    assert abs(after["cx"] - before["cx"]) < 0.01 \
+        and abs(after["cy"] - before["cy"]) < 0.01, (before, after)       # anchored about center
+    # W px box and W% box agree (W px == that % of the keyed-sprite native width).
+    nw = pc._native.width()
+    assert abs(pc.w_box.value() / nw * 100 - pc.w_pct_box.value()) < 1, \
+        (pc.w_box.value(), nw, pc.w_pct_box.value())
+
+    # Editing X/Y position moves the sprite (larger px -> center further right/down).
+    pc.x_box.setValue(100); pc.y_box.setValue(100)
+    near = pc.get_placement()
+    pc.x_box.setValue(300); pc.y_box.setValue(300)
+    far = pc.get_placement()
+    assert far["cx"] > near["cx"] and far["cy"] > near["cy"], (near, far)
+
+    assert edits, "numeric edits must emit changed (marks the shot dirty)"
+    # Programmatic refresh must not feed back into another edit (no runaway loop).
+    pre = len(edits)
+    pc.set_placement({"scale": 0.5, "cx": 0.4, "cy": 0.6})
+    assert len(edits) == pre, "set_placement readback should not emit changed"
+    print("PlacementCanvas OK: editable position/size/percentage fields drive placement")
+
 
 def test_shot_tab() -> None:
     from PySide6.QtWidgets import QApplication
