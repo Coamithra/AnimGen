@@ -49,6 +49,20 @@ def build_summary(items: list[dict]) -> tuple[str, float, bool]:
     return header + "\n\n" + "\n".join(lines), total, has_spend
 
 
+def total_price_text(costs: list[Optional[float]]) -> str:
+    """Shots-view label: full-set generation cost summed over per-shot estimates.
+
+    None costs (model declares no rate / unknown model) are tallied separately as
+    '(+N unknown)' rather than silently dropped; local $0 shots contribute nothing.
+    """
+    total = sum(c for c in costs if c is not None)   # known costs; local $0 adds nothing
+    unknown = sum(1 for c in costs if c is None)
+    text = f"Full set: ${total:.2f}"
+    if unknown:
+        text += f"  (+{unknown} unknown)"
+    return text
+
+
 def confirm_launch(parent, items: list[dict]) -> bool:
     body, total, has_spend = build_summary(items)
     dlg = QDialog(parent)
