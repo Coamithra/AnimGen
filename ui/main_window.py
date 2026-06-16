@@ -178,13 +178,19 @@ class MainWindow(QMainWindow):
         star = "*" if self._has_unsaved_changes() else ""
         self.setWindowTitle(f"{self.project.name}{star} - Animation Generator")
 
-    def _has_unsaved_changes(self) -> bool:
-        """Project dirty marker: it's never been saved (untitled), has buffered authoring
-        edits, or any open shot tab has uncommitted editor edits."""
-        if self.project.dirty or self.project.is_untitled:
+    def _has_unsaved_edits(self) -> bool:
+        """Real unsaved edits a discard would lose: buffered authoring edits or an open
+        shot tab with uncommitted editor edits. (A pristine untitled project has nothing
+        to lose, so it doesn't arm the save-prompt — see _has_unsaved_changes.)"""
+        if self.project.dirty:
             return True
         return any(isinstance(w, ShotTab) and w.is_dirty()
                    for w in (self.tabs.widget(i) for i in range(self.tabs.count())))
+
+    def _has_unsaved_changes(self) -> bool:
+        """Whether the window title shows the dirty marker: real unsaved edits, or the
+        project has never been saved at all (untitled)."""
+        return self.project.is_untitled or self._has_unsaved_edits()
 
     def _on_shot_dirty_changed(self, tab: ShotTab) -> None:
         idx = self.tabs.indexOf(tab)
@@ -205,8 +211,9 @@ class MainWindow(QMainWindow):
         self.reload()
 
     def _maybe_save_changes(self) -> bool:
-        """Prompt before discarding unsaved authoring edits. Return False to abort."""
-        if not self.project.dirty:
+        """Prompt before discarding unsaved authoring edits. Return False to abort. Covers
+        uncommitted shot-tab edits too (Save flushes them via _commit_open_shot_tabs)."""
+        if not self._has_unsaved_edits():
             return True
         choice = QMessageBox.question(
             self, "Unsaved changes",

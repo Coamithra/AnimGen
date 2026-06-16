@@ -113,6 +113,13 @@ def test_window_builds() -> None:
     tab.prompt.setPlainText("edited")
     assert tab.is_dirty() and w2.tabs.tabText(idx) == "kick*", "editing flags the tab text"
     assert w2._has_unsaved_changes() and "*" in w2.windowTitle(), "title reflects the dirty tab"
+    # The discard/close guard must see the uncommitted tab edit, and Save must flush it
+    # (otherwise the title advertises unsaved work the discard path would silently drop).
+    assert w2._has_unsaved_edits(), "an uncommitted tab edit arms the save-prompt"
+    assert w2.save_project(), "Save (titled project -> no dialog) succeeds"
+    assert w2.project.get_shot(s2.id).prompt == "edited", "Save flushed the open tab"
+    assert not tab.is_dirty() and w2.tabs.tabText(idx) == "kick", "saving clears the marker"
+    assert not w2._has_unsaved_edits() and "*" not in w2.windowTitle()
     print("MainWindow OK: builds with export wiring, row ids gathered, dirty * propagates")
 
 

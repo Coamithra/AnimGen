@@ -93,8 +93,10 @@ class ShotTab(QWidget):
 
     def _wire_dirty(self, widget: QWidget) -> None:
         """Mark this tab dirty whenever a built editor widget changes. Param/output rows
-        are sometimes a container host (e.g. the length spin + hint), so fall back to its
-        concrete child editors."""
+        are sometimes a container host (today only the length spin + hint), so fall back to
+        its concrete child editors. QLineEdit is intentionally absent from the descend set:
+        no container hosts a free-text field, and including it would also match the private
+        line edit inside a QSpinBox. Top-level QLineEdit rows are still handled by _wire_one."""
         if not self._wire_one(widget):
             for cls in (QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox):
                 for child in widget.findChildren(cls):
@@ -326,10 +328,12 @@ class ShotTab(QWidget):
             self._mark_dirty()
 
     def _clear(self, which: str) -> None:
+        had_asset = self._assets[which] is not None
         self._set_asset(which, None)
         if self._active == which:
             self.canvas.set_sprite(None)
-        self._mark_dirty()
+        if had_asset:                  # clearing an already-empty slot isn't an edit
+            self._mark_dirty()
 
     def _set_asset(self, which: str, path: Optional[str]) -> None:
         self._assets[which] = path or None
