@@ -134,7 +134,7 @@ class ModelLibraryWindow(QWidget):
         self.fetch_btn = QPushButton("Fetch live schemas")
         self.fetch_btn.setToolTip("Fetch every Replicate model's current input schema and cache "
                                   "it for the shot editor (no spend - schema read only).")
-        self.fetch_btn.clicked.connect(self._fetch_all)
+        self.fetch_btn.clicked.connect(self.start_schema_fetch)
         self.status = QLabel("")
         self.status.setStyleSheet("color: gray;")
         actions = QHBoxLayout()
@@ -147,6 +147,11 @@ class ModelLibraryWindow(QWidget):
         lay.addWidget(self.table)
 
     # ---- live-schema fetch ----------------------------------------------
+    def start_schema_fetch(self) -> None:
+        """Public entry to kick off the off-thread schema fetch — used both by the
+        Fetch button and by MainWindow's 'update model data on startup' setting."""
+        self._fetch_all()
+
     def _fetch_all(self) -> None:
         rids = list(self._row_by_rid)
         if not rids:

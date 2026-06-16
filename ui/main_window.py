@@ -29,6 +29,7 @@ import paths
 from backends import comfy_client, replicate_client
 from backends.jobs import JobManager
 from pipeline import export, framing
+from store import app_settings
 from store.project import Project
 from store.models import STATUS_PENDING
 from ui.assets_view import AssetsView
@@ -61,6 +62,7 @@ class MainWindow(QMainWindow):
         self._build_body()
         self._build_menu()
         self.reload()
+        self._maybe_refresh_schemas_on_startup()
 
     # ---- construction ---------------------------------------------------
     def _build_controls(self) -> QToolBar:
@@ -135,6 +137,21 @@ class MainWindow(QMainWindow):
             act.triggered.connect(
                 lambda _checked=False, w=widget, t=name: self._show_fixed_tab(w, t))
             view_menu.addAction(act)
+
+        settings_menu = bar.addMenu("&Settings")
+        self.startup_fetch_act = QAction("Update Replicate model data on startup", self)
+        self.startup_fetch_act.setCheckable(True)
+        self.startup_fetch_act.setChecked(
+            app_settings.get_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP))
+        self.startup_fetch_act.toggled.connect(
+            lambda on: app_settings.set_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP, on))
+        settings_menu.addAction(self.startup_fetch_act)
+
+    def _maybe_refresh_schemas_on_startup(self) -> None:
+        """If the user opted in, kick off the off-thread Replicate schema fetch at launch
+        (reuses the Model Library tab's fetcher; no GUI block, no-ops without a token)."""
+        if app_settings.get_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP):
+            self.library_tab.start_schema_fetch()
 
     def _build_body(self) -> None:
         self.cards_container = QWidget()
