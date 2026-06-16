@@ -97,10 +97,11 @@ def test_prompt_library() -> None:
     # FLF transition, and a PD-unique move should all be present.
     for expected in ("Punch combo (light + heavy)", "Stand -> Crouch", "Dagger slash"):
         assert expected in names, f"missing curated seed {expected!r}; got {names}"
-    assert len(seeds) >= 25, f"expected the curated seed set, got only {len(seeds)}"
+    assert len(seeds) == 31, f"expected the 31-template curated seed set, got {len(seeds)}"
+    assert len(names) == len(set(names)), f"duplicate seed names: {names}"
     # Local templates carry the shared local style tail; hosted ones do not.
     crouch = prompt_library.get("Stand -> Crouch")
-    assert crouch and crouch["positive"].endswith("fighting game motion."), crouch
+    assert crouch and crouch["positive"].endswith(prompt_library._LOCAL_TAIL), crouch
     assert crouch["negative"] and "still image" in crouch["negative"], crouch
     prompt_library.save("My move", "spinning kick", "blurry")
     got = prompt_library.get("My move")
