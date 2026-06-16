@@ -8,9 +8,30 @@ backends/replicate_client.get_input_schema) so we don't duplicate every field he
 from __future__ import annotations
 
 import json
+import random
 from typing import Optional
 
 from paths import MODEL_LIBRARY_PATH
+
+# Sentinel stored in a shot's settings["seed"] meaning "pick a fresh random seed for
+# every generation" (so each take - and every member of a future batch - differs). The
+# concrete seed is resolved per-take at launch via resolve_seed() and recorded on the
+# take, keeping a good result reproducible.
+SEED_RANDOM = -1
+
+
+def resolve_seed(seed):
+    """The concrete seed to hand a backend for one take: a fresh random draw when the
+    shot is set to SEED_RANDOM, otherwise the fixed seed unchanged (None passes through
+    so the model picks its own)."""
+    if seed == SEED_RANDOM:
+        return random.randint(0, 2**31 - 1)
+    return seed
+
+
+def seed_label(seed) -> str:
+    """Human-readable seed for summaries/gates: 'random' for the sentinel, else the value."""
+    return "random" if seed == SEED_RANDOM else str(seed)
 
 
 def load_library() -> dict:

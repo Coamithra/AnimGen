@@ -66,12 +66,14 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 | `ui/main_window.py` | shot cards + global filters + Generate/Export + **Cancel pending** + a right-aligned **Full set** total-price label (`_refresh_total_price`: sums `estimate_cost` over *all* shots, ignoring the view filters; unknown-rate shots tallied as `(+N unknown)`) (in the Shots-tab control strip); **File** menu project lifecycle (**New/Open/Save/Save As** + **New Shot**) with dirty-marker title (`*` when the project is untitled, has buffered edits, or any open shot tab has uncommitted edits — `_has_unsaved_changes`) + save-prompt; **closable** tabbed central widget (Shots / Assets / Model Library / ComfyUI Status; reopen from **View**). Double-click a shot row (or **+ New Shot**) opens a shot tab; shot tabs tracked in `shot_tabs` |
 | `ui/comfy_monitor_window.py` | the **ComfyUI Status** tab: status/version, RAM+VRAM, queue, launch settings, installed models + **Launch ComfyUI**/Stop working/Shut down controls; `start_monitoring`/`stop_monitoring` poll only while the tab is visible (off-thread `_MonitorPoller` + `_AsyncCall` for stop/shutdown, same closed-port-timeout reason) |
 | `ui/shot_card.py` `ui/takes_view.py` | shot row (double-click opens its shot tab; Generate / Export) + inline takes folder grid |
-| `ui/shot_tab.py` | the **shot tab**: full editor + the shot's takes grid + Save/Generate/Export. Tab title shows a trailing `*` while the editor has uncommitted edits (`is_dirty`/`dirty_changed`; cleared on `commit()`, suppressed during load). Per-model **Aspect** dropdown (turns red + blocks Generate if invalid for the model); per-keyframe placement: left-click a keyframe to frame it, double-click to pick |
+| `ui/shot_tab.py` | the **shot tab**: full editor + the shot's takes grid + Save/Generate/Export. Tab title shows a trailing `*` while the editor has uncommitted edits (`is_dirty`/`dirty_changed`; cleared on `commit()`, suppressed during load). Per-model **Aspect** dropdown (turns red + blocks Generate if invalid for the model); per-keyframe placement: left-click a keyframe to frame it, double-click to pick. **Prompt** subtab: a **template** combo (Apply/Save as…/Delete, backed by `store/prompt_library.py`) above the positive/negative boxes; the **Negative** box is greyed + disabled for models whose live schema has no `negative_prompt` field (`_negative_supported`/`_refresh_negative_state` — left editable when the schema's unfetched, since the backend drops an unsupported negative anyway) |
 | `ui/placement_widget.py` | the framing canvas: drag a keyed sprite to position + corner-handle scale on the magenta aspect canvas, plus an **editable readout panel** (X/Y px, W/H px, W%/H% spin boxes) for precise numeric entry — all linked views of the placement; placement stored normalized `{scale,cx,cy}` |
 | `ui/asset_picker.py` | the visual keyframe picker dialog (thumbnail grid + Import) |
 | `ui/assets_view.py` | the **Assets** tab: drag-drop / Import keyframe images into `.assets/`; thumbnail grid + delete |
 | `ui/cost_confirm.py` | the launch gate |
-| `ui/model_library_window.py` | the **Model Library** tab: read-only model roster |
+| `ui/model_library_window.py` | the **Model Library** tab: read-only model roster + a **Fetch live schemas** button (off-thread `_SchemaFetcher`) that pulls every Replicate model's input schema into `store/schema_cache.py`; a **Schema** column shows the cached field count per model |
+| `store/schema_cache.py` | persistent cache of Replicate input schemas (`data/schema_cache.json`, keyed by `replicate_model_id`); lock-guarded, atomic writes (reuses `store.project._atomic_write_json`). Populated by the Model Library tab; read by the shot editor for per-param enums/types **and to decide whether a model accepts a negative prompt** |
+| `store/prompt_library.py` | app-global library of reusable prompt prefabs (`data/prompt_templates.json`; entry = `{name, positive, negative}`, upsert-by-name). Same lock + atomic-write discipline as `schema_cache`; ships seed templates; read/written by the shot tab's Prompt subtab template combo |
 | `scripts/` | `seed_configs.py` (writes `Fighter.animproj`, imports keyframes as assets) + `smoke_phase*.py` + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) |
 | `data/` | runtime (gitignored): `*.animproj` project files (default `Fighter.animproj`) + their sidecar `<name>.assets/` (flat keyframe images + `takes/`, `thumbs/`, `.bin/`); plus `exports/`, `_scratch/` (untitled-project assets), `app_state.json` (last opened) |
 | `workflows/` | bundled ComfyUI templates for the local backend |
@@ -127,7 +129,10 @@ Setup if `.venv` is missing: `python -m venv .venv` then
    untitled-project scratch stays out of `data/`. `build_summary` / pure functions are
    split out for exactly this reason.
 5. **`model_library.json` is authored, not generated.** Replicate IDs/fields were
-   verified via live schema fetch; per-param schemas are fetched live in the editor.
+   verified via live schema fetch; per-param schemas are fetched live (Replicate) via the
+   **Model Library** tab's *Fetch live schemas* button, cached to `data/schema_cache.json`
+   (`store/schema_cache.py`, keyed by `replicate_model_id`), and read from there by the
+   shot editor — the editor no longer fetches per shot.
 6. **Windows/MINGW:** use `python` (not `python3`); set `PYTHONIOENCODING=utf-8`.
    `rm -rf` is guarded — don't rely on it for cleanup. Pass Windows-style paths
    (`C:/...`) to `sys.path.insert`, not MINGW (`/c/...`) paths.

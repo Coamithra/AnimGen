@@ -78,8 +78,9 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/seed_configs.py   # writ
 - **Take** — one generated `.mp4`: immutable `settings_snapshot`, status
   (`pending → generating → done/failed/cancelled`), star, soft-delete flag.
 - **Model library** — `model_library.json`, a read-only roster (hosted + local) with
-  cost/duration metadata; Replicate per-parameter schemas are fetched live in the
-  editor. Open it from the **Model Library** tab.
+  cost/duration metadata. Open it from the **Model Library** tab, whose **Fetch live
+  schemas** button pulls every Replicate model's per-parameter input schema and caches it
+  (`data/schema_cache.json`) for the shot editor to reuse.
 - **Cost-confirm gate** — every launch shows model + estimated spend + params and
   requires explicit confirmation. Default button is Cancel.
 - **Cancel pending** — the toolbar button cancels every queued generation that hasn't
