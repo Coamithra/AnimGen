@@ -126,13 +126,21 @@ def test_library_window() -> None:
     table = win.findChild(QTableWidget)
     assert table is not None and table.rowCount() == len(library.models())
     assert table.columnCount() == len(_COLUMNS) and "Schema" in _COLUMNS
-    # the fetch-all control exists; Schema column reflects per-backend state (no fetch yet)
-    assert any(isinstance(b, QPushButton) and b.text() == "Fetch live schemas"
+    assert "Capabilities" in _COLUMNS
+    # the refresh control exists; Schema column reflects per-backend state (no fetch yet)
+    assert any(isinstance(b, QPushButton) and b.text() == "Refresh from Replicate"
                for b in win.findChildren(QPushButton))
     schema_col = _COLUMNS.index("Schema")
     cells = {table.item(r, schema_col).text() for r in range(table.rowCount())}
     assert cells <= {"n/a", "not fetched"}, f"unexpected Schema cells: {cells}"
-    print(f"ModelLibraryWindow OK: {table.rowCount()} model rows, Schema column present")
+    # Capabilities column renders the synced flags (authored values pre-seeded in the roster):
+    # veo-3.1-fast supports negative, seedance-1.0-pro supports fixed camera.
+    caps_col = _COLUMNS.index("Capabilities")
+    caps_by_model = {library.models()[r]["id"]: table.item(r, caps_col).text()
+                     for r in range(table.rowCount())}
+    assert "negative" in caps_by_model["veo-3.1-fast"], caps_by_model["veo-3.1-fast"]
+    assert "camera-fixed" in caps_by_model["seedance-1.0-pro"], caps_by_model["seedance-1.0-pro"]
+    print(f"ModelLibraryWindow OK: {table.rowCount()} model rows, Schema + Capabilities columns")
 
 
 if __name__ == "__main__":

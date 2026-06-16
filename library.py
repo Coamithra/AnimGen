@@ -9,9 +9,15 @@ from __future__ import annotations
 
 import json
 import random
+import threading
 from typing import Optional
 
 from paths import MODEL_LIBRARY_PATH
+
+# Guards writes to model_library.json (the Model Library refresh syncs capability flags
+# off a daemon thread). Reads stay lock-free: atomic writes mean a reader sees either the
+# whole old file or the whole new one (mirrors store.schema_cache's discipline).
+_LIB_LOCK = threading.RLock()
 
 # Sentinel stored in a shot's settings["seed"] meaning "pick a fresh random seed for
 # every generation" (so each take - and every member of a future batch - differs). The
@@ -52,6 +58,33 @@ def get_model(model_id: str) -> Optional[dict]:
 
 def default_negative_prompt() -> str:
     return load_library().get("default_negative_prompt", "")
+
+
+def _apply_capabilities(doc: dict, model_id: str, caps: dict) -> dict:
+    """Pure: merge capability flags into the matching model in `doc` (mutated in place).
+    Returns {field: (old, new)} for every flag that actually changed."""
+    changed: dict = {}
+    for m in doc.get("models", []):
+        if m.get("id") == model_id:
+            for k, v in caps.items():
+                if m.get(k) != v:
+                    changed[k] = (m.get(k), v)
+                    m[k] = v
+            break
+    return changed
+
+
+def sync_model_capabilities(model_id: str, caps: dict) -> dict:
+    """Write derived capability flags back into model_library.json (the Model Library
+    'Refresh from Replicate' action). Atomic + lock-guarded; only rewrites the file when a
+    flag actually changed. Returns the {field: (old, new)} change diff."""
+    from store.project import _atomic_write_json   # lazy: library is a low-level import
+    with _LIB_LOCK:
+        doc = load_library()
+        changed = _apply_capabilities(doc, model_id, caps)
+        if changed:
+            _atomic_write_json(MODEL_LIBRARY_PATH, doc)
+    return changed
 
 
 def aspect_ratios(model_id: str) -> list[str]:

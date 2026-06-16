@@ -54,7 +54,7 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 |---|---|
 | `app.py` | entry point (adds repo root to `sys.path`; opens the last/seeded/new Project, shows MainWindow) |
 | `paths.py` | all paths + external-location config (see below); `DEFAULT_PROJECT`, `SCRATCH_DIR`, `APP_STATE` |
-| `library.py` / `model_library.json` | model-roster loader (+ `aspect_ratios(model_id)`) + the hand-authored roster (per-model `aspect_ratios`; local `comfy_nodes.size_node`) |
+| `library.py` / `model_library.json` | model-roster loader (+ `aspect_ratios(model_id)`, `sync_model_capabilities` — writes the two refresh-derived capability flags back into the roster, atomic+lock-guarded) + the roster (authored IDs/costs/notes/`aspect_ratios`/`supports_end_frame`, plus auto-synced `supports_negative_prompt`/`supports_camera_fixed`; local `comfy_nodes.size_node`) |
 | `store/project.py` `store/models.py` | file-based **Project** document (shots / takes / jobs) + dataclasses (`Shot`/`Take`/`Job`). Hybrid persistence: shot edits buffer (`dirty`, saved on `save()`); takes write through to `<assets>/takes.json`. Keyframe **assets** (`list_assets`/`import_asset`/`remove_asset` — image files flat in `.assets/`) + a load-time migration that flattens old `keyposes/<hash>/` baked files. RLock-guarded; atomic JSON writes |
 | `backends/replicate_client.py` | hosted generation (refactor of Fighter's `run_replicate.py`). `get_input_schema` **inlines enum `$ref`s** (`_resolve_enums`/`_follow_enum`/`_deref`): Replicate stores a property's allowed values as a `$ref`/`allOf`/`anyOf`/`oneOf` into `components.schemas`, not inline, so the resolver pulls each referenced `enum` (+ `type`) onto the property before returning — without this the editor never sees live options and silently falls back to the authored lists |
 | `backends/comfy_client.py` | local ComfyUI generation (node-role mapping); also server lifecycle/status/preflight: `launch_server` (tracks the Popen in `_server_proc`), `stop_work` (interrupt+clear queue), `stop_server` (terminate ours, else kill by port via `_pid_on_port`/`_kill_pid`), `server_status`, `monitor_snapshot`, `list_models`, `build_launch_command`, `preflight`, `dynamic_vram_enabled` |
@@ -71,7 +71,7 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 | `ui/asset_picker.py` | the visual keyframe picker dialog (thumbnail grid + Import) |
 | `ui/assets_view.py` | the **Assets** tab: drag-drop / Import keyframe images into `.assets/`; thumbnail grid + delete |
 | `ui/cost_confirm.py` | the launch gate |
-| `ui/model_library_window.py` | the **Model Library** tab: read-only model roster + a **Fetch live schemas** button (off-thread `_SchemaFetcher`) that pulls every Replicate model's input schema into `store/schema_cache.py`; a **Schema** column shows the cached field count per model |
+| `ui/model_library_window.py` | the **Model Library** tab: model roster + a **Refresh from Replicate** button (off-thread `_SchemaFetcher`) that pulls every Replicate model's input schema into `store/schema_cache.py` AND derives + syncs its capability flags into `model_library.json` (`library.sync_model_capabilities`); a **Schema** column shows the cached field count and a **Capabilities** column shows the synced negative/fixed-camera flags. Pricing isn't API-exposed, so costs are left alone |
 | `store/schema_cache.py` | persistent cache of Replicate input schemas (`data/schema_cache.json`, keyed by `replicate_model_id`); lock-guarded, atomic writes (reuses `store.project._atomic_write_json`). Populated by the Model Library tab; read by the shot editor for per-param enums/types **and to decide whether a model accepts a negative prompt** |
 | `store/app_settings.py` | app-global user preferences (`data/app_settings.json`; `get_bool`/`set_bool`). Own file (NOT `app_state.json`, which `main_window._remember_last` rewrites wholesale). Same lock + atomic-write discipline as `schema_cache`. First key `update_schemas_on_startup` (default off) — read by `MainWindow` to auto-refresh Replicate schemas at launch, toggled from the **Settings** menu |
 | `store/prompt_library.py` | app-global library of reusable prompt prefabs (`data/prompt_templates.json`; entry = `{name, positive, negative}`, upsert-by-name). Same lock + atomic-write discipline as `schema_cache`; ships seed templates; read/written by the shot tab's Prompt subtab template combo |
@@ -129,17 +129,28 @@ Setup if `.venv` is missing: `python -m venv .venv` then
    `.exec()` in a test (it blocks). Tests override `paths.SCRATCH_DIR` to a tempdir so
    untitled-project scratch stays out of `data/`. `build_summary` / pure functions are
    split out for exactly this reason.
-5. **`model_library.json` is authored, not generated.** Replicate IDs/fields were
-   verified via live schema fetch; per-param schemas are fetched live (Replicate) via the
-   **Model Library** tab's *Fetch live schemas* button, cached to `data/schema_cache.json`
-   (`store/schema_cache.py`, keyed by `replicate_model_id`), and read from there by the
-   shot editor — the editor no longer fetches per shot. `get_input_schema` **resolves enum
-   `$ref`/`allOf`/`anyOf`/`oneOf` into inline `enum`s** at fetch time, so the cached schema
-   carries live option lists and the shot editor reflects Replicate's current
-   resolution/duration/mode values automatically; the authored
-   `resolution_options`/`duration_range`/`mode_options` are now a fallback for when the live
-   fetch hasn't run or failed. Opt into a launch-time refresh via **Settings → Update
-   Replicate model data on startup** (default off; `store/app_settings.py`).
+5. **`model_library.json` is mostly authored, with two auto-synced capability flags.**
+   IDs, costs, notes, aspect_ratios, and `supports_end_frame` are hand-authored
+   (Replicate's API exposes **NO** pricing — costs are scraped from the web pricing page,
+   so the refresh can't and doesn't touch them; `supports_end_frame` predates the sync and
+   a roster invariant relies on it). The two **capability flags** `supports_negative_prompt`
+   and `supports_camera_fixed` ARE auto-derived from the live input schema and written back
+   into `model_library.json` by the **Model Library** tab's *Refresh from Replicate* button
+   (`library.sync_model_capabilities`, derived via `replicate_client.derive_capabilities`)
+   — don't hand-edit those two, a refresh overwrites them. They're a roster record shown in
+   the Model Library tab's Capabilities column; the shot editor still reads negative-prompt
+   support live from the schema cache, not from this flag. Per-param schemas are fetched
+   live and cached to `data/schema_cache.json` (`store/schema_cache.py`, keyed by
+   `replicate_model_id`), read from there by the shot editor — the editor no longer fetches
+   per shot. `get_input_schema` **resolves enum `$ref`/`allOf`/`anyOf`/`oneOf` into inline
+   `enum`s** at fetch time, so the cached schema carries live option lists and the shot
+   editor reflects Replicate's current resolution/duration/mode values automatically; the
+   authored `resolution_options`/`duration_range`/`mode_options` are a fallback for when the
+   live fetch hasn't run or failed. The same refresh path (`start_schema_fetch`) backs both
+   the *Refresh from Replicate* button and an opt-in launch-time refresh via **Settings →
+   Update Replicate model data on startup** (default off; `store/app_settings.py`) — so a
+   startup refresh also re-syncs the capability flags. Note: a refresh rewrites the file via
+   `_atomic_write_json` (indent=2), so the roster is stored in that normalized format.
 6. **Windows/MINGW:** use `python` (not `python3`); set `PYTHONIOENCODING=utf-8`.
    `rm -rf` is guarded — don't rely on it for cleanup. Pass Windows-style paths
    (`C:/...`) to `sys.path.insert`, not MINGW (`/c/...`) paths.

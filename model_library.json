@@ -1,144 +1,351 @@
 {
   "version": 1,
-  "note": "Model roster for the animgen tool. Replicate IDs + field mappings verified by TRACK_B's live schema fetch (2026-06-10); cost_per_second_usd from the billing-verified cost rule. Replicate per-parameter schemas are fetched live at edit time, so only canonical metadata lives here. Local (comfyui) entries point at a workflow template under ../workflows.",
+  "note": "Model roster for the animgen tool. Replicate IDs + field mappings verified by TRACK_B's live schema fetch (2026-06-10); cost_per_second_usd from the billing-verified cost rule (Replicate's API exposes NO pricing, so costs stay authored/scraped). The capability flags supports_negative_prompt and supports_camera_fixed are AUTO-SYNCED from the live input schema by the Model Library tab's 'Refresh from Replicate' button - don't hand-edit those two, they'll be overwritten. supports_end_frame stays hand-authored. Replicate per-parameter schemas are fetched live at edit time, so only canonical metadata lives here. Local (comfyui) entries point at a workflow template under ../workflows.",
   "default_negative_prompt": "camera pan, camera zoom, dolly, tracking shot, scene change, background change, new background, realistic, photorealistic, 3D render, blurry, extra limbs, deformed hands, text, watermark, frozen, still image, static pose",
   "models": [
     {
       "id": "seedance-2.0-std",
-      "aspect_ratios": ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"],
+      "aspect_ratios": [
+        "16:9",
+        "4:3",
+        "1:1",
+        "3:4",
+        "9:16",
+        "21:9",
+        "9:21"
+      ],
       "display_name": "Seedance 2.0 (Std)",
       "backend": "replicate",
       "replicate_model_id": "bytedance/seedance-2.0",
       "tier": "hero",
       "supports_end_frame": true,
+      "supports_negative_prompt": false,
+      "supports_camera_fixed": false,
       "requires_data_uri": false,
-      "cost_per_second_usd": {"480p": 0.08, "720p": 0.18, "1080p": 0.45},
-      "duration_range": [1, 15],
-      "resolution_options": ["480p", "720p", "1080p"],
-      "default_params": {"duration": 4, "resolution": "720p", "seed": -1, "aspect_ratio": "1:1", "camera_fixed": true},
-      "notes": "Hero/production tier. Always pass an explicit aspect_ratio (the editor injects the chosen aspect); omitting it defaults to 16:9 and stretches/clips a tighter-framed keypose. Camera is stochastic (seed lottery). Two-part prompts soak duration padding. A tier/resolution change is a choreography REROLL, not an upgrade. Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.08, 720p=0.18, 1080p=0.45. Resolution 480p/720p/1080p and the full aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) match Replicate's live schema; 'adaptive' is omitted (no fixed canvas)."
+      "cost_per_second_usd": {
+        "480p": 0.08,
+        "720p": 0.18,
+        "1080p": 0.45
+      },
+      "duration_range": [
+        1,
+        15
+      ],
+      "resolution_options": [
+        "480p",
+        "720p",
+        "1080p"
+      ],
+      "default_params": {
+        "duration": 4,
+        "resolution": "720p",
+        "seed": -1,
+        "aspect_ratio": "1:1",
+        "camera_fixed": true
+      },
+      "notes": "Hero/production tier. Always pass an explicit aspect_ratio (the editor injects the chosen aspect); omitting it defaults to 16:9 and stretches/clips a tighter-framed keypose. Camera is stochastic (seed lottery) - the live schema has NO camera_fixed field, so supports_camera_fixed is false even though default_params still carries a (now-ignored) camera_fixed:true. Two-part prompts soak duration padding. A tier/resolution change is a choreography REROLL, not an upgrade. Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.08, 720p=0.18, 1080p=0.45. Resolution 480p/720p/1080p and the full aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) match Replicate's live schema; 'adaptive' is omitted (no fixed canvas)."
     },
     {
       "id": "seedance-2.0-fast",
-      "aspect_ratios": ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"],
+      "aspect_ratios": [
+        "16:9",
+        "4:3",
+        "1:1",
+        "3:4",
+        "9:16",
+        "21:9",
+        "9:21"
+      ],
       "display_name": "Seedance 2.0 (Fast)",
       "backend": "replicate",
       "replicate_model_id": "bytedance/seedance-2.0-fast",
       "tier": "audition",
       "supports_end_frame": true,
+      "supports_negative_prompt": false,
+      "supports_camera_fixed": false,
       "requires_data_uri": false,
-      "cost_per_second_usd": {"480p": 0.07, "720p": 0.15},
-      "duration_range": [1, 15],
-      "resolution_options": ["480p", "720p"],
-      "default_params": {"duration": 4, "resolution": "480p", "seed": -1, "aspect_ratio": "1:1"},
+      "cost_per_second_usd": {
+        "480p": 0.07,
+        "720p": 0.15
+      },
+      "duration_range": [
+        1,
+        15
+      ],
+      "resolution_options": [
+        "480p",
+        "720p"
+      ],
+      "default_params": {
+        "duration": 4,
+        "resolution": "480p",
+        "seed": -1,
+        "aspect_ratio": "1:1"
+      },
       "notes": "Cheap choreography auditions only. Validates prompt/staging; never the final frame source (tier change = reroll). Fast-tier bg shimmer is keyed out. Resolution 480p/720p and the full aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) match Replicate's live schema; 'adaptive' is omitted (no fixed canvas). Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.07, 720p=0.15."
     },
     {
       "id": "seedance-1.0-pro",
-      "aspect_ratios": ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"],
+      "aspect_ratios": [
+        "16:9",
+        "4:3",
+        "1:1",
+        "3:4",
+        "9:16",
+        "21:9",
+        "9:21"
+      ],
       "display_name": "Seedance 1.0 Pro",
       "backend": "replicate",
       "replicate_model_id": "bytedance/seedance-1-pro",
       "tier": "production",
       "supports_end_frame": true,
+      "supports_negative_prompt": false,
+      "supports_camera_fixed": true,
       "requires_data_uri": false,
-      "cost_per_second_usd": {"480p": 0.024, "720p": 0.054, "1080p": 0.122},
-      "duration_range": [2, 12],
-      "resolution_options": ["480p", "720p", "1080p"],
-      "default_params": {"duration": 5, "resolution": "720p", "seed": -1, "camera_fixed": true},
+      "cost_per_second_usd": {
+        "480p": 0.024,
+        "720p": 0.054,
+        "1080p": 0.122
+      },
+      "duration_range": [
+        2,
+        12
+      ],
+      "resolution_options": [
+        "480p",
+        "720p",
+        "1080p"
+      ],
+      "default_params": {
+        "duration": 5,
+        "resolution": "720p",
+        "seed": -1,
+        "camera_fixed": true
+      },
       "notes": "Prior-gen ByteDance Seedance, image-to-video. Start frame -> 'image', end frame -> 'last_frame_image' (both already in replicate_client.ALIASES). Unlike seedance-2.0 there is NO required aspect lock: aspect_ratio is IGNORED when an image is supplied (per live schema), and AnimGen always sends a start keyframe, so the output follows the framing canvas - aspect_ratio is deliberately left out of default_params. camera_fixed=true stabilises the camera for sprite work. fps fixed at 24. Aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) matches Replicate's live schema; here it drives only the framing canvas (aspect_ratio is ignored when an image is supplied, so it stays out of default_params). Cost: token-billed (tokens = h*w*fps*duration/1024 at $2.5/1M tokens for pro); the per-second table is the 16:9 equivalent {480p~0.024, 720p~0.054, 1080p~0.122} - true cost scales with the chosen aspect's pixel count. Replicate IDs/fields verified via live schema fetch 2026-06-16."
     },
     {
       "id": "seedance-1.0-lite",
-      "aspect_ratios": ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"],
+      "aspect_ratios": [
+        "16:9",
+        "4:3",
+        "1:1",
+        "3:4",
+        "9:16",
+        "21:9",
+        "9:21"
+      ],
       "display_name": "Seedance 1.0 Lite",
       "backend": "replicate",
       "replicate_model_id": "bytedance/seedance-1-lite",
       "tier": "audition",
       "supports_end_frame": true,
+      "supports_negative_prompt": false,
+      "supports_camera_fixed": true,
       "requires_data_uri": false,
-      "cost_per_second_usd": {"480p": 0.017, "720p": 0.039, "1080p": 0.087},
-      "duration_range": [4, 12],
-      "resolution_options": ["480p", "720p", "1080p"],
-      "default_params": {"duration": 5, "resolution": "720p", "seed": -1, "camera_fixed": true},
+      "cost_per_second_usd": {
+        "480p": 0.017,
+        "720p": 0.039,
+        "1080p": 0.087
+      },
+      "duration_range": [
+        4,
+        12
+      ],
+      "resolution_options": [
+        "480p",
+        "720p",
+        "1080p"
+      ],
+      "default_params": {
+        "duration": 5,
+        "resolution": "720p",
+        "seed": -1,
+        "camera_fixed": true
+      },
       "notes": "Cheaper prior-gen Seedance, image-to-video (the Lite sibling of seedance-1.0-pro). Same field mapping (start='image', end='last_frame_image') and same aspect-ignored-when-image behaviour, so no required aspect lock. Also exposes reference_images (1-4) which AnimGen doesn't use. fps fixed at 24; duration floor is 4s (vs 2s on pro). Aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) matches Replicate's live schema; it drives only the framing canvas (aspect_ratio is ignored when an image is supplied). Cost: token-billed at $1.8/1M tokens; per-second 16:9 equivalent {480p~0.017, 720p~0.039, 1080p~0.087} - scales with aspect pixel count. Replicate IDs/fields verified via live schema fetch 2026-06-16."
     },
     {
       "id": "vidu-q3-pro",
-      "aspect_ratios": ["16:9", "9:16", "3:4", "4:3", "1:1"],
+      "aspect_ratios": [
+        "16:9",
+        "9:16",
+        "3:4",
+        "4:3",
+        "1:1"
+      ],
       "display_name": "Vidu Q3 Pro",
       "backend": "replicate",
       "replicate_model_id": "vidu/q3-pro",
       "tier": "airborne",
       "supports_end_frame": true,
+      "supports_negative_prompt": false,
+      "supports_camera_fixed": false,
       "requires_data_uri": true,
-      "cost_per_second_usd": {"540p": 0.07, "720p": 0.15, "1080p": 0.16},
-      "duration_range": [1, 16],
-      "resolution_options": ["540p", "720p", "1080p"],
-      "default_params": {"duration": 2, "resolution": "720p", "seed": -1},
+      "cost_per_second_usd": {
+        "540p": 0.07,
+        "720p": 0.15,
+        "1080p": 0.16
+      },
+      "duration_range": [
+        1,
+        16
+      ],
+      "resolution_options": [
+        "540p",
+        "720p",
+        "1080p"
+      ],
+      "default_params": {
+        "duration": 2,
+        "resolution": "720p",
+        "seed": -1
+      },
       "notes": "Best lane: single short airborne/structural actions. Files API unsupported -> data-uri REQUIRED (images < ~250KB: flatten bg to magenta, then quantize). Short durations fix bg pulsing. Never pack multiple moves (its lever is duration). Resolution 540p/720p/1080p and aspects (16:9/9:16/3:4/4:3/1:1) match Replicate's live schema. Cost: $/s by resolution (Replicate model page 2026-06): 540p=0.07, 720p=0.15, 1080p=0.16 (default 720p kept)."
     },
     {
       "id": "veo-3.1-fast",
-      "aspect_ratios": ["16:9", "9:16"],
+      "aspect_ratios": [
+        "16:9",
+        "9:16"
+      ],
       "display_name": "Veo 3.1 Fast",
       "backend": "replicate",
       "replicate_model_id": "google/veo-3.1-fast",
       "tier": "fast",
       "supports_end_frame": true,
+      "supports_negative_prompt": true,
+      "supports_camera_fixed": false,
       "requires_data_uri": false,
-      "cost_per_second_usd": 0.10,
-      "duration_range": [4, 8],
-      "duration_options": [4, 6, 8],
-      "resolution_options": ["720p", "1080p"],
-      "default_params": {"duration": 4, "resolution": "720p", "seed": -1},
+      "cost_per_second_usd": 0.1,
+      "duration_range": [
+        4,
+        8
+      ],
+      "duration_options": [
+        4,
+        6,
+        8
+      ],
+      "resolution_options": [
+        "720p",
+        "1080p"
+      ],
+      "default_params": {
+        "duration": 4,
+        "resolution": "720p",
+        "seed": -1
+      },
       "notes": "Strong prompt adherence, fast. Resolution defaults 1080p - set 720p. Duration is an enum (4/6/8s). No 1:1 aspect on Replicate; test aspect 'auto'. Cost: priced by AUDIO, not resolution (Replicate 2026-06) - without-audio=0.10/s (our case, audio forced off), with-audio=0.15/s; 720p and 1080p cost the same."
     },
     {
       "id": "wan-2.7-i2v",
-      "aspect_ratios": ["16:9", "9:16", "1:1"],
+      "aspect_ratios": [
+        "16:9",
+        "9:16",
+        "1:1"
+      ],
       "display_name": "Wan 2.7 i2v",
       "backend": "replicate",
       "replicate_model_id": "wan-video/wan-2.7-i2v",
       "tier": "filler",
       "supports_end_frame": true,
+      "supports_negative_prompt": true,
+      "supports_camera_fixed": false,
       "requires_data_uri": false,
-      "cost_per_second_usd": {"720p": 0.10, "1080p": 0.15},
-      "duration_range": [2, 15],
-      "resolution_options": ["720p", "1080p"],
-      "default_params": {"duration": 4, "resolution": "720p", "seed": -1},
+      "cost_per_second_usd": {
+        "720p": 0.1,
+        "1080p": 0.15
+      },
+      "duration_range": [
+        2,
+        15
+      ],
+      "resolution_options": [
+        "720p",
+        "1080p"
+      ],
+      "default_params": {
+        "duration": 4,
+        "resolution": "720p",
+        "seed": -1
+      },
       "notes": "Cheap filler / prototyping (quality ~animation-student). Resolution defaults 1080p - set 720p. Two-part prompts help padding. 'audio' is a URL string, not a boolean toggle. Cost: $/s by resolution (Replicate 2026-06): 720p=0.10, 1080p=0.15."
     },
     {
       "id": "kling-3.0",
-      "aspect_ratios": ["16:9", "9:16", "1:1"],
+      "aspect_ratios": [
+        "16:9",
+        "9:16",
+        "1:1"
+      ],
       "display_name": "Kling 3.0",
       "backend": "replicate",
       "replicate_model_id": "kwaivgi/kling-v3-video",
       "tier": "retired",
       "supports_end_frame": true,
+      "supports_negative_prompt": true,
+      "supports_camera_fixed": false,
       "requires_data_uri": false,
-      "cost_per_second_usd": {"standard": 0.168, "pro": 0.224, "4k": 0.42},
+      "cost_per_second_usd": {
+        "standard": 0.168,
+        "pro": 0.224,
+        "4k": 0.42
+      },
       "cost_by": "mode",
-      "duration_range": [3, 15],
-      "mode_options": ["standard", "pro", "4k"],
-      "default_params": {"duration": 5, "seed": -1, "mode": "standard"},
+      "duration_range": [
+        3,
+        15
+      ],
+      "mode_options": [
+        "standard",
+        "pro",
+        "4k"
+      ],
+      "default_params": {
+        "duration": 5,
+        "seed": -1,
+        "mode": "standard"
+      },
       "notes": "Stable backgrounds but low-fps cadence and invents actions (retired by human verdict). mode default=pro; set 'standard' for cheaper. Kept available for one-off comparisons. Replicate's API default is pro; we default to standard (cheapest). mode standard/pro/4k matches Replicate's live schema; Kling exposes NO resolution param (mode is the only quality axis). Cost: $/s by MODE, without-audio (Replicate 2026-06): standard=0.168, pro=0.224, 4k=0.42."
     },
     {
       "id": "local-flf-wan14b",
-      "aspect_ratios": ["1:1", "16:9", "9:16", "4:3", "3:4", "21:9"],
+      "aspect_ratios": [
+        "1:1",
+        "16:9",
+        "9:16",
+        "4:3",
+        "3:4",
+        "21:9"
+      ],
       "display_name": "Wan 2.2 14B (local)",
       "backend": "comfyui",
       "workflow_template": "workflows/FLF_stand_to_crouch.json",
       "tier": "local-free",
       "supports_end_frame": true,
+      "supports_negative_prompt": true,
+      "supports_camera_fixed": false,
       "requires_data_uri": false,
       "cost_per_second_usd": 0.0,
       "frames": 17,
-      "default_params": {"seed": -1, "length": 17},
-      "comfy_nodes": {"start_image": "9", "end_image": "10", "prompt": "7", "negative": "8", "seed_nodes": ["12", "13"], "size_node": "11"},
-      "notes": "Local Wan 2.2 14B. The app picks the workflow from the shot's keyframes: end keyframe set -> FLF first-last tween; no end -> open-ended (I2V-style) continuation from the start frame (prepare_workflow severs the end-image node). ~3 min/render. ComfyUI must run on 127.0.0.1:8188. Best for transitions: stand<->crouch, hurt snap/recovery, block flinch. Template node ids match the FLF_*.json family. (VACE multi-pin deferred until 3-4 pin keyframes exist; build per-job via scripts/make_vace_workflow.py.)"
+      "default_params": {
+        "seed": -1,
+        "length": 17
+      },
+      "comfy_nodes": {
+        "start_image": "9",
+        "end_image": "10",
+        "prompt": "7",
+        "negative": "8",
+        "seed_nodes": [
+          "12",
+          "13"
+        ],
+        "size_node": "11"
+      },
+      "notes": "Local Wan 2.2 14B. The app picks the workflow from the shot's keyframes: end keyframe set -> FLF first-last tween; no end -> open-ended (I2V-style) continuation from the start frame (prepare_workflow severs the end-image node). ~3 min/render. ComfyUI must run on 127.0.0.1:8188. Best for transitions: stand<->crouch, hurt snap/recovery, block flinch. Template node ids match the FLF_*.json family. Capability flags are local-authored (comfyui has no Replicate schema): negative via comfy_nodes.negative, end_frame via comfy_nodes.end_image; the Refresh from Replicate sync skips comfyui models. (VACE multi-pin deferred until 3-4 pin keyframes exist; build per-job via scripts/make_vace_workflow.py.)"
     }
   ]
 }
