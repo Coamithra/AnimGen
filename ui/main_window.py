@@ -175,8 +175,22 @@ class MainWindow(QMainWindow):
 
     # ---- project lifecycle ----------------------------------------------
     def _update_title(self) -> None:
-        star = "*" if self.project.dirty else ""
+        star = "*" if self._has_unsaved_changes() else ""
         self.setWindowTitle(f"{self.project.name}{star} - Animation Generator")
+
+    def _has_unsaved_changes(self) -> bool:
+        """Project dirty marker: it's never been saved (untitled), has buffered authoring
+        edits, or any open shot tab has uncommitted editor edits."""
+        if self.project.dirty or self.project.is_untitled:
+            return True
+        return any(isinstance(w, ShotTab) and w.is_dirty()
+                   for w in (self.tabs.widget(i) for i in range(self.tabs.count())))
+
+    def _on_shot_dirty_changed(self, tab: ShotTab) -> None:
+        idx = self.tabs.indexOf(tab)
+        if idx >= 0:
+            self.tabs.setTabText(idx, tab.title())
+        self._update_title()
 
     def _switch_project(self, project: Project) -> None:
         for tab in list(self.shot_tabs.values()):   # old shot tabs reference the old project
@@ -358,6 +372,7 @@ class MainWindow(QMainWindow):
 
     def _wire_shot_tab(self, tab: ShotTab) -> None:
         tab.saved.connect(lambda sid, t=tab: self._on_shot_saved(sid, t))
+        tab.dirty_changed.connect(lambda t=tab: self._on_shot_dirty_changed(t))
         tab.generate_requested.connect(self.generate_shot)
         tab.export_requested.connect(self.export_takes)
 

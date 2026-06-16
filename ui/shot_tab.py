@@ -48,6 +48,7 @@ class ShotTab(QWidget):
     saved = Signal(str)              # shot_id (after a successful save)
     generate_requested = Signal(str)  # shot_id
     export_requested = Signal(list)   # take ids
+    dirty_changed = Signal()          # this tab's unsaved-edits state flipped
 
     def __init__(self, project: Project, shot=None, parent=None):
         super().__init__(parent)
@@ -61,26 +62,70 @@ class ShotTab(QWidget):
                                           "end": dict(_DEFAULT_PLACEMENT)}
         self._keyed_cache: dict = {}   # asset path -> keyed PIL sprite (thumb reuse)
         self._active = "start"
+        self._dirty = False
+        self._suppress = True          # block dirty-marking while building/loading widgets
         self._build()
         if shot:
             self._load(shot)
         else:
             self._select("start")
         self._update_action_state()
+        self._suppress = False         # subsequent widget changes are real user edits
 
     def title(self) -> str:
-        return self.shot.name if self.shot else "New shot"
+        base = self.shot.name if self.shot else "New shot"
+        return f"{base}*" if self._dirty else base
+
+    # ---- dirty tracking -------------------------------------------------
+    def is_dirty(self) -> bool:
+        return self._dirty
+
+    def _mark_dirty(self) -> None:
+        if self._suppress or self._dirty:
+            return
+        self._dirty = True
+        self.dirty_changed.emit()
+
+    def _clear_dirty(self) -> None:
+        if self._dirty:
+            self._dirty = False
+            self.dirty_changed.emit()
+
+    def _wire_dirty(self, widget: QWidget) -> None:
+        """Mark this tab dirty whenever a built editor widget changes. Param/output rows
+        are sometimes a container host (e.g. the length spin + hint), so fall back to its
+        concrete child editors."""
+        if not self._wire_one(widget):
+            for cls in (QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox):
+                for child in widget.findChildren(cls):
+                    self._wire_one(child)
+
+    def _wire_one(self, w: QWidget) -> bool:
+        if isinstance(w, QCheckBox):
+            w.toggled.connect(self._mark_dirty)
+        elif isinstance(w, QComboBox):
+            w.currentIndexChanged.connect(self._mark_dirty)
+        elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+            w.valueChanged.connect(self._mark_dirty)
+        elif isinstance(w, QLineEdit):
+            w.textChanged.connect(self._mark_dirty)
+        else:
+            return False
+        return True
 
     # ---- construction ---------------------------------------------------
     def _build(self) -> None:
         self.name = QLineEdit()
+        self.name.textChanged.connect(self._mark_dirty)
         self.model_combo = QComboBox()
         for m in library.models():
             self.model_combo.addItem(m["display_name"], m["id"])
         self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        self.model_combo.currentIndexChanged.connect(self._mark_dirty)
 
         self.aspect_combo = QComboBox()
         self.aspect_combo.currentIndexChanged.connect(self._on_aspect_changed)
+        self.aspect_combo.currentIndexChanged.connect(self._mark_dirty)
         self.canvas_lbl = QLabel("")
         self.canvas_lbl.setStyleSheet("color: gray;")
 
@@ -93,9 +138,12 @@ class ShotTab(QWidget):
 
         self.canvas = PlacementCanvas()
         self.canvas.changed.connect(self._on_placement_changed)
+        self.canvas.changed.connect(self._mark_dirty)
 
         self.prompt = QPlainTextEdit(); self.prompt.setPlaceholderText("Prompt…")
+        self.prompt.textChanged.connect(self._mark_dirty)
         self.negative = QPlainTextEdit(); self.negative.setPlaceholderText("Negative prompt…")
+        self.negative.textChanged.connect(self._mark_dirty)
         self.negative.setPlainText(library.default_negative_prompt())
         prompt_box = QGroupBox("Prompt")
         pv = QVBoxLayout(prompt_box)
@@ -275,11 +323,13 @@ class ShotTab(QWidget):
         if dlg.exec() and dlg.selected():
             self._set_asset(which, dlg.selected())
             self._select(which)
+            self._mark_dirty()
 
     def _clear(self, which: str) -> None:
         self._set_asset(which, None)
         if self._active == which:
             self.canvas.set_sprite(None)
+        self._mark_dirty()
 
     def _set_asset(self, which: str, path: Optional[str]) -> None:
         self._assets[which] = path or None
@@ -366,12 +416,14 @@ class ShotTab(QWidget):
                 widget, getter = self._make_output_widget(name, merged[name], model)
                 self.output_form.addRow(label, widget)
                 self._param_getters[name] = getter
+                self._wire_dirty(widget)
         ordered = [k for k in _PARAM_ORDER if k in merged and k not in _OUTPUT_PARAMS]
         ordered += [k for k in merged if k not in ordered and k not in _OUTPUT_PARAMS]
         for name in ordered:
             widget, getter = self._make_param_widget(name, merged[name], model)
             self.params_form.addRow(name, widget)
             self._param_getters[name] = getter
+            self._wire_dirty(widget)
         self.fetch_btn.setEnabled(model["backend"] == "replicate")
         self._refresh_price()
 
@@ -501,7 +553,11 @@ class ShotTab(QWidget):
             props, _ = replicate_client.get_input_schema(replicate_client.load_token(), rid)
             self._schema = props
             self.schema_status.setText(f"schema: {len(props)} fields")
-            self._rebuild_params(self._params())
+            self._suppress = True   # re-populating with the same values isn't a user edit
+            try:
+                self._rebuild_params(self._params())
+            finally:
+                self._suppress = False
         except Exception as e:  # noqa: BLE001
             self.schema_status.setText(f"fetch failed: {e}")
         finally:
@@ -570,6 +626,7 @@ class ShotTab(QWidget):
         self.shot = self.project.get_shot(sid)
         self._ensure_takes_view()
         self._update_action_state()
+        self._clear_dirty()
         return sid
 
     def _save(self) -> Optional[str]:
