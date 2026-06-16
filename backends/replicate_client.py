@@ -148,6 +148,8 @@ def _follow_enum(prop: dict, schemas: dict) -> tuple[Optional[list], Optional[st
                 candidates.append(sub)
             elif "$ref" in sub:
                 candidates.append(_deref(sub["$ref"], schemas))
+    # First resolvable enum wins (handles the common optional shape
+    # anyOf: [{$ref: <enum>}, {type: "null"}]); unions of multiple enums aren't merged.
     for cand in candidates:
         if isinstance(cand.get("enum"), list):
             return cand["enum"], cand.get("type")

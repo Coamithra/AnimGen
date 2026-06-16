@@ -59,6 +59,8 @@ def test_resolve_enums() -> None:
         "resolution": {"allOf": [{"$ref": "#/components/schemas/resolution"}], "default": "720p"},
         "mode": {"$ref": "#/components/schemas/mode"},                      # bare $ref
         "duration": {"anyOf": [{"$ref": "#/components/schemas/duration"}]}, # anyOf combiner
+        # optional enum: the real Replicate shape for a nullable enum field
+        "opt": {"anyOf": [{"$ref": "#/components/schemas/mode"}, {"type": "null"}]},
         "fps": {"oneOf": [{"enum": [16, 24]}]},                            # inline enum in combiner
         "seed": {"type": "integer"},                                       # no enum -> unchanged
         "prompt": {"type": "string"},
@@ -69,6 +71,7 @@ def test_resolve_enums() -> None:
     assert resolved["resolution"]["type"] == "string"         # type pulled from the component
     assert resolved["mode"]["enum"] == ["standard", "pro"]
     assert resolved["duration"]["enum"] == [5, 10] and resolved["duration"]["type"] == "integer"
+    assert resolved["opt"]["enum"] == ["standard", "pro"]     # enum extracted past the null sibling
     assert resolved["fps"]["enum"] == [16, 24]
     assert "enum" not in resolved["seed"] and "enum" not in resolved["prompt"]
     assert props["resolution"].get("enum") is None            # inputs not mutated

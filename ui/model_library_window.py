@@ -134,7 +134,7 @@ class ModelLibraryWindow(QWidget):
         self.fetch_btn = QPushButton("Fetch live schemas")
         self.fetch_btn.setToolTip("Fetch every Replicate model's current input schema and cache "
                                   "it for the shot editor (no spend - schema read only).")
-        self.fetch_btn.clicked.connect(self._fetch_all)
+        self.fetch_btn.clicked.connect(self.start_schema_fetch)
         self.status = QLabel("")
         self.status.setStyleSheet("color: gray;")
         actions = QHBoxLayout()
