@@ -163,7 +163,7 @@ class ModelLibraryWindow(QWidget):
                                     "(negative prompt / fixed camera) into model_library.json. "
                                     "No spend - schema read only. Pricing isn't exposed by the "
                                     "API, so costs are left alone.")
-        self.refresh_btn.clicked.connect(self._refresh_all)
+        self.refresh_btn.clicked.connect(self.start_schema_fetch)
         self.status = QLabel("")
         self.status.setStyleSheet("color: gray;")
         actions = QHBoxLayout()
@@ -176,7 +176,13 @@ class ModelLibraryWindow(QWidget):
         lay.addLayout(actions)
         lay.addWidget(self.table)
 
-    # ---- refresh from Replicate (schema + capability sync) --------------
+    # ---- refresh from Replicate (schema cache + capability sync) --------
+    def start_schema_fetch(self) -> None:
+        """Public entry to kick off the off-thread refresh — used both by the Refresh
+        button and by MainWindow's 'update model data on startup' setting. Caches each
+        model's input schema and syncs its capability flags into model_library.json."""
+        self._refresh_all()
+
     def _refresh_all(self) -> None:
         rep_models = [m for m in self.models
                       if m.get("backend") == "replicate" and m.get("replicate_model_id")]

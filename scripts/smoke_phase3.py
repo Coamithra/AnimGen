@@ -113,6 +113,20 @@ def test_placement_canvas() -> None:
     far = pc.get_placement()
     assert far["cx"] > near["cx"] and far["cy"] > near["cy"], (near, far)
 
+    # Off-frame clamp: a sprite can be pushed all the way out until its bounding box
+    # just touches a frame bound, but no further. (Position edits never change scale,
+    # so the sprite size captured here stays valid across the clamp below.)
+    s = pc.sprite_item.scale()
+    sw = pc._native.width() * s
+    sh = pc._native.height() * s
+    pc.x_box.setValue(99999); pc.y_box.setValue(99999)        # shove far past bottom-right
+    pos = pc.sprite_item.pos()
+    assert abs(pos.x() - pc._w) < 1 and abs(pos.y() - pc._h) < 1, (pos, pc._w, pc._h)
+    pc.x_box.setValue(-99999); pc.y_box.setValue(-99999)      # shove far past top-left
+    pos = pc.sprite_item.pos()
+    assert abs(pos.x() - (-sw)) < 1 and abs(pos.y() - (-sh)) < 1, (pos, sw, sh)
+    pc.set_placement({"scale": 0.5, "cx": 0.4, "cy": 0.6})    # recenter for later checks
+
     assert edits, "numeric edits must emit changed (marks the shot dirty)"
     # Programmatic refresh must not feed back into another edit (no runaway loop).
     pre = len(edits)
@@ -253,6 +267,45 @@ def test_negative_and_templates() -> None:
     print("ShotTab OK: negative greyed per-schema, prompt templates apply into both boxes")
 
 
+def test_mode_widget_live_enum() -> None:
+    """A live-schema enum for 'mode' must still build the dedicated mode widget (live
+    options + the price-refresh wiring), not the generic enum combo. Regression: resolving
+    Replicate's mode $ref into an inline enum made the generic `if enum` branch shadow the
+    mode special-case, silently dropping Kling's mode-driven cost refresh."""
+    from PySide6.QtWidgets import QApplication, QComboBox, QFormLayout
+
+    from store import schema_cache
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    paths.SCHEMA_CACHE = Path(tempfile.mkdtemp()) / "schema_cache.json"
+    # Cache a mode enum that differs from the authored mode_options, so "live wins" is visible.
+    kling = library.get_model("kling-3.0")
+    schema_cache.put(kling["replicate_model_id"],
+                     {"mode": {"enum": ["standard", "pro", "4k", "cinematic"]}})
+
+    project = Project.new()
+    ed = ShotTab(project)
+    ed.model_combo.setCurrentIndex(ed.model_combo.findData("kling-3.0"))
+
+    def field(form, label):
+        for r in range(form.rowCount()):
+            lab = form.itemAt(r, QFormLayout.ItemRole.LabelRole)
+            if lab and lab.widget() and lab.widget().text() == label:
+                return form.itemAt(r, QFormLayout.ItemRole.FieldRole).widget()
+        return None
+
+    combo = field(ed.params_form, "mode")
+    assert isinstance(combo, QComboBox), type(combo)
+    assert [combo.itemText(i) for i in range(combo.count())] == \
+        ["standard", "pro", "4k", "cinematic"], "live schema enum should win over mode_options"
+    calls = []
+    ed._refresh_price = lambda: calls.append(1)   # lambda resolves self._refresh_price at emit
+    combo.setCurrentText("pro")
+    assert calls, "changing mode must still refresh the price"
+    print("ShotTab OK: live mode enum keeps the dedicated widget + price-refresh wiring")
+
+
 def test_render_keyposes() -> None:
     tmp = Path(tempfile.mkdtemp())
     src = tmp / "char.png"
@@ -281,5 +334,6 @@ if __name__ == "__main__":
     test_placement_canvas()
     test_shot_tab()
     test_negative_and_templates()
+    test_mode_widget_live_enum()
     test_render_keyposes()
     print("PHASE 3 SMOKE: PASS")

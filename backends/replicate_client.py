@@ -126,16 +126,67 @@ def upload_file(token: str, path: str | Path, as_data_uri: bool = False) -> str:
     return url
 
 
+def _deref(ref, schemas: dict) -> dict:
+    """Resolve a '#/components/schemas/<name>' pointer against components.schemas."""
+    if not isinstance(ref, str) or not ref.startswith("#/components/schemas/"):
+        return {}
+    target = schemas.get(ref.rsplit("/", 1)[-1])
+    return target if isinstance(target, dict) else {}
+
+
+def _follow_enum(prop: dict, schemas: dict) -> tuple[Optional[list], Optional[str]]:
+    """Find a property's enum (+ its type) when Replicate stores it as a $ref/allOf/
+    anyOf/oneOf into components.schemas instead of inline. Returns (None, None) if none."""
+    candidates: list[dict] = []
+    if "$ref" in prop:
+        candidates.append(_deref(prop["$ref"], schemas))
+    for key in ("allOf", "anyOf", "oneOf"):
+        for sub in prop.get(key) or []:
+            if not isinstance(sub, dict):
+                continue
+            if "enum" in sub:                          # inline enum inside the combiner
+                candidates.append(sub)
+            elif "$ref" in sub:
+                candidates.append(_deref(sub["$ref"], schemas))
+    # First resolvable enum wins (handles the common optional shape
+    # anyOf: [{$ref: <enum>}, {type: "null"}]); unions of multiple enums aren't merged.
+    for cand in candidates:
+        if isinstance(cand.get("enum"), list):
+            return cand["enum"], cand.get("type")
+    return None, None
+
+
+def _resolve_enums(props: dict, schemas: dict) -> dict:
+    """Inline each property's referenced enum (+ type) so callers see prop['enum']
+    directly. Returns a new dict; inputs are not mutated. Props with an inline enum or
+    no resolvable enum pass through unchanged (aside from the shallow copy)."""
+    resolved = {}
+    for name, prop in props.items():
+        if not isinstance(prop, dict):
+            resolved[name] = prop
+            continue
+        prop = dict(prop)
+        if "enum" not in prop:
+            enum, typ = _follow_enum(prop, schemas)
+            if enum is not None:
+                prop["enum"] = enum
+                if typ and "type" not in prop:
+                    prop["type"] = typ
+        resolved[name] = prop
+    return resolved
+
+
 def get_input_schema(token: str, replicate_model_id: str) -> tuple[dict, list]:
     info = api_request(token, f"{API}/models/{replicate_model_id}")
     version = info.get("latest_version") or {}
     schema = version.get("openapi_schema") or {}
-    comp = schema.get("components", {}).get("schemas", {}).get("Input", {})
+    schemas = schema.get("components", {}).get("schemas", {})
+    comp = schemas.get("Input", {})
     props = comp.get("properties", {})
     if not props:
         raise ReplicateError(
             f"Could not read input schema for {replicate_model_id} - id ok?")
-    return props, comp.get("required", [])
+    return _resolve_enums(props, schemas), comp.get("required", [])
 
 
 def derive_capabilities(props: dict) -> dict:
