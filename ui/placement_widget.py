@@ -105,8 +105,9 @@ class _PlacementView(QGraphicsView):
     def _clamp_pos(self, pos: QPointF) -> QPointF:
         """Clamp so the sprite's bounding box stays attached to the canvas: it may be
         dragged all the way off-frame until one edge just touches a frame bound, but no
-        further. This permits a fully partial sprite while ensuring it can never be lost
-        entirely past the frame (and the numeric X/Y readout can always recover it)."""
+        further (so at least a hairline stays on the bound). This permits a fully partial
+        sprite; a sprite pushed clean off is clipped invisible, but the numeric X/Y
+        readout can always recover it."""
         assert self.sprite_item is not None
         w = self.sprite_item.pixmap().width() * self.sprite_item.scale()
         h = self.sprite_item.pixmap().height() * self.sprite_item.scale()

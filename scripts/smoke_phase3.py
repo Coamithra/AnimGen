@@ -114,7 +114,8 @@ def test_placement_canvas() -> None:
     assert far["cx"] > near["cx"] and far["cy"] > near["cy"], (near, far)
 
     # Off-frame clamp: a sprite can be pushed all the way out until its bounding box
-    # just touches a frame bound, but no further (so it's never lost entirely off-frame).
+    # just touches a frame bound, but no further. (Position edits never change scale,
+    # so the sprite size captured here stays valid across the clamp below.)
     s = pc.sprite_item.scale()
     sw = pc._native.width() * s
     sh = pc._native.height() * s
