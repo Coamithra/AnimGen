@@ -138,6 +138,47 @@ def test_project() -> None:
     print("project OK: shot+take+job round-trip, snapshot, star/delete/restore, save/load")
 
 
+def test_shot_context_ops() -> None:
+    """Duplicate copies the spec independently (no takes); the ShotCard right-click menu
+    exposes Edit/Generate/Duplicate/Delete and fires the matching signals."""
+    p = Project.new()
+    src = p.add_shot("kick", model_id="seedance-2.0-std", prompt="hi",
+                     settings={"seed": 7}, crop={"aspect": "16:9", "start": {"scale": 1.0}})
+    p.add_take(src.id, status=STATUS_DONE)
+    p.dirty = False
+
+    dup = p.duplicate_shot(src.id)
+    assert dup is not None and dup.id != src.id
+    assert dup.name == "kick (copy)" and p.dirty
+    assert dup.prompt == "hi" and dup.settings["seed"] == 7
+    assert p.list_takes(dup.id) == [], "duplicate must start with no takes"
+    dup.settings["seed"] = 99
+    dup.crop["start"]["scale"] = 2.0
+    assert p.get_shot(src.id).settings["seed"] == 7, "settings must be deep-copied"
+    assert p.get_shot(src.id).crop["start"]["scale"] == 1.0, "crop must be deep-copied"
+    assert p.duplicate_shot("nope") is None
+
+    from PySide6.QtWidgets import QApplication
+
+    from ui.shot_card import ShotCard
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    card = ShotCard(p, src)
+    menu = card._build_context_menu()
+    labels = [a.text() for a in menu.actions() if a.text()]
+    assert labels == ["Edit", "Generate", "Duplicate", "Delete"], labels
+    fired: dict = {}
+    card.duplicate_requested.connect(lambda sid: fired.__setitem__("dup", sid))
+    card.delete_requested.connect(lambda sid: fired.__setitem__("del", sid))
+    card.open_requested.connect(lambda sid: fired.__setitem__("edit", sid))
+    card.generate_requested.connect(lambda sid: fired.__setitem__("gen", sid))
+    by_text = {a.text(): a for a in menu.actions()}
+    for label in ("Duplicate", "Delete", "Edit", "Generate"):
+        by_text[label].trigger()
+    assert fired == {"dup": src.id, "del": src.id, "edit": src.id, "gen": src.id}, fired
+    print("shot context ops OK: duplicate is independent + no takes; menu signals fire")
+
+
 def test_hybrid_persistence() -> None:
     """Shot edits buffer (dirty, not on disk); a finished take writes through at once."""
     proj_path = Path(tempfile.mkdtemp()) / "h.animproj"
@@ -176,6 +217,7 @@ if __name__ == "__main__":
     test_library()
     test_model_options()
     test_project()
+    test_shot_context_ops()
     test_hybrid_persistence()
     test_gui_build()
     print("PHASE 1 SMOKE: PASS")

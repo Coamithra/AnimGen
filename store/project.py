@@ -28,6 +28,7 @@ worker threads can update takes off the GUI thread.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -340,6 +341,26 @@ class Project:
                 setattr(shot, k, v)
             shot.updated = _now()
             self.dirty = True
+
+    def duplicate_shot(self, shot_id: str) -> Optional[Shot]:
+        """Copy a shot's authoring spec into a new shot (fresh id, name '<name> (copy)').
+        Takes are NOT copied - a duplicate starts empty. Mutable dicts (crop/settings) are
+        deep-copied so the copy is independent; asset paths are shared (we never duplicate
+        asset files). Buffers like add_shot (sets dirty)."""
+        with self._lock:
+            src = self._shots.get(shot_id)
+            if not src:
+                return None
+            dup = Shot(
+                id=new_id(), name=f"{src.name} (copy)",
+                start_frame=src.start_frame, end_frame=src.end_frame,
+                canvas_w=src.canvas_w, canvas_h=src.canvas_h,
+                crop=copy.deepcopy(src.crop), prompt=src.prompt,
+                negative_prompt=src.negative_prompt, model_id=src.model_id,
+                settings=copy.deepcopy(src.settings), created=_now(), updated=_now())
+            self._shots[dup.id] = dup
+            self.dirty = True
+        return dup
 
     def delete_shot(self, shot_id: str) -> None:
         with self._lock:
