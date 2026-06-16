@@ -2,8 +2,8 @@
 
 Choose start/end keyframes from the project's assets (left-click a slot to frame it,
 double-click to pick), set the canvas aspect ratio (offered per the model), drag/scale
-each keyframe within the aspect canvas, write prompt + settings, and see/generate this
-shot's takes - all inline.
+each keyframe within the aspect canvas, write the prompt, tune the output/model
+settings, and see/generate this shot's takes - all inline.
 
 Placement is stored per keyframe under shot.crop = {aspect, start:{...}, end:{...}};
 the 1254-class (hosted) or pixel-budget (local) canvas is computed from the aspect, and
@@ -33,7 +33,7 @@ from ui.takes_view import TakesView
 _PARAM_ORDER = ["duration", "resolution", "seed", "camera_fixed", "mode", "length"]
 _DEFAULT_PLACEMENT = {"scale": 0.65, "cx": 0.5, "cy": 0.6}
 _WAN_FPS = 16                                          # local Wan renders at a fixed 16 fps
-_OUTPUT_PARAMS = {"resolution", "duration", "length"}  # live on the Output tab, not Model settings
+_OUTPUT_PARAMS = {"resolution", "duration", "length"}  # go in the output_form, not the Model settings group
 
 
 class _KeyframeButton(QPushButton):
@@ -108,13 +108,17 @@ class ShotTab(QWidget):
         self.fetch_btn.clicked.connect(self._fetch_schema)
         self.schema_status = QLabel("")
 
-        # Output tab: resolution + duration (both model-aware) + read-only fps.
+        # Output tab: resolution + duration (model-aware) + the Model settings group +
+        # read-only fps and est. price.
         self.output_form = QFormLayout()
         self.fps_value = QLabel("—"); self.fps_value.setStyleSheet("color: gray;")
         self.price_value = QLabel("—"); self.price_value.setStyleSheet("font-weight: bold;")
         output_tab = QWidget()
         ov = QVBoxLayout(output_tab)
         ov.addLayout(self.output_form)
+        ov.addWidget(self.params_box)
+        frow = QHBoxLayout(); frow.addWidget(self.fetch_btn); frow.addWidget(self.schema_status); frow.addStretch(1)
+        ov.addLayout(frow)
         fps_line = QHBoxLayout()
         fps_line.addWidget(QLabel("Output FPS")); fps_line.addWidget(self.fps_value, 1)
         ov.addLayout(fps_line)
@@ -125,12 +129,10 @@ class ShotTab(QWidget):
         tabs = QTabWidget()
         tabs.addTab(self.canvas, "Framing")
         tabs.addTab(output_tab, "Output")
-        settings_tab = QWidget()
-        sv = QVBoxLayout(settings_tab)
-        sv.addWidget(prompt_box); sv.addWidget(self.params_box)
-        frow = QHBoxLayout(); frow.addWidget(self.fetch_btn); frow.addWidget(self.schema_status); frow.addStretch(1)
-        sv.addLayout(frow)
-        tabs.addTab(settings_tab, "Prompt & settings")
+        prompt_tab = QWidget()
+        sv = QVBoxLayout(prompt_tab)
+        sv.addWidget(prompt_box)
+        tabs.addTab(prompt_tab, "Prompt")
 
         self._takes_host = QWidget()
         self._takes_layout = QVBoxLayout(self._takes_host)
