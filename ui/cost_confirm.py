@@ -55,7 +55,7 @@ def total_price_text(costs: list[Optional[float]]) -> str:
     None costs (model declares no rate / unknown model) are tallied separately as
     '(+N unknown)' rather than silently dropped; local $0 shots contribute nothing.
     """
-    total = sum(c for c in costs if c)          # None and 0.0 are falsy -> skipped
+    total = sum(c for c in costs if c is not None)   # known costs; local $0 adds nothing
     unknown = sum(1 for c in costs if c is None)
     text = f"Full set: ${total:.2f}"
     if unknown:
