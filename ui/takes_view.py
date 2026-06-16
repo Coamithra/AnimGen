@@ -7,11 +7,12 @@ cached. Emits `changed` (so the card header can refresh counts) and `export_requ
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QColor, QIcon, QMovie, QPainter, QPixmap, QStandardItem, QStandardItemModel,
+    QColor, QIcon, QPainter, QPixmap, QStandardItem, QStandardItemModel,
 )
 from PySide6.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QListView, QMenu, QPushButton, QSlider,
@@ -20,11 +21,39 @@ from PySide6.QtWidgets import (
 
 from pipeline import extract, takes_io
 from store.project import Project
+from ui.take_player import decode_strip, take_source
+
+_ANIM_INTERVAL_MS = 80     # ~12.5 fps grid loop (a thumbnail only needs to read as motion)
 
 _USER_ROLE = int(Qt.ItemDataRole.UserRole)
 _BADGE = {"pending": "⏳", "generating": "▶", "done": "", "failed": "✗"}
 _BADGE_COLOR = {"pending": "#b0b0b0", "generating": "#5aa0ff",
                 "done": "#7ade8c", "failed": "#ff6b6b", "cancelled": "#c0a060"}
+
+
+class _StripLoader(QObject):
+    """Decodes each take's clip into a small frame strip off the GUI thread, emitting one
+    `ready` per take as it finishes (so tiles start animating progressively rather than all
+    at once). `gen` is a generation token the view uses to discard results from a load that
+    has since been superseded (e.g. the row was collapsed and re-expanded)."""
+    ready = Signal(str, list, int)   # take_id, list[QImage], gen
+
+    def __init__(self, jobs: list, gen: int):
+        super().__init__()
+        self._jobs = jobs            # list[(take_id, source_path)]
+        self._gen = gen
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        for take_id, source in self._jobs:
+            try:
+                frames = decode_strip(source)
+            except Exception:  # noqa: BLE001 - a bad clip just doesn't animate
+                frames = []
+            if frames:
+                self.ready.emit(take_id, frames, self._gen)
 
 
 class TakesView(QWidget):
@@ -36,9 +65,15 @@ class TakesView(QWidget):
         super().__init__()
         self.project = project
         self.shot_id = shot_id
-        self._items: dict[str, QStandardItem] = {}   # take_id -> grid item (for live frames)
-        self._movies: dict[str, QMovie] = {}         # take_id -> looping gif preview
+        self._items: dict[str, QStandardItem] = {}    # take_id -> grid item (for live frames)
+        self._strips: dict[str, list] = {}            # take_id -> list[QPixmap] (decoded loop)
+        self._frame_idx: dict[str, int] = {}          # take_id -> current frame in its strip
         self._animating = True
+        self._anim_gen = 0                            # bumped on each (re)load to drop stale strips
+        self._loader: _StripLoader | None = None
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(_ANIM_INTERVAL_MS)
+        self._anim_timer.timeout.connect(self._tick)
         self._build()
         self.load()
 
@@ -88,7 +123,7 @@ class TakesView(QWidget):
     def load(self) -> None:
         fav = self.filter.currentText() == "Favorites"
         takes = self.project.list_takes(self.shot_id, starred_only=fav)
-        self._clear_movies()
+        self._reset_anim()
         self.model.clear()
         self._items.clear()
         for t in takes:
@@ -98,46 +133,67 @@ class TakesView(QWidget):
             self.model.appendRow(item)
             self._items[t.id] = item
         self.count_label.setText(f"{len(takes)} shown")
-        self._build_movies(takes)
+        if self._animating:
+            self._start_strip_load(takes)
 
-    # ---- animated previews (gif loops over the static thumbnails) -------
-    def _clear_movies(self) -> None:
-        for m in self._movies.values():
-            m.stop()
-            m.deleteLater()
-        self._movies.clear()
+    # ---- animated previews (decoded frame loop over the static thumbnails) ----
+    # The grid tiles animate by cycling a small decoded frame strip per take. This goes
+    # through PyAV (decode_strip) rather than QMovie so it animates the real .mp4 renders -
+    # we don't generate gif previews, so a gif-only path would leave every actual take
+    # static. Strips are held only while the row is expanded (cleared on collapse) to bound
+    # memory; re-expanding re-decodes off-thread.
+    def _reset_anim(self) -> None:
+        self._anim_gen += 1          # any in-flight loader's results now belong to an old gen
+        self._anim_timer.stop()
+        self._strips.clear()
+        self._frame_idx.clear()
+        self._loader = None
 
-    def _build_movies(self, takes) -> None:
-        """Give each take with a gif preview a looping QMovie so the grid tiles animate.
-        QMovie streams the gif (cheap memory) and each frame is pushed onto the take's icon;
-        QIcon scales it to the current icon size keeping aspect, so non-square clips aren't
-        distorted. Animation is paused while the view is collapsed/hidden (set_animating)."""
+    def _start_strip_load(self, takes) -> None:
+        jobs = []
         for t in takes:
-            gif = t.preview_gif
-            if not (gif and Path(gif).exists()):
-                continue
-            movie = QMovie(gif, parent=self)
-            movie.setCacheMode(QMovie.CacheMode.CacheAll)
-            movie.frameChanged.connect(lambda _f, tid=t.id: self._on_movie_frame(tid))
-            self._movies[t.id] = movie
-            if self._animating:
-                movie.start()
+            src = take_source(t)
+            if src:
+                jobs.append((t.id, src))
+        if not jobs:
+            return
+        self._loader = _StripLoader(jobs, self._anim_gen)   # kept on self so it isn't GC'd
+        self._loader.ready.connect(self._on_strip_ready)
+        self._loader.start()
 
-    def _on_movie_frame(self, take_id: str) -> None:
-        movie = self._movies.get(take_id)
-        item = self._items.get(take_id)
-        if movie is not None and item is not None:
-            item.setIcon(QIcon(movie.currentPixmap()))
+    def _on_strip_ready(self, take_id: str, qimages: list, gen: int) -> None:
+        if gen != self._anim_gen or take_id not in self._items:
+            return                                          # superseded by a newer load
+        self._strips[take_id] = [QPixmap.fromImage(im) for im in qimages]
+        self._frame_idx[take_id] = 0
+        self._items[take_id].setIcon(QIcon(self._strips[take_id][0]))
+        if self._animating and not self._anim_timer.isActive():
+            self._anim_timer.start()
+
+    def _tick(self) -> None:
+        for take_id, strip in self._strips.items():
+            item = self._items.get(take_id)
+            if not (item and strip):
+                continue
+            idx = (self._frame_idx.get(take_id, 0) + 1) % len(strip)
+            self._frame_idx[take_id] = idx
+            item.setIcon(QIcon(strip[idx]))
 
     def set_animating(self, on: bool) -> None:
-        """Play/pause the grid animations - the card pauses them while collapsed so a
-        long shot list isn't decoding dozens of gifs no one is looking at."""
+        """Play/pause the grid animations - the card pauses them while collapsed so a long
+        shot list isn't decoding clips no one is looking at. Collapsing also frees the
+        decoded strips (re-decoded on re-expand) to keep memory to the visible row."""
+        if on == self._animating:
+            return
         self._animating = on
-        for m in self._movies.values():
-            if on and m.state() != QMovie.MovieState.Running:
-                m.start()
-            elif not on:
-                m.setPaused(True)
+        if on:
+            if not self._strips:
+                self._start_strip_load(self.project.list_takes(
+                    self.shot_id, starred_only=self.filter.currentText() == "Favorites"))
+            elif not self._anim_timer.isActive():
+                self._anim_timer.start()
+        else:
+            self._reset_anim()
 
     def hideEvent(self, event):  # noqa: N802 - Qt override: pause when the view goes off screen
         self.set_animating(False)
