@@ -22,11 +22,15 @@ MODEL_LIBRARY_PATH = ROOT / "model_library.json"
 WORKFLOWS_DIR = ROOT / "workflows"               # bundled local-backend templates
 ENV_FILE = ROOT / ".env"                         # own token file (gitignored, optional)
 
+RESOURCES_DIR = ROOT / "resources"               # bundled app assets (icon, ...)
+APP_ICON_SVG = RESOURCES_DIR / "icon.svg"        # vector source (runtime QIcon)
+APP_ICON_ICO = RESOURCES_DIR / "icon.ico"        # multi-size Windows icon
+
 DATA_DIR = ROOT / "data"
-DB_PATH = DATA_DIR / "animgen.db"
-RESULTS_DIR = DATA_DIR / "results"               # results/<config_id>/<result_id>.mp4
-BIN_DIR = DATA_DIR / "bin"                       # soft-deleted results land here
 EXPORTS_DIR = DATA_DIR / "exports"               # <name>_<timestamp>/ frame sets
+SCRATCH_DIR = DATA_DIR / "_scratch"              # assets dir for untitled projects
+APP_STATE = DATA_DIR / "app_state.json"          # {"last_project": <path>}
+DEFAULT_PROJECT = DATA_DIR / "Fighter.animproj"  # seeded starter project
 
 # External references (overridable via env) -----------------------------------
 COMFY_DIR = Path(os.environ.get("ANIMGEN_COMFY_DIR", str(PROJECTS_ROOT / "comfyui")))
@@ -41,7 +45,7 @@ GAME_SPRITES_MANIFEST = FIGHTER_ROOT / "scripts" / "game_sprites_manifest.json"
 
 def ensure_dirs() -> None:
     """Create the runtime data directories if they don't exist."""
-    for d in (DATA_DIR, RESULTS_DIR, BIN_DIR, EXPORTS_DIR):
+    for d in (DATA_DIR, EXPORTS_DIR, SCRATCH_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

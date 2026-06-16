@@ -316,6 +316,20 @@ def _nodes_by_class(wf: dict, class_type: str) -> list[str]:
     return sorted(ids, key=lambda s: (len(s), s))  # numeric-ish ascending
 
 
+def _disconnect_consumers(wf: dict, src_id: str) -> None:
+    """Remove every input link that feeds FROM node `src_id`. Used to drop an FLF
+    workflow's end-image conditioning when no end frame is supplied, so the Wan
+    first-last node runs open-ended (I2V-style) instead of reusing a baked frame."""
+    src = str(src_id)
+    for node in wf.values():
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for field in [f for f, v in inputs.items()
+                      if isinstance(v, list) and v and str(v[0]) == src]:
+            del inputs[field]
+
+
 def prepare_workflow(template: dict, *, start_img: Optional[str] = None,
                      end_img: Optional[str] = None, prompt: Optional[str] = None,
                      negative: Optional[str] = None, seed: Optional[int] = None,
@@ -347,6 +361,10 @@ def prepare_workflow(template: dict, *, start_img: Optional[str] = None,
         if nid is None:
             raise ComfyError("no second LoadImage node for end image")
         set_input(nid, "image", copy_input_image(end_img))
+    elif roles.get("end_image") or len(loads) > 1:
+        # No end frame -> run open-ended: sever the end-image conditioning so an FLF
+        # workflow degrades to I2V instead of reusing the template's baked end frame.
+        _disconnect_consumers(wf, roles.get("end_image") or loads[1])
     if prompt is not None:
         nid = roles.get("prompt") or (clips[0] if clips else None)
         if nid is None:

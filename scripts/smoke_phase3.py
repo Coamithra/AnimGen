@@ -1,8 +1,8 @@
 """Phase 3 smoke test (offscreen, no spend).
 
-Covers framing math (crop + scale-to-height + magenta canvas), the crop widget's
-crop/framing readout, and the config editor's save/load round-trip (bakes a
-normalized start keypose and persists framing metadata).
+Covers framing math (normalize_keypose), the placement canvas (aspect + sprite + drag
+placement round-trip), per-model aspect dropdown + validation in the shot tab, and the
+gen-time keypose render from a shot's per-keyframe placement.
 
     QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
         animgen/.venv/Scripts/python.exe animgen/scripts/smoke_phase3.py
@@ -20,8 +20,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # animgen/
 from PIL import Image, ImageDraw  # noqa: E402
 
 import paths  # noqa: E402
+
+paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
+
 from pipeline import framing  # noqa: E402
-from store.db import Store  # noqa: E402
+from store.project import Project  # noqa: E402
 
 
 def _char_image(path: Path) -> None:
@@ -43,81 +46,114 @@ def test_framing() -> None:
     assert abs((y1 - y0 + 1) - target) <= max(5, 0.06 * target), (y1 - y0 + 1, target)
     assert abs(y1 - 380) <= 3, y1                          # feet at ground line
     assert abs((x0 + x1) / 2 - 200) <= 3                   # centered
-    # crop path: tight crop still frames to the target fraction
-    meta2 = framing.normalize_keypose(
-        src, crop=(80, 40, 41, 121), canvas=(400, 400), char_height_frac=0.8, ground_y=390)
-    h2 = meta2["char_box"][3] - meta2["char_box"][1] + 1
-    assert abs(h2 - 0.8 * 400) <= max(6, 0.06 * 320), h2
-    print("framing OK: scale-to-height, ground placement, centering, crop")
+    # canvas_size: hosted = longest side 1254; local = ~budget, both dims /16
+    assert framing.canvas_size("16:9", local=False) == (1254, 705)
+    for a in ("1:1", "16:9", "9:16", "21:9"):
+        w, h = framing.canvas_size(a, local=True)
+        assert w % 16 == 0 and h % 16 == 0 and 380_000 < w * h < 430_000, (a, w, h)
+    # display_size: hosted readout tracks the resolution tier (short side); local = render canvas
+    assert framing.display_size("1:1", resolution="720p") == (720, 720)
+    assert framing.display_size("1:1", resolution="480p") == (480, 480)
+    assert framing.display_size("16:9", resolution="720p") == (1280, 720)
+    assert framing.display_size("9:16", resolution="1080p") == (1080, 1920)
+    assert framing.display_size("1:1", local=True) == framing.canvas_size("1:1", local=True)
+    assert framing.display_size("16:9", resolution=None) == framing.canvas_size("16:9")
+    print("framing OK: normalize_keypose + canvas_size (hosted long-side / local /16 budget)")
 
 
-def test_crop_widget() -> None:
+def test_placement_canvas() -> None:
     from PySide6.QtWidgets import QApplication
 
-    from ui.crop_widget import CropWidget
+    from ui.placement_widget import PlacementCanvas, pil_to_pixmap
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
     tmp = Path(tempfile.mkdtemp())
     src = tmp / "char.png"
     _char_image(src)
-    w = CropWidget()
-    w.set_source(str(src))
-    assert w.get_crop() == [0, 0, 200, 200]
-    f = w.get_framing()
-    assert f["canvas"] == [1254, 1254] and abs(f["char_height_frac"] - 0.65) < 1e-9
-    w.sx.setValue(80); w.sy.setValue(40); w.sw.setValue(41); w.sh.setValue(121)
-    assert w.get_crop() == [80, 40, 41, 121]
-    out = tmp / "baked.png"
-    w.bake(str(out))
-    assert out.exists() and Image.open(out).size == (1254, 1254)
-    print("CropWidget OK: source load, crop readout, bake")
+    pc = PlacementCanvas()
+    pc.set_aspect(*framing.canvas_size("16:9", local=False))
+    pc.set_sprite(pil_to_pixmap(framing.keyed_sprite(str(src))))
+    pc.set_placement({"scale": 0.5, "cx": 0.4, "cy": 0.6})
+    got = pc.get_placement()
+    assert abs(got["scale"] - 0.5) < 0.03 and abs(got["cx"] - 0.4) < 0.03 \
+        and abs(got["cy"] - 0.6) < 0.03, got
+    print("PlacementCanvas OK: aspect + keyed sprite + placement round-trip")
 
 
-def test_config_editor() -> None:
+def test_shot_tab() -> None:
     from PySide6.QtWidgets import QApplication
 
-    from ui.config_editor import ConfigEditor
+    from ui.shot_tab import ShotTab
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
     tmp = Path(tempfile.mkdtemp())
     src = tmp / "char.png"
     _char_image(src)
-    paths.ensure_dirs()
-    st = Store(Path(tempfile.mkdtemp()) / "e.db")
+    project = Project.new()
+    asset = str(project.import_asset(src))
 
-    ed = ConfigEditor(st)
-    idx = ed.model_combo.findData("seedance-2.0-std")
-    ed.model_combo.setCurrentIndex(idx)
-    p = ed._params()
-    assert p["aspect_ratio"] == "1:1" and p["camera_fixed"] is True
-    assert p["duration"] == 4 and p["resolution"] == "720p" and p["seed"] == 7
+    ed = ShotTab(project)
+    ed.model_combo.setCurrentIndex(ed.model_combo.findData("seedance-2.0-std"))
+    aspects = [ed.aspect_combo.itemText(i) for i in range(ed.aspect_combo.count())]
+    assert aspects == ["1:1", "16:9", "9:16"], aspects
+    assert ed.aspect_valid()
+    assert "aspect_ratio" not in ed._params()    # owned by the Aspect dropdown now
+    assert ed._params()["resolution"] == "720p" and ed._params()["seed"] == 7
+
     ed.name.setText("kick_heavy")
     ed.prompt.setPlainText("fierce kick")
-    ed.start_src.setText(str(src))
-    ed.crop.set_source(str(src))
-    ed._save()
+    ed._set_asset("start", asset); ed._select("start")
+    ed.aspect_combo.setCurrentText("16:9")
+    saved = []
+    ed.saved.connect(saved.append)
+    sid = ed._save()
+    assert sid and saved == [sid], "save should emit saved(shot_id)"
 
-    cfgs = st.list_configs()
-    assert len(cfgs) == 1
-    cfg = cfgs[0]
-    assert cfg.name == "kick_heavy" and cfg.model_id == "seedance-2.0-std"
-    assert cfg.prompt == "fierce kick"
-    assert cfg.start_frame and Path(cfg.start_frame).exists()
-    assert cfg.crop.get("source_start") == str(src) and cfg.canvas_w == 1254
+    shot = project.list_shots()[0]
+    assert shot.name == "kick_heavy" and shot.start_frame == asset
+    assert shot.crop["aspect"] == "16:9" and "start" in shot.crop and "end" in shot.crop
+    assert (shot.canvas_w, shot.canvas_h) == framing.canvas_size("16:9", local=False)
+    assert shot.settings.get("aspect_ratio") == "16:9"   # injected for seedance
+    assert not (project.assets_dir / "keyposes").exists(), "no hash keypose folders"
 
-    # reopen for edit: fields load back, second save keeps a single config
-    ed2 = ConfigEditor(st, config=st.get_config(cfg.id))
-    assert ed2.name.text() == "kick_heavy"
-    assert ed2.model_combo.currentData() == "seedance-2.0-std"
-    assert ed2._params()["seed"] == 7
-    ed2._save()
-    assert len(st.list_configs()) == 1
-    st.close()
-    print("ConfigEditor OK: params, save (bake+persist), load round-trip")
+    # selected AR unavailable on a new model -> field invalid (Generate would refuse)
+    ed.aspect_combo.setCurrentText("1:1")
+    ed.model_combo.setCurrentIndex(ed.model_combo.findData("veo-3.1-fast"))  # no 1:1
+    assert not ed.aspect_valid()
+
+    # reopen round-trip
+    ed2 = ShotTab(project, shot=project.get_shot(shot.id))
+    assert ed2.name.text() == "kick_heavy" and ed2._assets["start"] == asset
+    assert ed2.selected_aspect() == "16:9"
+    print("ShotTab OK: per-model aspect dropdown + validation, asset pick, save/load")
+
+
+def test_render_keyposes() -> None:
+    tmp = Path(tempfile.mkdtemp())
+    src = tmp / "char.png"
+    _char_image(src)
+    project = Project.new()
+    asset = str(project.import_asset(src))
+    w, h = framing.canvas_size("16:9", local=False)
+
+    class _Shot:  # duck-typed shot for the framing call
+        start_frame = asset
+        end_frame = None
+        canvas_w, canvas_h = w, h
+        crop = {"aspect": "16:9", "start": {"scale": 0.8, "cx": 0.5, "cy": 0.55}, "end": {}}
+
+    out = Path(tempfile.mkdtemp())
+    start_kp, end_kp = framing.render_keyposes(_Shot(), out)
+    assert start_kp and Path(start_kp).exists()
+    assert Image.open(start_kp).size == (w, h)
+    assert Image.open(start_kp).getpixel((0, 0)) == (255, 0, 255)  # magenta bg
+    assert end_kp is None
+    print("render_keyposes OK: keyed sprite placed on the aspect canvas at gen time")
 
 
 if __name__ == "__main__":
     test_framing()
-    test_crop_widget()
-    test_config_editor()
+    test_placement_canvas()
+    test_shot_tab()
+    test_render_keyposes()
     print("PHASE 3 SMOKE: PASS")

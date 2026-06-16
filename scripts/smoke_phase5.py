@@ -1,8 +1,8 @@
 """Phase 5 smoke test (offscreen, no spend).
 
-Encodes a tiny real mp4, then exercises export: single result (flat folder),
-multiple (parent + subfolders), skipped (no video), and verifies settings.txt
-carries the immutable settings_snapshot. Also confirms the main window still builds.
+Encodes a tiny real mp4, then exercises export: single take (flat folder), multiple
+(parent + subfolders), skipped (no video), and verifies settings.txt carries the
+immutable settings_snapshot. Also confirms the main window still builds.
 
     QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
         animgen/.venv/Scripts/python.exe animgen/scripts/smoke_phase5.py
@@ -20,8 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # animgen/
 import av  # noqa: E402
 import numpy as np  # noqa: E402
 
+import paths  # noqa: E402
+
+paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
+
 from pipeline import export  # noqa: E402
-from store.db import Store  # noqa: E402
+from store.project import Project  # noqa: E402
 from store.models import STATUS_DONE, STATUS_PENDING  # noqa: E402
 
 
@@ -44,19 +48,19 @@ def _make_mp4(path: Path, n: int = 5) -> None:
 def test_export() -> None:
     tmp = Path(tempfile.mkdtemp())
     dest = tmp / "exports"
-    st = Store(tmp / "db.sqlite")
-    cfg = st.add_config("kick_heavy", model_id="seedance-2.0-std",
-                        prompt="fierce kick", settings={"seed": 7, "duration": 4})
+    project = Project.new()
+    shot = project.add_shot("kick_heavy", model_id="seedance-2.0-std",
+                            prompt="fierce kick", settings={"seed": 7, "duration": 4})
 
     vid = tmp / "r1.mp4"
     _make_mp4(vid, n=5)
     snap = {"model_id": "seedance-2.0-std", "seed": 7, "prompt": "fierce kick",
             "settings": {"seed": 7, "duration": 4}}
-    r1 = st.add_result(cfg.id, status=STATUS_DONE, seed=7, video_path=str(vid),
-                       settings_snapshot=snap, cost_estimate=0.72)
+    r1 = project.add_take(shot.id, status=STATUS_DONE, seed=7, video_path=str(vid),
+                          settings_snapshot=snap, cost_estimate=0.72)
 
     # single -> flat folder with frames + settings.txt
-    res = export.export_results(st, [r1.id], dest_root=dest)
+    res = export.export_takes(project, [r1.id], dest_root=dest)
     folder = res["parent"]
     frames = sorted(folder.glob("frame_*.png"))
     assert len(frames) == 5, len(frames)
@@ -64,18 +68,17 @@ def test_export() -> None:
     assert "settings_snapshot" in txt and '"seed": 7' in txt and "fierce kick" in txt
     assert "kick_heavy" in folder.name
 
-    # multiple -> parent with one subfolder per result
+    # multiple -> parent with one subfolder per take
     vid2 = tmp / "r2.mp4"; _make_mp4(vid2, n=3)
-    r2 = st.add_result(cfg.id, status=STATUS_DONE, video_path=str(vid2), settings_snapshot=snap)
-    res2 = export.export_results(st, [r1.id, r2.id], label="kick_heavy", dest_root=dest)
+    r2 = project.add_take(shot.id, status=STATUS_DONE, video_path=str(vid2), settings_snapshot=snap)
+    res2 = export.export_takes(project, [r1.id, r2.id], label="kick_heavy", dest_root=dest)
     subs = [p for p in res2["parent"].iterdir() if p.is_dir()]
     assert len(subs) == 2 and all((s / "settings.txt").exists() for s in subs)
 
-    # skipped: a pending result with no video
-    r3 = st.add_result(cfg.id, status=STATUS_PENDING)
-    res3 = export.export_results(st, [r3.id], dest_root=dest)
+    # skipped: a pending take with no video
+    r3 = project.add_take(shot.id, status=STATUS_PENDING)
+    res3 = export.export_takes(project, [r3.id], dest_root=dest)
     assert res3["parent"] is None and r3.id in res3["skipped"]
-    st.close()
     print("export OK: single(flat)/multi(subfolders)/skipped, settings.txt snapshot")
 
 
@@ -85,17 +88,16 @@ def test_window_builds() -> None:
     from ui.main_window import MainWindow
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
-    st = Store(Path(tempfile.mkdtemp()) / "db.sqlite")
-    cfg = st.add_config("c", model_id="seedance-2.0-std")
-    st.add_result(cfg.id, status=STATUS_DONE)
-    win = MainWindow(st)
+    project = Project.new()
+    shot = project.add_shot("c", model_id="seedance-2.0-std")
+    project.add_take(shot.id, status=STATUS_DONE)
+    win = MainWindow(project)
     assert len(win.cards) == 1
     # export_current_view gathers ids without crashing (no video -> would no-op in UI)
     ids = []
     for card in win.cards.values():
         ids.extend(card._row_export_ids())
     assert len(ids) == 1
-    st.close()
     print("MainWindow OK: builds with export wiring, row ids gathered")
 
 

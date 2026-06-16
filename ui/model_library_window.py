@@ -17,6 +17,12 @@ _COLUMNS = ["Model", "Backend", "Cost", "End frame", "Data-URI", "Duration", "No
 
 def _cost(m: dict) -> str:
     c = m.get("cost_per_second_usd")
+    if isinstance(c, dict):                       # per-resolution table -> show the span
+        vals = [v for v in c.values() if v is not None]
+        if not vals:
+            return "?"
+        lo, hi = min(vals), max(vals)
+        return f"${lo:.3f}/s" if lo == hi else f"${lo:.3f}-${hi:.3f}/s"
     if c == 0:
         return "free"
     return f"${c:.3f}/s" if c is not None else "?"

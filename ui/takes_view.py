@@ -1,15 +1,13 @@
-"""Results folder view - the per-config grid of generated takes.
+"""Takes folder view - the per-shot grid of generated takes.
 
 A QListView in IconMode (Windows-folder style) with an icon-size slider, a
-favorite/all filter, live status badges, per-result star + delete-to-bin, and
+favorite/all filter, live status badges, per-take star + delete-to-bin, and
 shift/ctrl multi-select. Thumbnails are the first video frame, generated lazily and
-cached. Emits `changed` (so the card header can refresh counts) and
-`export_requested` (consumed in Phase 5).
+cached. Emits `changed` (so the card header can refresh counts) and `export_requested`.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QStandardItem, QStandardItemModel
@@ -18,9 +16,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-import paths
-from pipeline import extract, results_io
-from store.db import Store
+from pipeline import extract, takes_io
+from store.project import Project
 
 _USER_ROLE = int(Qt.ItemDataRole.UserRole)
 _BADGE = {"pending": "⏳", "generating": "▶", "done": "", "failed": "✗"}
@@ -28,15 +25,14 @@ _BADGE_COLOR = {"pending": "#b0b0b0", "generating": "#5aa0ff",
                 "done": "#7ade8c", "failed": "#ff6b6b", "cancelled": "#c0a060"}
 
 
-class ResultsView(QWidget):
+class TakesView(QWidget):
     changed = Signal()
-    export_requested = Signal(list)   # list[result_id]
+    export_requested = Signal(list)   # list[take_id]
 
-    def __init__(self, store: Store, config_id: str):
+    def __init__(self, project: Project, shot_id: str):
         super().__init__()
-        self.store = store
-        self.config_id = config_id
-        self._thumb_dir = paths.DATA_DIR / "thumbs"
+        self.project = project
+        self.shot_id = shot_id
         self._build()
         self.load()
 
@@ -53,7 +49,7 @@ class ResultsView(QWidget):
 
         export_btn = QPushButton("Export selected")
         export_btn.clicked.connect(
-            lambda: self.export_requested.emit(self.selected_result_ids()))
+            lambda: self.export_requested.emit(self.selected_take_ids()))
         self.count_label = QLabel("")
 
         head = QHBoxLayout()
@@ -85,35 +81,35 @@ class ResultsView(QWidget):
     # ---- population -----------------------------------------------------
     def load(self) -> None:
         fav = self.filter.currentText() == "Favorites"
-        results = self.store.list_results(self.config_id, starred_only=fav)
+        takes = self.project.list_takes(self.shot_id, starred_only=fav)
         self.model.clear()
-        for r in results:
-            item = QStandardItem(self._icon_for(r), self._label(r))
-            item.setData(r.id, _USER_ROLE)
+        for t in takes:
+            item = QStandardItem(self._icon_for(t), self._label(t))
+            item.setData(t.id, _USER_ROLE)
             item.setEditable(False)
             self.model.appendRow(item)
-        self.count_label.setText(f"{len(results)} shown")
+        self.count_label.setText(f"{len(takes)} shown")
 
-    def _label(self, r) -> str:
-        badge = _BADGE.get(r.status, "")
-        star = "★ " if r.starred else ""
-        tail = "" if r.status == "done" else f"  {r.status}"
-        return f"{star}{badge}{tail}".strip() or r.id[:6]
+    def _label(self, t) -> str:
+        badge = _BADGE.get(t.status, "")
+        star = "★ " if t.starred else ""
+        tail = "" if t.status == "done" else f"  {t.status}"
+        return f"{star}{badge}{tail}".strip() or t.id[:6]
 
-    def _icon_for(self, r) -> QIcon:
-        if r.thumbnail and Path(r.thumbnail).exists():
-            return QIcon(r.thumbnail)
-        if r.video_path and Path(r.video_path).exists():
+    def _icon_for(self, t) -> QIcon:
+        if t.thumbnail and Path(t.thumbnail).exists():
+            return QIcon(t.thumbnail)
+        if t.video_path and Path(t.video_path).exists():
             try:
-                out = self._thumb_dir / f"{r.id}.png"
+                out = self.project.thumbs_dir / f"{t.id}.png"
                 if not out.exists():
-                    extract.make_thumbnail(r.video_path, out)
+                    extract.make_thumbnail(t.video_path, out)
                 if out.exists():
-                    self.store.update_result(r.id, thumbnail=str(out))
+                    self.project.update_take(t.id, thumbnail=str(out))
                     return QIcon(str(out))
             except Exception:  # noqa: BLE001 - corrupt/locked video -> placeholder
                 pass
-        return self._placeholder(r.status)
+        return self._placeholder(t.status)
 
     def _placeholder(self, status: str) -> QIcon:
         pm = QPixmap(220, 160)
@@ -130,15 +126,15 @@ class ResultsView(QWidget):
         self.view.setGridSize(QSize(s + 26, s + 42))
 
     # ---- selection / actions -------------------------------------------
-    def selected_result_ids(self) -> list:
+    def selected_take_ids(self) -> list:
         return [self.model.itemFromIndex(i).data(_USER_ROLE)
                 for i in self.view.selectedIndexes()]
 
-    def all_result_ids(self) -> list:
+    def all_take_ids(self) -> list:
         return [self.model.item(r).data(_USER_ROLE) for r in range(self.model.rowCount())]
 
     def _context_menu(self, pos) -> None:
-        ids = self.selected_result_ids()
+        ids = self.selected_take_ids()
         if not ids:
             return
         menu = QMenu(self)
@@ -157,27 +153,27 @@ class ResultsView(QWidget):
             self._open_selected()
 
     def toggle_star(self, ids: list) -> None:
-        for rid in ids:
-            r = self.store.get_result(rid)
-            if r:
-                self.store.set_starred(rid, not r.starred)
+        for tid in ids:
+            t = self.project.get_take(tid)
+            if t:
+                self.project.set_starred(tid, not t.starred)
         self.load()
         self.changed.emit()
 
     def delete(self, ids: list) -> None:
-        for rid in ids:
-            r = self.store.get_result(rid)
-            if r:
-                results_io.move_to_bin(r, self.store)
+        for tid in ids:
+            t = self.project.get_take(tid)
+            if t:
+                takes_io.move_to_bin(t, self.project)
         self.load()
         self.changed.emit()
 
     def _open_selected(self, *_) -> None:
         import os
-        for rid in self.selected_result_ids():
-            r = self.store.get_result(rid)
-            if r and r.video_path and Path(r.video_path).exists():
+        for tid in self.selected_take_ids():
+            t = self.project.get_take(tid)
+            if t and t.video_path and Path(t.video_path).exists():
                 try:
-                    os.startfile(r.video_path)  # type: ignore[attr-defined]  # Windows
+                    os.startfile(t.video_path)  # type: ignore[attr-defined]  # Windows
                 except Exception:  # noqa: BLE001
                     pass

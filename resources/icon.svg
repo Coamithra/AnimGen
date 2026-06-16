@@ -1,0 +1,32 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="40" y1="24" x2="472" y2="488" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5B6CFF"/>
+      <stop offset="0.52" stop-color="#7A3FF2"/>
+      <stop offset="1" stop-color="#B23BE0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.32" cy="0.2" r="0.95">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.38"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tri" x1="206" y1="160" x2="360" y2="356" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#E4ECFF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- app tile -->
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#glow)"/>
+
+  <!-- onion-skin keyframes resolving into a played animation -->
+  <g stroke-linejoin="round" fill="none">
+    <path d="M 122 184 L 122 328 L 240 256 Z" stroke="#ffffff" stroke-opacity="0.22" stroke-width="20"/>
+    <path d="M 165 175 L 165 337 L 298 256 Z" stroke="#ffffff" stroke-opacity="0.45" stroke-width="22"/>
+  </g>
+  <path d="M 208 166 L 208 346 L 356 256 Z" fill="url(#tri)" stroke="url(#tri)" stroke-width="26" stroke-linejoin="round"/>
+
+  <!-- generation spark -->
+  <path d="M 372 138 l 10 26 26 10 -26 10 -10 26 -10 -26 -26 -10 26 -10 z" fill="#FFE6A0"/>
+  <circle cx="330" cy="120" r="9" fill="#FFE6A0" fill-opacity="0.9"/>
+</svg>

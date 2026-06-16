@@ -1,19 +1,18 @@
-"""Dataclasses mirroring the SQLite schema in store/db.py.
+"""Dataclasses for the AnimGen project document (see store/project.py).
 
-- Config: one "animation configuration" row - start/end keypose, framing, prompt,
-  model + params. The user-facing rows in the main window.
-- Result: one generated take. Its `settings_snapshot` is an IMMUTABLE copy of the
-  exact config + resolved model params at the moment it was launched, so a result
-  stays linked to what made it even if the config is later edited. This fills the
-  project's current "no per-take metadata" gap.
-- Job: one generation in the queue (backend + external id + state/log).
+- Shot: one authored animation - start/end keypose, framing, prompt, model + params.
+  The user-facing rows in the main window (was "config" pre-2026-06-16).
+- Take: one generated take (an .mp4). Its `settings_snapshot` is an IMMUTABLE copy of
+  the exact shot + resolved model params at the moment it was launched, so a take stays
+  linked to what made it even if the shot is later edited (was "result").
+- Job: one generation in the queue (backend + external id + state/log). In-memory only.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional
 
-# Result status values (also the folder-view badge labels).
+# Take status values (also the folder-view badge labels).
 STATUS_PENDING = "pending"
 STATUS_GENERATING = "generating"
 STATUS_DONE = "done"
@@ -23,7 +22,7 @@ STATUSES = (STATUS_PENDING, STATUS_GENERATING, STATUS_DONE, STATUS_FAILED, STATU
 
 
 @dataclass
-class Config:
+class Shot:
     id: str
     name: str
     start_frame: Optional[str] = None       # path to start keypose
@@ -40,9 +39,9 @@ class Config:
 
 
 @dataclass
-class Result:
+class Take:
     id: str
-    config_id: str
+    shot_id: str
     status: str = STATUS_PENDING
     video_path: Optional[str] = None
     preview_gif: Optional[str] = None
@@ -54,7 +53,7 @@ class Result:
     fps: Optional[float] = None
     frame_count: Optional[int] = None
     starred: bool = False
-    deleted: bool = False                   # soft delete -> moved to data/bin/
+    deleted: bool = False                   # soft delete -> moved to <assets>/.bin/
     error: Optional[str] = None
     created: str = ""
     completed: Optional[str] = None
@@ -63,7 +62,7 @@ class Result:
 @dataclass
 class Job:
     id: str
-    result_id: str
+    take_id: str
     backend: str = ""                       # "replicate" | "comfyui"
     state: str = "queued"                   # queued | running | done | failed
     log: str = ""

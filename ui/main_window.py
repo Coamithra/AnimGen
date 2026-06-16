@@ -1,109 +1,76 @@
 """Main window.
 
-Shows animation configs as expandable cards (header + inline results folder view),
-with global filters (model, starred). Generate resolves a config's model + params,
-runs the cost-confirm gate, creates a pending result with an immutable
-settings_snapshot, and enqueues a background job whose status streams into the log
-panel and refreshes the originating card. Export is wired in Phase 5.
+Shows a project's shots as expandable cards (header + inline takes folder view), with
+global filters (model, starred). Generate resolves a shot's model + params, runs the
+cost-confirm gate, creates a pending take with an immutable settings_snapshot, and
+enqueues a background job whose status streams into the log panel and refreshes the
+originating card.
+
+The window owns the current Project document and the File-menu lifecycle (New / Open /
+Save / Save As). Authoring edits buffer (dirty marker in the title; prompt before
+discarding); finished takes auto-persist (see store/project.py).
 """
 from __future__ import annotations
 
-import threading
-import time
+import json
+import tempfile
 from typing import Optional
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QLabel, QMainWindow, QMessageBox,
-    QPlainTextEdit, QScrollArea, QSplitter, QToolBar, QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTabWidget,
+    QToolBar, QVBoxLayout, QWidget,
 )
 
 import library
 import paths
 from backends import comfy_client, replicate_client
 from backends.jobs import JobManager
-from pipeline import export
-from store.db import Store
+from pipeline import export, framing
+from store.project import Project
 from store.models import STATUS_PENDING
-from ui.config_card import ConfigCard
+from ui.assets_view import AssetsView
+from ui.shot_card import ShotCard
 from ui.comfy_monitor_window import ComfyMonitorWindow
-from ui.config_editor import ConfigEditor
+from ui.shot_tab import ShotTab
 from ui.cost_confirm import confirm_launch
 from ui.model_library_window import ModelLibraryWindow
 
 # settings keys passed to the hosted client explicitly (everything else -> extra/--set)
 _EXPLICIT_SETTINGS = ("duration", "resolution", "seed", "length")
-
-
-class _ComfyController(QObject):
-    """Drives the Launch-ComfyUI flow entirely off the GUI thread.
-
-    Probing a down server costs a full socket timeout on Windows (a closed localhost
-    port drops SYNs rather than refusing), so even the initial "is it up?" check would
-    freeze the GUI. The whole probe -> launch -> poll sequence therefore runs on a daemon
-    thread and reports back via `result`, whose queued delivery hops to the GUI thread.
-    Outcomes: 'running', 'launching', 'ready', 'timeout', 'failed' (info is a status
-    dict, or {'message': ...} for 'failed').
-    """
-    result = Signal(str, object)
-
-    def __init__(self, attempts: int = 45, interval: float = 2.0):
-        super().__init__()
-        self._attempts = attempts
-        self._interval = interval
-
-    def start(self) -> None:
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def _run(self) -> None:
-        st = comfy_client.server_status(timeout=2)
-        if st["running"]:
-            self.result.emit("running", st)
-            return
-        try:
-            comfy_client.launch_server()
-        except comfy_client.ComfyError as e:
-            self.result.emit("failed", {"message": str(e)})
-            return
-        self.result.emit("launching", {})
-        for _ in range(self._attempts):
-            time.sleep(self._interval)
-            st = comfy_client.server_status(timeout=2)
-            if st["running"]:
-                self.result.emit("ready", st)
-                return
-        self.result.emit("timeout", {})
+_PROJECT_FILTER = "AnimGen project (*.animproj)"
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, store: Store):
+    def __init__(self, project: Project):
         super().__init__()
-        self.store = store
-        self.cards: dict[str, ConfigCard] = {}
+        self.project = project
+        self.cards: dict[str, ShotCard] = {}
+        self.shot_tabs: dict[str, ShotTab] = {}   # shot_id -> its open detail/edit tab
 
-        self.jobs = JobManager(store)
+        self.jobs = JobManager(project)
         self.jobs.progress.connect(self._on_progress)
         self.jobs.status_changed.connect(self._on_status_changed)
-        self.jobs.finished.connect(lambda rid: self._after_job(rid, f"✓ done {rid[:8]}"))
+        self.jobs.finished.connect(lambda tid: self._after_job(tid, f"✓ done {tid[:8]}"))
         self.jobs.failed.connect(
-            lambda rid, err: self._after_job(rid, f"✗ FAILED {rid[:8]}: {err}"))
+            lambda tid, err: self._after_job(tid, f"✗ FAILED {tid[:8]}: {err}"))
 
-        self.setWindowTitle("Animation Generator")
         self.resize(1180, 820)
-        self._build_toolbar()
         self._build_body()
+        self._build_menu()
         self.reload()
 
     # ---- construction ---------------------------------------------------
-    def _build_toolbar(self) -> None:
-        tb = QToolBar("Main")
+    def _build_controls(self) -> QToolBar:
+        """The Shots-tab control strip (filters + view actions). Lives inside the Shots
+        tab, not above the tabs, since every control here acts only on that view."""
+        tb = QToolBar("Shot controls")
         tb.setMovable(False)
-        self.addToolBar(tb)
-        for label, slot in (("New config", self.new_config), ("Reload", self.reload)):
-            act = QAction(label, self)
-            act.triggered.connect(slot)
-            tb.addAction(act)
+        reload_act = QAction("Reload", self)
+        reload_act.triggered.connect(self.reload)
+        tb.addAction(reload_act)
         tb.addSeparator()
         tb.addWidget(QLabel(" Model: "))
         self.model_filter = QComboBox()
@@ -120,18 +87,44 @@ class MainWindow(QMainWindow):
         self.cancel_act.triggered.connect(self.cancel_pending)
         self.cancel_act.setEnabled(False)
         tb.addAction(self.cancel_act)
-        tb.addSeparator()
-        lib_act = QAction("Model Library", self)
-        lib_act.triggered.connect(self.show_library)
-        tb.addAction(lib_act)
-        comfy_act = QAction("Launch ComfyUI", self)
-        comfy_act.setToolTip("Start the local ComfyUI backend with --disable-dynamic-vram")
-        comfy_act.triggered.connect(self.launch_comfyui)
-        tb.addAction(comfy_act)
-        mon_act = QAction("ComfyUI Status", self)
-        mon_act.setToolTip("Live status, memory, queue, settings and installed models")
-        mon_act.triggered.connect(self.show_comfy_monitor)
-        tb.addAction(mon_act)
+        return tb
+
+    def _build_menu(self) -> None:
+        bar = self.menuBar()
+
+        file_menu = bar.addMenu("&File")
+        for label, shortcut, slot in (
+            ("&New Project", "Ctrl+Shift+N", self.new_project),
+            ("&Open Project...", "Ctrl+O", self.open_project),
+            ("&Save", "Ctrl+S", self.save_project),
+            ("Save &As...", "Ctrl+Shift+S", self.save_project_as),
+        ):
+            act = QAction(label, self)
+            act.setShortcut(shortcut)
+            act.triggered.connect(slot)
+            file_menu.addAction(act)
+        file_menu.addSeparator()
+        new_shot_act = QAction("New &Shot", self)
+        new_shot_act.setShortcut("Ctrl+N")
+        new_shot_act.triggered.connect(self.new_shot)
+        file_menu.addAction(new_shot_act)
+        file_menu.addSeparator()
+        reload_act = QAction("&Reload", self)
+        reload_act.setShortcut("F5")
+        reload_act.triggered.connect(self.reload)
+        file_menu.addAction(reload_act)
+        file_menu.addSeparator()
+        quit_act = QAction("E&xit", self)
+        quit_act.setShortcut("Ctrl+Q")
+        quit_act.triggered.connect(self.close)
+        file_menu.addAction(quit_act)
+
+        view_menu = bar.addMenu("&View")
+        for widget, name in self._fixed_tabs:
+            act = QAction(name, self)
+            act.triggered.connect(
+                lambda _checked=False, w=widget, t=name: self._show_fixed_tab(w, t))
+            view_menu.addAction(act)
 
     def _build_body(self) -> None:
         self.cards_container = QWidget()
@@ -144,23 +137,134 @@ class MainWindow(QMainWindow):
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setPlaceholderText("Generation log…")
+        self.log.setPlaceholderText("Generation log...")
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(scroll)
         splitter.addWidget(self.log)
         splitter.setSizes([640, 160])
 
-        central = QWidget()
-        QVBoxLayout(central).addWidget(splitter)
-        self.setCentralWidget(central)
+        shots_tab = QWidget()
+        shots_layout = QVBoxLayout(shots_tab)
+        shots_layout.setContentsMargins(0, 0, 0, 0)
+        shots_layout.addWidget(self._build_controls())
+        shots_layout.addWidget(splitter, 1)
+
+        # Model Library and ComfyUI Status used to be separate top-level windows; they're
+        # now tabs alongside the shots view. The monitor only polls while its tab is on
+        # screen (see _on_tab_changed) to avoid hammering a down port in the background.
+        self.assets_tab = AssetsView(self.project)
+        self.library_tab = ModelLibraryWindow(self)
+        self.comfy_tab = ComfyMonitorWindow(self)
+
+        self.shots_tab = shots_tab
+        # Fixed tabs are closable (the x) and reopen from the View menu; shot tabs are
+        # dynamic (reopen by opening the shot again).
+        self._fixed_tabs = [(shots_tab, "Shots"), (self.assets_tab, "Assets"),
+                            (self.library_tab, "Model Library"),
+                            (self.comfy_tab, "ComfyUI Status")]
+
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        for widget, title in self._fixed_tabs:
+            self.tabs.addTab(widget, title)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.tabCloseRequested.connect(self._on_tab_close)
+        self.setCentralWidget(self.tabs)
+
+    # ---- project lifecycle ----------------------------------------------
+    def _update_title(self) -> None:
+        star = "*" if self.project.dirty else ""
+        self.setWindowTitle(f"{self.project.name}{star} - Animation Generator")
+
+    def _switch_project(self, project: Project) -> None:
+        for tab in list(self.shot_tabs.values()):   # old shot tabs reference the old project
+            idx = self.tabs.indexOf(tab)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            tab.deleteLater()
+        self.shot_tabs.clear()
+        self.project = project
+        self.jobs.set_project(project)
+        self.assets_tab.set_project(project)
+        self.reload()
+
+    def _maybe_save_changes(self) -> bool:
+        """Prompt before discarding unsaved authoring edits. Return False to abort."""
+        if not self.project.dirty:
+            return True
+        choice = QMessageBox.question(
+            self, "Unsaved changes",
+            f"Save changes to '{self.project.name}' before continuing?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Save)
+        if choice == QMessageBox.StandardButton.Cancel:
+            return False
+        if choice == QMessageBox.StandardButton.Save:
+            return self.save_project()
+        return True  # Discard
+
+    def new_project(self) -> None:
+        if not self._maybe_save_changes():
+            return
+        self._switch_project(Project.new())
+        self._log("new project")
+
+    def open_project(self) -> None:
+        if not self._maybe_save_changes():
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open project", str(paths.DATA_DIR), _PROJECT_FILTER)
+        if not path:
+            return
+        try:
+            project = Project.load(path)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "Open project", f"Could not open:\n{e}")
+            return
+        self._switch_project(project)
+        self._remember_last()
+        self._log(f"opened {project.name}")
+
+    def save_project(self) -> bool:
+        if self.project.is_untitled:
+            return self.save_project_as()
+        self._commit_open_shot_tabs()
+        self.project.save()
+        self._remember_last()
+        self._update_title()
+        self.statusBar().showMessage(f"Saved {self.project.name}", 4000)
+        return True
+
+    def save_project_as(self) -> bool:
+        start = str(self.project.path or (paths.DATA_DIR / f"{self.project.name}.animproj"))
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save project as", start, _PROJECT_FILTER)
+        if not path:
+            return False
+        self._commit_open_shot_tabs()
+        self.project.save_as(path)
+        self._remember_last()
+        self._update_title()
+        self.statusBar().showMessage(f"Saved {self.project.name}", 4000)
+        return True
+
+    def _remember_last(self) -> None:
+        if self.project.path is None:
+            return
+        try:
+            paths.APP_STATE.write_text(
+                json.dumps({"last_project": str(self.project.path)}), encoding="utf-8")
+        except OSError:
+            pass
 
     # ---- data -----------------------------------------------------------
     def reload(self) -> None:
         self._refresh_model_filter()
         model_sel = self.model_filter.currentData()
         starred_only = self.starred_filter.isChecked()
-        expanded = {cid for cid, c in self.cards.items() if c.expand_btn.isChecked()}
+        expanded = {sid for sid, c in self.cards.items() if c.expand_btn.isChecked()}
 
         while self.cards_layout.count():
             w = self.cards_layout.takeAt(0).widget()
@@ -168,84 +272,154 @@ class MainWindow(QMainWindow):
                 w.deleteLater()
         self.cards.clear()
 
-        configs = self.store.list_configs()
+        shots = self.project.list_shots()
         shown = 0
-        for cfg in configs:
-            if model_sel and cfg.model_id != model_sel:
+        for shot in shots:
+            if model_sel and shot.model_id != model_sel:
                 continue
-            if starred_only and not self.store.list_results(cfg.id, starred_only=True):
+            if starred_only and not self.project.list_takes(shot.id, starred_only=True):
                 continue
-            card = ConfigCard(self.store, cfg)
-            card.generate_requested.connect(self.generate_config)
-            card.edit_requested.connect(self.edit_config)
-            card.export_results_requested.connect(self.export_results)
-            if cfg.id in expanded:
+            card = ShotCard(self.project, shot)
+            card.generate_requested.connect(self.generate_shot)
+            card.open_requested.connect(self.open_shot)
+            card.export_takes_requested.connect(self.export_takes)
+            if shot.id in expanded:
                 card.expand_btn.setChecked(True)
             self.cards_layout.addWidget(card)
-            self.cards[cfg.id] = card
+            self.cards[shot.id] = card
             shown += 1
 
-        self.statusBar().showMessage(f"{shown} configs shown · {len(configs)} total")
+        self.cards_layout.addWidget(self._make_add_shot_card())
+        self.statusBar().showMessage(f"{shown} shots shown · {len(shots)} total")
+        self._update_title()
+
+    def _make_add_shot_card(self) -> QPushButton:
+        """Placeholder '+ New Shot' card at the end of the list (also the empty state)."""
+        btn = QPushButton("+  New Shot")
+        btn.setObjectName("addShotCard")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setMinimumHeight(56)
+        btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        btn.clicked.connect(self.new_shot)
+        btn.setStyleSheet(
+            "QPushButton#addShotCard { border: 2px dashed #3a3f4b; border-radius: 6px;"
+            " color: #9aa; font-size: 15px; background: transparent; }"
+            "QPushButton#addShotCard:hover { border-color: #5fa97a; color: #cde6d6; }")
+        return btn
 
     def _refresh_model_filter(self) -> None:
         self.model_filter.blockSignals(True)
         prev = self.model_filter.currentData()
         self.model_filter.clear()
         self.model_filter.addItem("All models", None)
-        for mid in self.store.used_model_ids():
+        for mid in self.project.used_model_ids():
             model = library.get_model(mid)
             self.model_filter.addItem(model["display_name"] if model else mid, mid)
         idx = self.model_filter.findData(prev)
         self.model_filter.setCurrentIndex(idx if idx >= 0 else 0)
         self.model_filter.blockSignals(False)
 
-    # ---- config actions -------------------------------------------------
-    def new_config(self) -> None:
-        if ConfigEditor(self.store, parent=self).exec():
-            self.reload()
+    # ---- shot tabs ------------------------------------------------------
+    def new_shot(self) -> None:
+        tab = ShotTab(self.project)
+        self._wire_shot_tab(tab)
+        self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
 
-    def edit_config(self, config_id: str) -> None:
-        if ConfigEditor(self.store, config=self.store.get_config(config_id), parent=self).exec():
-            self.reload()
-
-    def generate_config(self, config_id: str) -> None:
-        cfg = self.store.get_config(config_id)
-        model = library.get_model(cfg.model_id)
-        if not model:
-            QMessageBox.warning(self, "Generate", f"Unknown model: {cfg.model_id}")
+    def open_shot(self, shot_id: str) -> None:
+        if shot_id in self.shot_tabs:
+            self.tabs.setCurrentWidget(self.shot_tabs[shot_id])
             return
-        if not cfg.start_frame:
+        shot = self.project.get_shot(shot_id)
+        if not shot:
+            return
+        tab = ShotTab(self.project, shot=shot)
+        self._wire_shot_tab(tab)
+        self.shot_tabs[shot_id] = tab
+        self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
+
+    def _commit_open_shot_tabs(self) -> None:
+        """Flush every open shot-tab editor into the project buffer so File > Save
+        persists in-progress edits, not just shots saved via their own tab. Blank-named
+        but worked-on tabs are auto-named 'Unnamed Shot N'; pristine untouched new tabs
+        are skipped. Iterates the tab widget directly, since new tabs aren't in
+        shot_tabs until first saved."""
+        changed = False
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if not isinstance(tab, ShotTab) or tab.is_blank_new():
+                continue
+            sid = tab.commit()
+            if sid:
+                self.shot_tabs[sid] = tab
+                self.tabs.setTabText(i, tab.title())
+                changed = True
+        if changed:
+            self.reload()
+
+    def _wire_shot_tab(self, tab: ShotTab) -> None:
+        tab.saved.connect(lambda sid, t=tab: self._on_shot_saved(sid, t))
+        tab.generate_requested.connect(self.generate_shot)
+        tab.export_requested.connect(self.export_takes)
+
+    def _on_shot_saved(self, shot_id: str, tab: ShotTab) -> None:
+        # A blank tab just became a real shot (or an existing shot was re-saved): register
+        # it, refresh the tab label, and rebuild the list so the card appears/updates.
+        self.shot_tabs[shot_id] = tab
+        idx = self.tabs.indexOf(tab)
+        if idx >= 0:
+            self.tabs.setTabText(idx, tab.title())
+        self.reload()
+
+    def generate_shot(self, shot_id: str) -> None:
+        shot = self.project.get_shot(shot_id)
+        model = library.get_model(shot.model_id)
+        if not model:
+            QMessageBox.warning(self, "Generate", f"Unknown model: {shot.model_id}")
+            return
+        aspect = (shot.crop or {}).get("aspect")
+        if aspect and aspect not in library.aspect_ratios(shot.model_id):
+            QMessageBox.warning(self, "Generate",
+                                f"'{aspect}' isn't a valid aspect ratio for "
+                                f"{model['display_name']}. Open the shot and pick one from "
+                                "the Aspect list.")
+            return
+        if not shot.start_frame:
             start, _ = QFileDialog.getOpenFileName(
-                self, "Pick a start frame", str(paths.ASSETS_DIR),
+                self, "Pick a start keyframe", str(paths.ASSETS_DIR),
                 "Images (*.png *.jpg *.jpeg *.webp)")
             if not start:
                 return
-            self.store.update_config(cfg.id, start_frame=start)
-            cfg = self.store.get_config(config_id)
+            self.project.update_shot(shot.id, start_frame=str(self.project.import_asset(start)))
+            shot = self.project.get_shot(shot_id)
 
-        settings = {**model.get("default_params", {}), **cfg.settings}
-        est = library.estimate_cost(cfg.model_id, settings)
-        item = {"name": cfg.name, "model_display": model["display_name"],
+        settings = {**model.get("default_params", {}), **shot.settings}
+        est = library.estimate_cost(shot.model_id, settings)
+        item = {"name": shot.name, "model_display": model["display_name"],
                 "backend": model["backend"], "est_cost": est, "params": settings}
         if not confirm_launch(self, [item]):
             self._log("launch cancelled")
             return
 
+        # Persist the project so the take never references an unsaved shot (untitled ->
+        # Save As prompt). Aborting the save aborts the generation.
+        if not self.save_project():
+            self._log("generation cancelled (project not saved)")
+            return
+
         snapshot = {
-            "model_id": cfg.model_id, "backend": model["backend"],
+            "model_id": shot.model_id, "backend": model["backend"],
             "replicate_model_id": model.get("replicate_model_id"),
             "workflow_template": model.get("workflow_template"),
-            "start_frame": cfg.start_frame, "end_frame": cfg.end_frame,
-            "prompt": cfg.prompt, "negative_prompt": cfg.negative_prompt, "settings": settings,
+            "start_frame": shot.start_frame, "end_frame": shot.end_frame,
+            "prompt": shot.prompt, "negative_prompt": shot.negative_prompt, "settings": settings,
         }
-        result = self.store.add_result(cfg.id, status=STATUS_PENDING,
-                                       seed=settings.get("seed"), cost_estimate=est,
-                                       settings_snapshot=snapshot)
-        self.jobs.enqueue(result.id, model["backend"],
-                          self._make_runner(model, cfg, settings, result.id))
-        self._log(f"queued {result.id[:8]} ({cfg.name})")
-        if cfg.id in self.cards:
-            self.cards[cfg.id].refresh_results()
+        take = self.project.add_take(shot.id, status=STATUS_PENDING,
+                                     seed=settings.get("seed"), cost_estimate=est,
+                                     settings_snapshot=snapshot)
+        self.jobs.enqueue(take.id, model["backend"],
+                          self._make_runner(model, shot, settings, take.id))
+        self._log(f"queued {take.id[:8]} ({shot.name})")
+        self._refresh_shot(shot.id)
         self._refresh_cancel_action()
 
     def cancel_pending(self) -> None:
@@ -257,45 +431,58 @@ class MainWindow(QMainWindow):
     def _refresh_cancel_action(self) -> None:
         self.cancel_act.setEnabled(self.jobs.pending_count() > 0)
 
-    def _make_runner(self, model, cfg, settings, result_id):
-        out_path = paths.RESULTS_DIR / cfg.id / f"{result_id}.mp4"
+    def _make_runner(self, model, shot, settings, take_id):
+        # Keyposes are framed from the shot's assets at generation time (on the worker
+        # thread) into a temp dir, rather than baked at save time. See framing.render_keyposes.
+        out_path = self.project.takes_dir / f"{take_id}.mp4"
         if model["backend"] == "replicate":
             rid = model["replicate_model_id"]
             data_uri = model.get("requires_data_uri", False)
             extra = {k: v for k, v in settings.items() if k not in _EXPLICIT_SETTINGS}
 
             def runner(progress):
+                start_kp, end_kp = framing.render_keyposes(shot, tempfile.mkdtemp(prefix="animgen_kp_"))
                 return replicate_client.generate(
-                    rid, start=cfg.start_frame, end=cfg.end_frame, prompt=cfg.prompt,
-                    negative=cfg.negative_prompt, duration=settings.get("duration"),
+                    rid, start=start_kp, end=end_kp, prompt=shot.prompt,
+                    negative=shot.negative_prompt, duration=settings.get("duration"),
                     resolution=settings.get("resolution"), seed=settings.get("seed"),
                     extra=extra, data_uri=data_uri, out_path=out_path, progress_cb=progress)
             return runner
 
         tpl = paths.resolve_template(model.get("workflow_template") or "")
         roles = model.get("comfy_nodes")
+        # Drive the workflow's output size from the shot's canvas (aspect -> w x h at the
+        # local pixel budget) so a wide/tall aspect produces a wide/tall local video.
+        size_sets = {}
+        size_node = (roles or {}).get("size_node")
+        if size_node and shot.canvas_w and shot.canvas_h:
+            size_sets = {f"{size_node}.width": shot.canvas_w, f"{size_node}.height": shot.canvas_h}
+        length = shot.settings.get("length")   # Output-tab duration -> Wan frame count (4n+1)
+        if size_node and length:
+            size_sets[f"{size_node}.length"] = int(length)
 
         def runner(progress):
+            start_kp, end_kp = framing.render_keyposes(shot, tempfile.mkdtemp(prefix="animgen_kp_"))
             return comfy_client.generate(
-                tpl, out_path, start=cfg.start_frame, end=cfg.end_frame,
-                prompt=cfg.prompt or None, negative=cfg.negative_prompt or None,
-                seed=settings.get("seed"), node_roles=roles, progress_cb=progress)
+                tpl, out_path, start=start_kp, end=end_kp,
+                prompt=shot.prompt or None, negative=shot.negative_prompt or None,
+                seed=settings.get("seed"), node_roles=roles, sets=size_sets, progress_cb=progress)
         return runner
 
     # ---- export ---------------------------------------------------------
-    def export_results(self, result_ids: list, label: Optional[str] = None) -> None:
-        if not result_ids:
+    def export_takes(self, take_ids: list, label: Optional[str] = None) -> None:
+        if not take_ids:
             QMessageBox.information(self, "Export", "Nothing to export.")
             return
         if label is None:
-            cfg_ids = {r.config_id for r in (self.store.get_result(i) for i in result_ids) if r}
-            if len(cfg_ids) == 1:
-                cfg = self.store.get_config(next(iter(cfg_ids)))
-                label = cfg.name if cfg else "selection"
+            shot_ids = {t.shot_id for t in (self.project.get_take(i) for i in take_ids) if t}
+            if len(shot_ids) == 1:
+                shot = self.project.get_shot(next(iter(shot_ids)))
+                label = shot.name if shot else "selection"
             else:
                 label = "selection"
         try:
-            res = export.export_results(self.store, result_ids, label=label)
+            res = export.export_takes(self.project, take_ids, label=label)
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "Export", f"Export failed:\n{e}")
             return
@@ -305,12 +492,12 @@ class MainWindow(QMainWindow):
         ids = []
         for card in self.cards.values():
             ids.extend(card._row_export_ids())
-        self.export_results(ids, label="view")
+        self.export_takes(ids, label="view")
 
     def _report_export(self, res: dict) -> None:
         parent = res.get("parent")
         if not parent:
-            QMessageBox.information(self, "Export", "No results had a video file to export.")
+            QMessageBox.information(self, "Export", "No takes had a video file to export.")
             return
         n_folders = len(res["exported"])
         total_frames = sum(n for _, n in res["exported"])
@@ -332,87 +519,70 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 pass
 
-    def show_library(self) -> None:
-        # keep a reference so the separate window isn't garbage-collected
-        self._library_window = ModelLibraryWindow(self)
-        self._library_window.setWindowFlag(Qt.WindowType.Window, True)
-        self._library_window.show()
-
-    def show_comfy_monitor(self) -> None:
-        # keep a reference so the separate window isn't garbage-collected
-        self._comfy_monitor = ComfyMonitorWindow(self)
-        self._comfy_monitor.setWindowFlag(Qt.WindowType.Window, True)
-        self._comfy_monitor.show()
-
-    # ---- local backend --------------------------------------------------
-    def launch_comfyui(self) -> None:
-        """Start the local ComfyUI (with --disable-dynamic-vram) if it isn't already up.
-
-        Non-blocking: a _ComfyController does the probe/launch/poll off-thread and reports
-        back through _on_comfy_result, so the button never freezes the GUI.
-        """
-        self._log("checking ComfyUI…")
-        self.statusBar().showMessage("Checking ComfyUI…")
-        self._comfy_ctl = _ComfyController()  # kept on self so it isn't GC'd
-        self._comfy_ctl.result.connect(self._on_comfy_result)
-        self._comfy_ctl.start()
-
-    def _on_comfy_result(self, outcome: str, info: dict) -> None:
-        if outcome == "launching":
-            self._log("launching ComfyUI (--disable-dynamic-vram) - first model load can take a minute…")
-            self.statusBar().showMessage("Starting ComfyUI…")
-            return
-        if outcome == "failed":
-            self.statusBar().clearMessage()
-            self._log(f"ComfyUI launch failed: {info['message']}")
-            QMessageBox.warning(self, "Launch ComfyUI", info["message"])
-            return
-        if outcome == "timeout":
-            self._log("ComfyUI did not answer in time - check data/comfyui_server.log")
-            self.statusBar().showMessage("ComfyUI did not start", 6000)
-            return
-
-        # outcome is 'running' (already up) or 'ready' (we just launched it)
-        already = outcome == "running"
-        version = info.get("version") or "?"
-        if info.get("dynamic_vram"):  # via our launcher this won't happen; report it if it does
-            self._log("ComfyUI up with dynamic VRAM ENABLED - stop it and relaunch")
-            self.statusBar().showMessage("ComfyUI up (dynamic VRAM ENABLED!)", 6000)
-            QMessageBox.warning(
-                self, "ComfyUI",
-                f"ComfyUI is {'already ' if already else ''}running with DYNAMIC VRAM "
-                "ENABLED, so local generations will be blocked. Stop that server, then "
-                "click Launch ComfyUI again to start one with --disable-dynamic-vram.")
+    def _on_tab_changed(self, index: int) -> None:
+        # The ComfyUI monitor only polls while its tab is visible: a down localhost port
+        # costs a full socket timeout per probe on this machine, so there's no point
+        # paying that in the background. This keeps the poll scoped to the live tab.
+        if self.tabs.widget(index) is self.comfy_tab:
+            self.comfy_tab.start_monitoring()
         else:
-            self._log(f"ComfyUI {'already ' if already else ''}ready (v{version}) - dynamic VRAM disabled")
-            self.statusBar().showMessage("ComfyUI ready", 6000)
-            if already:
-                QMessageBox.information(
-                    self, "ComfyUI",
-                    f"ComfyUI is already running (v{version}) with dynamic VRAM disabled. "
-                    "Ready to generate.")
+            self.comfy_tab.stop_monitoring()
+
+    def _show_fixed_tab(self, widget: QWidget, title: str) -> None:
+        """Reopen (if closed) and focus one of the fixed tabs from the View menu."""
+        if self.tabs.indexOf(widget) < 0:
+            self.tabs.addTab(widget, title)
+        self.tabs.setCurrentWidget(widget)
+
+    def _on_tab_close(self, index: int) -> None:
+        widget = self.tabs.widget(index)
+        if widget is self.comfy_tab:
+            self.comfy_tab.stop_monitoring()
+        if isinstance(widget, ShotTab):
+            for sid, t in list(self.shot_tabs.items()):
+                if t is widget:
+                    del self.shot_tabs[sid]
+            self.tabs.removeTab(index)
+            widget.deleteLater()
+        else:                       # fixed tab: detach but keep the widget for reopening
+            self.tabs.removeTab(index)
+
+    def _refresh_shot(self, shot_id: str) -> None:
+        """Refresh both the list card and the open detail tab (if any) for a shot."""
+        if shot_id in self.cards:
+            self.cards[shot_id].refresh_takes()
+        if shot_id in self.shot_tabs:
+            self.shot_tabs[shot_id].refresh_takes()
+
+    def _refresh_shot_for_take(self, take_id: str) -> None:
+        take = self.project.get_take(take_id)
+        if take:
+            self._refresh_shot(take.shot_id)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if not self._maybe_save_changes():
+            event.ignore()
+            return
+        self.comfy_tab.stop_monitoring()
+        super().closeEvent(event)
 
     # ---- job signal handlers -------------------------------------------
     def _log(self, line: str) -> None:
         self.log.appendPlainText(line)
 
-    def _card_for_result(self, result_id: str):
-        r = self.store.get_result(result_id)
-        return self.cards.get(r.config_id) if r else None
+    def _card_for_take(self, take_id: str):
+        t = self.project.get_take(take_id)
+        return self.cards.get(t.shot_id) if t else None
 
-    def _on_progress(self, result_id: str, line: str) -> None:
-        self._log(f"  {result_id[:8]}: {line}")
+    def _on_progress(self, take_id: str, line: str) -> None:
+        self._log(f"  {take_id[:8]}: {line}")
 
-    def _on_status_changed(self, result_id: str, status: str) -> None:
-        self._log(f"[{status}] {result_id[:8]}")
-        card = self._card_for_result(result_id)
-        if card:
-            card.refresh_results()
+    def _on_status_changed(self, take_id: str, status: str) -> None:
+        self._log(f"[{status}] {take_id[:8]}")
+        self._refresh_shot_for_take(take_id)
         self._refresh_cancel_action()
 
-    def _after_job(self, result_id: str, msg: str) -> None:
+    def _after_job(self, take_id: str, msg: str) -> None:
         self._log(msg)
-        card = self._card_for_result(result_id)
-        if card:
-            card.refresh_results()
+        self._refresh_shot_for_take(take_id)
         self._refresh_cancel_action()

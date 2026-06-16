@@ -5,36 +5,39 @@
   "models": [
     {
       "id": "seedance-2.0-std",
-      "display_name": "Seedance 2.0 (std · 720p)",
+      "aspect_ratios": ["1:1", "16:9", "9:16"],
+      "display_name": "Seedance 2.0 (Std)",
       "backend": "replicate",
       "replicate_model_id": "bytedance/seedance-2.0",
       "tier": "hero",
       "supports_end_frame": true,
       "requires_data_uri": false,
-      "cost_per_second_usd": 0.18,
+      "cost_per_second_usd": {"480p": 0.08, "720p": 0.18, "1080p": 0.45},
       "duration_range": [1, 12],
-      "resolution_options": ["480p", "720p"],
+      "resolution_options": ["480p", "720p", "1080p"],
       "default_params": {"duration": 4, "resolution": "720p", "seed": 7, "aspect_ratio": "1:1", "camera_fixed": true},
       "required_params": {"aspect_ratio": "1:1"},
-      "notes": "Hero/production tier. MUST set aspect_ratio=1:1 or it defaults 16:9 and stretches/clips. Camera is stochastic (seed lottery). Two-part prompts soak duration padding. A tier/resolution change is a choreography REROLL, not an upgrade."
+      "notes": "Hero/production tier. MUST set aspect_ratio=1:1 or it defaults 16:9 and stretches/clips. Camera is stochastic (seed lottery). Two-part prompts soak duration padding. A tier/resolution change is a choreography REROLL, not an upgrade. Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.08, 720p=0.18, 1080p=0.45. Replicate lists 1080p for this model even though resolution_options here is 480/720."
     },
     {
       "id": "seedance-2.0-fast",
-      "display_name": "Seedance 2.0 (Fast · 480p)",
+      "aspect_ratios": ["1:1", "16:9", "9:16"],
+      "display_name": "Seedance 2.0 (Fast)",
       "backend": "replicate",
       "replicate_model_id": "bytedance/seedance-2.0-fast",
       "tier": "audition",
       "supports_end_frame": true,
       "requires_data_uri": false,
-      "cost_per_second_usd": 0.07,
+      "cost_per_second_usd": {"480p": 0.07, "720p": 0.15},
       "duration_range": [1, 12],
       "resolution_options": ["480p", "720p"],
       "default_params": {"duration": 4, "resolution": "480p", "seed": 7, "aspect_ratio": "1:1"},
       "required_params": {"aspect_ratio": "1:1"},
-      "notes": "Cheap choreography auditions only. Validates prompt/staging; never the final frame source (tier change = reroll). Fast-tier bg shimmer is keyed out."
+      "notes": "Cheap choreography auditions only. Validates prompt/staging; never the final frame source (tier change = reroll). Fast-tier bg shimmer is keyed out. Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.07, 720p=0.15."
     },
     {
       "id": "vidu-q3-pro",
+      "aspect_ratios": ["1:1", "16:9", "9:16"],
       "display_name": "Vidu Q3 Pro",
       "backend": "replicate",
       "replicate_model_id": "vidu/q3-pro",
@@ -49,6 +52,7 @@
     },
     {
       "id": "veo-3.1-fast",
+      "aspect_ratios": ["16:9", "9:16"],
       "display_name": "Veo 3.1 Fast",
       "backend": "replicate",
       "replicate_model_id": "google/veo-3.1-fast",
@@ -57,41 +61,46 @@
       "requires_data_uri": false,
       "cost_per_second_usd": 0.10,
       "duration_range": [4, 8],
+      "duration_options": [4, 6, 8],
       "resolution_options": ["720p", "1080p"],
       "default_params": {"duration": 4, "resolution": "720p", "seed": 7},
-      "notes": "Strong prompt adherence, fast. Resolution defaults 1080p - set 720p. Duration is an enum (4/6/8s). No 1:1 aspect on Replicate; test aspect 'auto'."
+      "notes": "Strong prompt adherence, fast. Resolution defaults 1080p - set 720p. Duration is an enum (4/6/8s). No 1:1 aspect on Replicate; test aspect 'auto'. Cost: priced by AUDIO, not resolution (Replicate 2026-06) - without-audio=0.10/s (our case, audio forced off), with-audio=0.15/s; 720p and 1080p cost the same."
     },
     {
       "id": "wan-2.7-i2v",
+      "aspect_ratios": ["16:9", "9:16", "1:1"],
       "display_name": "Wan 2.7 i2v",
       "backend": "replicate",
       "replicate_model_id": "wan-video/wan-2.7-i2v",
       "tier": "filler",
       "supports_end_frame": true,
       "requires_data_uri": false,
-      "cost_per_second_usd": 0.10,
+      "cost_per_second_usd": {"720p": 0.10, "1080p": 0.15},
       "duration_range": [2, 8],
       "resolution_options": ["720p", "1080p"],
       "default_params": {"duration": 4, "resolution": "720p", "seed": 7},
-      "notes": "Cheap filler / prototyping (quality ~animation-student). Resolution defaults 1080p - set 720p. Two-part prompts help padding. 'audio' is a URL string, not a boolean toggle."
+      "notes": "Cheap filler / prototyping (quality ~animation-student). Resolution defaults 1080p - set 720p. Two-part prompts help padding. 'audio' is a URL string, not a boolean toggle. Cost: $/s by resolution (Replicate 2026-06): 720p=0.10, 1080p=0.15."
     },
     {
       "id": "kling-3.0",
+      "aspect_ratios": ["16:9", "9:16", "1:1"],
       "display_name": "Kling 3.0",
       "backend": "replicate",
       "replicate_model_id": "kwaivgi/kling-v3-video",
       "tier": "retired",
       "supports_end_frame": true,
       "requires_data_uri": false,
-      "cost_per_second_usd": 0.112,
+      "cost_per_second_usd": {"standard": 0.168, "pro": 0.224},
+      "cost_by": "mode",
       "duration_range": [3, 15],
       "resolution_options": ["720p", "1080p"],
       "default_params": {"duration": 5, "seed": 7, "mode": "standard"},
-      "notes": "Stable backgrounds but low-fps cadence and invents actions (retired by human verdict). mode default=pro; set 'standard' for cheaper. Kept available for one-off comparisons."
+      "notes": "Stable backgrounds but low-fps cadence and invents actions (retired by human verdict). mode default=pro; set 'standard' for cheaper. Kept available for one-off comparisons. Cost: $/s by MODE, without-audio (Replicate 2026-06): standard=0.168, pro=0.224 (a 4k variant=0.42 isn't exposed). Resolution doesn't change the price."
     },
     {
       "id": "local-flf-wan14b",
-      "display_name": "Local FLF tween (Wan 14B)",
+      "aspect_ratios": ["1:1", "16:9", "9:16", "4:3", "3:4", "21:9"],
+      "display_name": "Wan 2.2 14B (local)",
       "backend": "comfyui",
       "workflow_template": "workflows/FLF_stand_to_crouch.json",
       "tier": "local-free",
@@ -100,20 +109,8 @@
       "cost_per_second_usd": 0.0,
       "frames": 17,
       "default_params": {"seed": 7, "length": 17},
-      "comfy_nodes": {"start_image": "9", "end_image": "10", "prompt": "7", "negative": "8", "seed_nodes": ["12", "13"]},
-      "notes": "Free local tween factory: end-pinned keypose A/B -> 1-2 usable fast mid frames (held frames stay hero-art keyposes). ~3 min/render. ComfyUI must run on 127.0.0.1:8188. Best for transitions: stand<->crouch, hurt snap/recovery, block flinch. Template node ids match the FLF_*.json family."
-    },
-    {
-      "id": "local-vace-4pin",
-      "display_name": "Local VACE multi-pin (Wan VACE)",
-      "backend": "comfyui",
-      "workflow_template": null,
-      "tier": "local-free",
-      "supports_end_frame": true,
-      "requires_data_uri": false,
-      "cost_per_second_usd": 0.0,
-      "default_params": {"seed": 7, "length": 17},
-      "notes": "Free local 2-4 keypose interpolation; pins must land on 4k+1 frame boundaries. Built per-job via scripts/make_vace_workflow.py. Rough quality - last resort vs FLF."
+      "comfy_nodes": {"start_image": "9", "end_image": "10", "prompt": "7", "negative": "8", "seed_nodes": ["12", "13"], "size_node": "11"},
+      "notes": "Local Wan 2.2 14B. The app picks the workflow from the shot's keyframes: end keyframe set -> FLF first-last tween; no end -> open-ended (I2V-style) continuation from the start frame (prepare_workflow severs the end-image node). ~3 min/render. ComfyUI must run on 127.0.0.1:8188. Best for transitions: stand<->crouch, hurt snap/recovery, block flinch. Template node ids match the FLF_*.json family. (VACE multi-pin deferred until 3-4 pin keyframes exist; build per-job via scripts/make_vace_workflow.py.)"
     }
   ]
 }

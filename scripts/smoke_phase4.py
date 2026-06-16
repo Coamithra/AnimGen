@@ -1,7 +1,7 @@
 """Phase 4 smoke test (offscreen, no spend).
 
-Covers bin/restore (tool-owned moved, external left in place), the results view's
-filter/star/delete, config-card expansion, and the main window building cards.
+Covers bin/restore (project-owned moved, external left in place), the takes view's
+filter/star/delete, shot-card expansion, and the main window building cards.
 
     QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
         animgen/.venv/Scripts/python.exe animgen/scripts/smoke_phase4.py
@@ -18,7 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # animgen/
 
 from PIL import Image  # noqa: E402
 
-from store.db import Store  # noqa: E402
+import paths  # noqa: E402
+
+paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
+
+from store.project import Project  # noqa: E402
 from store.models import STATUS_DONE  # noqa: E402
 
 
@@ -28,101 +32,133 @@ def _png(path: Path, color=(0, 200, 0)) -> None:
 
 
 def test_bin_restore() -> None:
-    from pipeline import results_io
+    from pipeline import takes_io
 
-    sandbox = Path(tempfile.mkdtemp())
-    results_io.DATA_DIR = sandbox
-    results_io.RESULTS_DIR = sandbox / "results"
-    results_io.BIN_DIR = sandbox / "bin"
+    project = Project.new()
+    shot = project.add_shot("c", model_id="seedance-2.0-std")
 
-    st = Store(sandbox / "db.sqlite")
-    cfg = st.add_config("c", model_id="seedance-2.0-std")
-
-    # tool-owned file -> moved to bin
-    owned = sandbox / "results" / cfg.id / "r.mp4"
-    owned.parent.mkdir(parents=True, exist_ok=True)
+    # project-owned file (under the project's assets dir) -> moved to bin
+    owned = project.takes_dir / "r.mp4"
     owned.write_bytes(b"video")
-    r1 = st.add_result(cfg.id, status=STATUS_DONE, video_path=str(owned))
-    results_io.move_to_bin(st.get_result(r1.id), st)
-    g1 = st.get_result(r1.id)
+    t1 = project.add_take(shot.id, status=STATUS_DONE, video_path=str(owned))
+    takes_io.move_to_bin(project.get_take(t1.id), project)
+    g1 = project.get_take(t1.id)
     assert g1.deleted and not owned.exists()
-    assert (sandbox / "bin" / r1.id / "r.mp4").exists()
+    assert (project.bin_dir / t1.id / "r.mp4").exists()
     assert Path(g1.video_path).exists()
     # restore
-    results_io.restore_from_bin(st.get_result(r1.id), st)
-    g1 = st.get_result(r1.id)
+    takes_io.restore_from_bin(project.get_take(t1.id), project)
+    g1 = project.get_take(t1.id)
     assert not g1.deleted and Path(g1.video_path).exists()
-    assert (sandbox / "results" / cfg.id / "r.mp4").exists()
+    assert (project.takes_dir / "r.mp4").exists()
 
-    # external file (a seeded project asset) -> NOT moved, just flagged
+    # external file (a seeded Fighter asset) -> NOT moved, just flagged
     ext_dir = Path(tempfile.mkdtemp())
     ext = ext_dir / "BAKE_take.mp4"
     ext.write_bytes(b"external")
-    r2 = st.add_result(cfg.id, status=STATUS_DONE, video_path=str(ext))
-    results_io.move_to_bin(st.get_result(r2.id), st)
-    g2 = st.get_result(r2.id)
+    t2 = project.add_take(shot.id, status=STATUS_DONE, video_path=str(ext))
+    takes_io.move_to_bin(project.get_take(t2.id), project)
+    g2 = project.get_take(t2.id)
     assert g2.deleted and ext.exists() and g2.video_path == str(ext)
-    st.close()
-    print("results_io OK: tool-owned binned/restored, external file untouched")
+    print("takes_io OK: project-owned binned/restored, external file untouched")
 
 
-def test_results_view() -> None:
+def test_takes_view() -> None:
     from PySide6.QtWidgets import QApplication
 
-    from ui.results_view import ResultsView
+    from ui.takes_view import TakesView
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
     tmp = Path(tempfile.mkdtemp())
-    st = Store(tmp / "db.sqlite")
-    cfg = st.add_config("c", model_id="seedance-2.0-std")
+    project = Project.new()
+    shot = project.add_shot("c", model_id="seedance-2.0-std")
     t1, t2 = tmp / "t1.png", tmp / "t2.png"
     _png(t1); _png(t2, (200, 0, 0))
-    r1 = st.add_result(cfg.id, status=STATUS_DONE, starred=True, thumbnail=str(t1))
-    r2 = st.add_result(cfg.id, status=STATUS_DONE, thumbnail=str(t2))
-    r3 = st.add_result(cfg.id, status=STATUS_DONE, thumbnail=str(t2), deleted=True)  # hidden
+    r1 = project.add_take(shot.id, status=STATUS_DONE, starred=True, thumbnail=str(t1))
+    r2 = project.add_take(shot.id, status=STATUS_DONE, thumbnail=str(t2))
+    r3 = project.add_take(shot.id, status=STATUS_DONE, thumbnail=str(t2), deleted=True)  # hidden
 
-    rv = ResultsView(st, cfg.id)
-    assert rv.model.rowCount() == 2, rv.model.rowCount()       # r3 hidden
-    rv.filter.setCurrentText("Favorites")
-    assert rv.model.rowCount() == 1                            # only r1 starred
-    rv.toggle_star([r2.id])
-    assert rv.model.rowCount() == 2                            # r1 + r2 now starred
-    rv.filter.setCurrentText("All")
-    rv.delete([r1.id])
-    assert rv.model.rowCount() == 1 and st.get_result(r1.id).deleted
+    tv = TakesView(project, shot.id)
+    assert tv.model.rowCount() == 2, tv.model.rowCount()       # r3 hidden
+    tv.filter.setCurrentText("Favorites")
+    assert tv.model.rowCount() == 1                            # only r1 starred
+    tv.toggle_star([r2.id])
+    assert tv.model.rowCount() == 2                            # r1 + r2 now starred
+    tv.filter.setCurrentText("All")
+    tv.delete([r1.id])
+    assert tv.model.rowCount() == 1 and project.get_take(r1.id).deleted
     _ = r3
-    print("ResultsView OK: filter, star toggle, delete-to-bin, counts")
+    print("TakesView OK: filter, star toggle, delete-to-bin, counts")
+
+
+def test_assets_view() -> None:
+    from PySide6.QtWidgets import QApplication
+
+    from ui.assets_view import AssetsView
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    tmp = Path(tempfile.mkdtemp())
+    imgs = []
+    for i in range(3):
+        q = tmp / f"k{i}.png"; _png(q); imgs.append(str(q))
+    project = Project.new()
+    av = AssetsView(project)
+    assert av.model.rowCount() == 0
+    av._import_files(imgs)                          # mimics drag-drop / Import
+    assert av.model.rowCount() == 3 and len(project.list_assets()) == 3
+    assert all(p.parent == project.assets_dir for p in project.list_assets())
+    project.remove_asset(project.list_assets()[0]); av.load()
+    assert av.model.rowCount() == 2
+    print("AssetsView OK: import (grid + flat in .assets), remove")
+
+
+def test_asset_picker() -> None:
+    from PySide6.QtWidgets import QApplication
+
+    from ui.asset_picker import AssetPickerDialog
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    tmp = Path(tempfile.mkdtemp())
+    project = Project.new()
+    a, b = tmp / "a.png", tmp / "b.png"
+    _png(a); _png(b, (0, 0, 200))
+    asset_a = str(project.import_asset(a)); project.import_asset(b)
+
+    dlg = AssetPickerDialog(project, current=asset_a)   # no exec() - don't block headless
+    assert dlg.model.rowCount() == 2
+    assert dlg.selected() == asset_a, "current selection should be pre-highlighted"
+    print("AssetPickerDialog OK: grid lists assets, pre-selects current")
 
 
 def test_card_and_window() -> None:
     from PySide6.QtWidgets import QApplication
 
-    from ui.config_card import ConfigCard
+    from ui.shot_card import ShotCard
     from ui.main_window import MainWindow
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
-    tmp = Path(tempfile.mkdtemp())
-    st = Store(tmp / "db.sqlite")
-    cfg = st.add_config("kick", model_id="seedance-2.0-std",
-                        settings={"seed": 7, "duration": 4, "resolution": "720p"})
-    r = st.add_result(cfg.id, status=STATUS_DONE, starred=True)
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std",
+                            settings={"seed": 7, "duration": 4, "resolution": "720p"})
+    r = project.add_take(shot.id, status=STATUS_DONE, starred=True)
 
-    card = ConfigCard(st, cfg)
-    assert "1 results" in card.counts.text() and "1★" in card.counts.text()
+    card = ShotCard(project, shot)
+    assert "1 takes" in card.counts.text() and "1★" in card.counts.text()
     card.expand_btn.setChecked(True)
-    assert card.results_view is not None and card.results_view.model.rowCount() == 1
+    assert card.takes_view is not None and card.takes_view.model.rowCount() == 1
     card.expand_btn.setChecked(False)
     assert not card.body.isVisible()
 
-    win = MainWindow(st)
-    assert len(win.cards) == 1 and cfg.id in win.cards
-    assert win._card_for_result(r.id) is win.cards[cfg.id]
-    st.close()
-    print("ConfigCard + MainWindow OK: counts, expand, card routing")
+    win = MainWindow(project)
+    assert len(win.cards) == 1 and shot.id in win.cards
+    assert win._card_for_take(r.id) is win.cards[shot.id]
+    print("ShotCard + MainWindow OK: counts, expand, card routing")
 
 
 if __name__ == "__main__":
     test_bin_restore()
-    test_results_view()
+    test_takes_view()
+    test_assets_view()
+    test_asset_picker()
     test_card_and_window()
     print("PHASE 4 SMOKE: PASS")

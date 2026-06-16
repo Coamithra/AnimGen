@@ -89,12 +89,25 @@ class ComfyMonitorWindow(QWidget):
         self.setWindowTitle("ComfyUI Monitor")
         self.resize(640, 760)
         self._busy = False  # an async stop/shutdown is in flight - freeze button states
+        self._models_fetched_once = False
         self._build()
 
         self._poller = _MonitorPoller()
         self._poller.snapshot.connect(self._apply_snapshot)
+        # Polling is driven by the host via start_monitoring()/stop_monitoring() so that,
+        # embedded as a tab, this only probes the (possibly down) port while on screen -
+        # a closed localhost port costs a full socket timeout per probe on this machine.
+
+    # ---- monitoring lifecycle -------------------------------------------
+    def start_monitoring(self) -> None:
+        """Begin live polling; fetch the installed-models list once, lazily."""
         self._poller.start()
-        self._fetch_models()
+        if not self._models_fetched_once:
+            self._models_fetched_once = True
+            self._fetch_models()
+
+    def stop_monitoring(self) -> None:
+        self._poller.stop()
 
     # ---- construction ---------------------------------------------------
     def _build(self) -> None:
@@ -103,7 +116,7 @@ class ComfyMonitorWindow(QWidget):
         # status header + actions
         self.status_lbl = QLabel("Checking...")
         self.status_lbl.setMinimumHeight(28)
-        self.launch_btn = QPushButton("Launch")
+        self.launch_btn = QPushButton("Launch ComfyUI")
         self.launch_btn.setToolTip("Start ComfyUI with --disable-dynamic-vram")
         self.launch_btn.clicked.connect(self._launch)
         self.stop_work_btn = QPushButton("Stop working")

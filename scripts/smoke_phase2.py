@@ -19,10 +19,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # animgen/
 
 import library  # noqa: E402
+import paths  # noqa: E402
 from backends import comfy_client, replicate_client  # noqa: E402
 from paths import WORKFLOWS_DIR  # noqa: E402
-from store.db import Store  # noqa: E402
+from store.project import Project  # noqa: E402
 from store.models import STATUS_DONE, STATUS_FAILED, STATUS_PENDING  # noqa: E402
+
+paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
 
 
 def test_build_input() -> None:
@@ -72,7 +75,17 @@ def test_comfy_prepare() -> None:
     assert wf2["9"]["inputs"]["image"] == "a.png" and wf2["10"]["inputs"]["image"] == "b.png"
     assert wf2["7"]["inputs"]["text"] == "P2" and wf2["8"]["inputs"]["text"] == "N2"
     assert wf2["12"]["inputs"]["noise_seed"] == 9
-    print("comfy prepare_workflow OK: node-role map + heuristic fallback + --set")
+
+    # no end frame -> open-ended: the end-image node (10) is left with no consumers,
+    # so the Wan first-last node runs like I2V instead of reusing the baked end frame.
+    wf3 = comfy_client.prepare_workflow(
+        template, start_img=str(a), end_img=None, prompt="P", negative="N",
+        seed=1, node_roles=roles)
+    assert wf3["9"]["inputs"]["image"] == "a.png"            # start still applied
+    assert not any(isinstance(v, list) and v and str(v[0]) == "10"
+                   for n in wf3.values() for v in n.get("inputs", {}).values()), \
+        "end-image node should have no consumers when no end frame is given"
+    print("comfy prepare_workflow OK: node-role map + heuristic fallback + --set + open-ended sever")
 
 
 def test_dynamic_vram_gate() -> None:
@@ -130,9 +143,9 @@ def test_cost_summary() -> None:
     from ui.cost_confirm import build_summary
 
     items = [
-        {"name": "kick", "model_display": "Seedance 2.0 (std · 720p)", "est_cost": 0.72,
+        {"name": "kick", "model_display": "Seedance 2.0 (Std)", "est_cost": 0.72,
          "params": {"duration": 4, "seed": 7, "aspect_ratio": "1:1"}},
-        {"name": "tween", "model_display": "Local FLF tween (Wan 14B)", "est_cost": 0.0,
+        {"name": "tween", "model_display": "Wan 2.2 14B (local)", "est_cost": 0.0,
          "params": {"seed": 7}},
     ]
     body, total, has_spend = build_summary(items)
@@ -149,15 +162,15 @@ def test_job_manager() -> None:
     from backends.jobs import JobManager
 
     app = QApplication.instance() or QApplication([])
-    st = Store(Path(tempfile.mkdtemp()) / "j.db")
-    cfg = st.add_config("kick", model_id="seedance-2.0-std")
-    jm = JobManager(st)
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    jm = JobManager(project)
     done, failed, progressed = [], [], []
     jm.finished.connect(done.append)
-    jm.failed.connect(lambda rid, err: failed.append((rid, err)))
-    jm.progress.connect(lambda rid, line: progressed.append(line))
+    jm.failed.connect(lambda tid, err: failed.append((tid, err)))
+    jm.progress.connect(lambda tid, line: progressed.append(line))
 
-    ok = st.add_result(cfg.id, status=STATUS_PENDING)
+    ok = project.add_take(shot.id, status=STATUS_PENDING)
 
     def good_runner(progress):
         progress("uploading")
@@ -166,7 +179,7 @@ def test_job_manager() -> None:
 
     jm.enqueue(ok.id, "replicate", good_runner)
 
-    bad = st.add_result(cfg.id, status=STATUS_PENDING)
+    bad = project.add_take(shot.id, status=STATUS_PENDING)
 
     def bad_runner(progress):
         progress("starting")
@@ -177,13 +190,12 @@ def test_job_manager() -> None:
     assert jm.wait_for_done(20000), "jobs did not finish"
     app.processEvents()
 
-    got_ok = st.get_result(ok.id)
+    got_ok = project.get_take(ok.id)
     assert got_ok.status == STATUS_DONE and got_ok.video_path == "x.mp4" and got_ok.fps == 16.0
-    got_bad = st.get_result(bad.id)
+    got_bad = project.get_take(bad.id)
     assert got_bad.status == STATUS_FAILED and "boom" in (got_bad.error or "")
-    assert ok.id in done and any(rid == bad.id for rid, _ in failed)
+    assert ok.id in done and any(tid == bad.id for tid, _ in failed)
     assert "uploading" in progressed and "starting" in progressed
-    st.close()
     print("JobManager OK: pending->generating->done + failure path + signals")
 
 
@@ -197,14 +209,14 @@ def test_cancel_pending() -> None:
     from store.models import STATUS_CANCELLED, STATUS_DONE, STATUS_GENERATING
 
     app = QApplication.instance() or QApplication([])
-    st = Store(Path(tempfile.mkdtemp()) / "cancel.db")
-    cfg = st.add_config("kick", model_id="local-flf-wan14b")
-    jm = JobManager(st)
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    jm = JobManager(project)
 
     release = threading.Event()
-    active = st.add_result(cfg.id, status=STATUS_PENDING)
-    q1 = st.add_result(cfg.id, status=STATUS_PENDING)
-    q2 = st.add_result(cfg.id, status=STATUS_PENDING)
+    active = project.add_take(shot.id, status=STATUS_PENDING)
+    q1 = project.add_take(shot.id, status=STATUS_PENDING)
+    q2 = project.add_take(shot.id, status=STATUS_PENDING)
 
     def blocker(progress):  # occupies the single local worker until released
         release.wait(timeout=10)
@@ -218,7 +230,7 @@ def test_cancel_pending() -> None:
     jm.enqueue(q2.id, "comfyui", quick)
 
     for _ in range(100):  # wait until the blocker is actually generating
-        if st.get_result(active.id).status == STATUS_GENERATING:
+        if project.get_take(active.id).status == STATUS_GENERATING:
             break
         time.sleep(0.02)
     assert jm.pending_count() == 2, jm.pending_count()
@@ -229,10 +241,9 @@ def test_cancel_pending() -> None:
     assert jm.wait_for_done(10000), "jobs did not finish"
     app.processEvents()
 
-    assert st.get_result(q1.id).status == STATUS_CANCELLED
-    assert st.get_result(q2.id).status == STATUS_CANCELLED
-    assert st.get_result(active.id).status == STATUS_DONE  # the running one was untouched
-    st.close()
+    assert project.get_take(q1.id).status == STATUS_CANCELLED
+    assert project.get_take(q2.id).status == STATUS_CANCELLED
+    assert project.get_take(active.id).status == STATUS_DONE  # the running one was untouched
     print("cancel_pending OK: queued cancelled, in-progress job left running")
 
 
