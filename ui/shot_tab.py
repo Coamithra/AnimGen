@@ -259,32 +259,29 @@ class ShotTab(QWidget):
 
     # ---- prompt templates ----------------------------------------------
     def _build_template_row(self) -> QHBoxLayout:
-        """Apply/save/delete row for the app-global prompt prefab library."""
-        self.template_combo = QComboBox()
-        self.template_combo.setToolTip("Reusable prompt prefabs, shared across all projects")
-        apply_btn = QPushButton("Apply"); apply_btn.clicked.connect(self._apply_template)
-        save_btn = QPushButton("Save as…"); save_btn.clicked.connect(self._save_template)
-        del_btn = QPushButton("Delete"); del_btn.clicked.connect(self._delete_template)
+        """Load/save buttons for the app-global prompt prefab library."""
+        load_btn = QPushButton("Load template"); load_btn.clicked.connect(self._load_template)
+        load_btn.setToolTip("Replace the prompt with a saved prefab (shared across all projects)")
+        save_btn = QPushButton("Save as template"); save_btn.clicked.connect(self._save_template)
+        save_btn.setToolTip("Save the current prompt as a reusable prefab")
         row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(QLabel("Template")); row.addWidget(self.template_combo, 1)
-        for b in (apply_btn, save_btn, del_btn):
-            row.addWidget(b)
-        self._reload_templates()
+        row.addWidget(QLabel("Template"))
+        row.addWidget(load_btn); row.addWidget(save_btn)
+        row.addStretch(1)
         return row
 
-    def _reload_templates(self, select: Optional[str] = None) -> None:
-        self.template_combo.blockSignals(True)
-        self.template_combo.clear()
-        for t in prompt_library.all_templates():
-            self.template_combo.addItem(t["name"], t)
-        if select is not None:
-            i = self.template_combo.findText(select)
-            if i >= 0:
-                self.template_combo.setCurrentIndex(i)
-        self.template_combo.blockSignals(False)
+    def _load_template(self) -> None:
+        names = [t["name"] for t in prompt_library.all_templates()]
+        if not names:
+            QMessageBox.information(self, "Load template", "No saved templates yet.")
+            return
+        name, ok = QInputDialog.getItem(self, "Load prompt template",
+                                        "Template:", names, 0, False)
+        if ok and name:
+            self._apply_template_by_name(name)
 
-    def _apply_template(self) -> None:
-        t = self.template_combo.currentData()
+    def _apply_template_by_name(self, name: str) -> None:
+        t = prompt_library.get(name)
         if not t:
             return
         self.prompt.setPlainText(t["positive"])      # fires textChanged -> marks dirty
@@ -292,9 +289,7 @@ class ShotTab(QWidget):
         self._mark_dirty()
 
     def _save_template(self) -> None:
-        suggested = self.template_combo.currentText()
-        name, ok = QInputDialog.getText(self, "Save prompt template",
-                                        "Template name:", text=suggested)
+        name, ok = QInputDialog.getText(self, "Save prompt template", "Template name:")
         name = name.strip()
         if not (ok and name):
             return
@@ -304,18 +299,6 @@ class ShotTab(QWidget):
                                     ) != QMessageBox.StandardButton.Yes:
                 return
         prompt_library.save(name, self.prompt.toPlainText(), self._negative_value())
-        self._reload_templates(select=name)
-
-    def _delete_template(self) -> None:
-        name = self.template_combo.currentText()
-        if not name:
-            return
-        if QMessageBox.question(self, "Delete template?",
-                                f"Delete the prompt template “{name}”?"
-                                ) != QMessageBox.StandardButton.Yes:
-            return
-        prompt_library.delete(name)
-        self._reload_templates()
 
     def _update_action_state(self) -> None:
         self.export_btn.setEnabled(self.shot is not None)

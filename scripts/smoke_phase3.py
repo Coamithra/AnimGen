@@ -213,7 +213,7 @@ def test_shot_tab() -> None:
 
 def test_negative_and_templates() -> None:
     """Negative box is greyed for models whose schema lacks negative_prompt (left editable
-    when the schema's unknown); the prompt-template combo applies a prefab into both boxes."""
+    when the schema's unknown); loading a prompt template applies a prefab into both boxes."""
     from PySide6.QtWidgets import QApplication
 
     from store import prompt_library, schema_cache
@@ -257,12 +257,11 @@ def test_negative_and_templates() -> None:
     assert ed.negative.toPlainText() == "no blur, no warping", "negative restored on switch-back"
     assert ed.negative.isEnabled() and ed.negative.placeholderText() == "Negative prompt…"
 
-    # Template combo: seeded prefabs present; Apply replaces both prompt boxes.
-    names = [ed.template_combo.itemText(i) for i in range(ed.template_combo.count())]
+    # Templates: seeded prefabs present; loading one replaces both prompt boxes.
+    names = [t["name"] for t in prompt_library.all_templates()]
     assert "Camera-locked action" in names, names
     prompt_library.save("Probe", "POS-PROBE", "NEG-PROBE")
-    ed._reload_templates(select="Probe")
-    ed._apply_template()
+    ed._apply_template_by_name("Probe")
     assert ed.prompt.toPlainText() == "POS-PROBE" and ed.negative.toPlainText() == "NEG-PROBE"
     print("ShotTab OK: negative greyed per-schema, prompt templates apply into both boxes")
 
