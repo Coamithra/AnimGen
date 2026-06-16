@@ -171,11 +171,11 @@ def test_shot_context_ops() -> None:
     card.duplicate_requested.connect(lambda sid: fired.__setitem__("dup", sid))
     card.delete_requested.connect(lambda sid: fired.__setitem__("del", sid))
     card.open_requested.connect(lambda sid: fired.__setitem__("edit", sid))
+    card.generate_requested.connect(lambda sid: fired.__setitem__("gen", sid))
     by_text = {a.text(): a for a in menu.actions()}
-    by_text["Duplicate"].trigger()
-    by_text["Delete"].trigger()
-    by_text["Edit"].trigger()
-    assert fired == {"dup": src.id, "del": src.id, "edit": src.id}, fired
+    for label in ("Duplicate", "Delete", "Edit", "Generate"):
+        by_text[label].trigger()
+    assert fired == {"dup": src.id, "del": src.id, "edit": src.id, "gen": src.id}, fired
     print("shot context ops OK: duplicate is independent + no takes; menu signals fire")
 
 
