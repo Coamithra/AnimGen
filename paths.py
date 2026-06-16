@@ -32,6 +32,7 @@ SCRATCH_DIR = DATA_DIR / "_scratch"              # assets dir for untitled proje
 APP_STATE = DATA_DIR / "app_state.json"          # {"last_project": <path>}
 SCHEMA_CACHE = DATA_DIR / "schema_cache.json"    # live Replicate input schemas (per replicate_model_id)
 PROMPT_TEMPLATES = DATA_DIR / "prompt_templates.json"  # app-global reusable prompt prefabs
+APP_SETTINGS = DATA_DIR / "app_settings.json"    # app-global preferences (e.g. startup schema refresh)
 DEFAULT_PROJECT = DATA_DIR / "Fighter.animproj"  # seeded starter project
 
 # External references (overridable via env) -----------------------------------

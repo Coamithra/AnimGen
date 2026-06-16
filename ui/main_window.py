@@ -29,6 +29,7 @@ import paths
 from backends import comfy_client, replicate_client
 from backends.jobs import JobManager
 from pipeline import export, framing
+from store import app_settings
 from store.project import Project
 from store.models import STATUS_PENDING
 from ui.assets_view import AssetsView
@@ -61,6 +62,7 @@ class MainWindow(QMainWindow):
         self._build_body()
         self._build_menu()
         self.reload()
+        self._maybe_refresh_schemas_on_startup()
 
     # ---- construction ---------------------------------------------------
     def _build_controls(self) -> QToolBar:
@@ -135,6 +137,21 @@ class MainWindow(QMainWindow):
             act.triggered.connect(
                 lambda _checked=False, w=widget, t=name: self._show_fixed_tab(w, t))
             view_menu.addAction(act)
+
+        settings_menu = bar.addMenu("&Settings")
+        self.startup_fetch_act = QAction("Update Replicate model data on startup", self)
+        self.startup_fetch_act.setCheckable(True)
+        self.startup_fetch_act.setChecked(
+            app_settings.get_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP))
+        self.startup_fetch_act.toggled.connect(
+            lambda on: app_settings.set_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP, on))
+        settings_menu.addAction(self.startup_fetch_act)
+
+    def _maybe_refresh_schemas_on_startup(self) -> None:
+        """If the user opted in, kick off the off-thread Replicate schema fetch at launch
+        (reuses the Model Library tab's fetcher; no GUI block, no-ops without a token)."""
+        if app_settings.get_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP):
+            self.library_tab.start_schema_fetch()
 
     def _build_body(self) -> None:
         self.cards_container = QWidget()
@@ -313,6 +330,8 @@ class MainWindow(QMainWindow):
             card = ShotCard(self.project, shot)
             card.generate_requested.connect(self.generate_shot)
             card.open_requested.connect(self.open_shot)
+            card.duplicate_requested.connect(self.duplicate_shot)
+            card.delete_requested.connect(self.delete_shot)
             card.export_takes_requested.connect(self.export_takes)
             if shot.id in expanded:
                 card.expand_btn.setChecked(True)
@@ -378,6 +397,36 @@ class MainWindow(QMainWindow):
         self._wire_shot_tab(tab)
         self.shot_tabs[shot_id] = tab
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
+
+    def duplicate_shot(self, shot_id: str) -> None:
+        dup = self.project.duplicate_shot(shot_id)
+        if not dup:
+            return
+        self.reload()
+        self._log(f"duplicated shot -> {dup.name}")
+
+    def delete_shot(self, shot_id: str) -> None:
+        shot = self.project.get_shot(shot_id)
+        if not shot:
+            return
+        takes = self.project.list_takes(shot_id, include_deleted=True)
+        msg = f"Delete shot '{shot.name}'?"
+        if takes:
+            msg += f"\n\nIts {len(takes)} take(s) will also be removed from the project."
+        if QMessageBox.question(
+                self, "Delete shot", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        tab = self.shot_tabs.pop(shot_id, None)   # close its open editor tab, if any
+        if tab is not None:
+            idx = self.tabs.indexOf(tab)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            tab.deleteLater()
+        self.project.delete_shot(shot_id)
+        self.reload()
+        self._log(f"deleted shot '{shot.name}'")
 
     def _commit_open_shot_tabs(self) -> None:
         """Flush every open shot-tab editor into the project buffer so File > Save

@@ -667,16 +667,16 @@ class ShotTab(QWidget):
                 w.setCurrentText(str(value))
             w.currentTextChanged.connect(lambda _t: self._on_aspect_changed())  # readout tracks resolution
             return w, lambda: w.currentText()
-        if enum:
-            w = QComboBox(); w.addItems([str(o) for o in enum])
-            w.setCurrentText(str(value))
-            return w, lambda: w.currentText()
-        if name == "mode":
-            opts = model.get("mode_options") or ["standard", "pro"]
+        if name == "mode":   # before the generic enum branch: mode drives Kling price and
+            opts = enum or model.get("mode_options") or ["standard", "pro"]   # needs the refresh wiring
             w = QComboBox(); w.addItems([str(o) for o in opts])
             if str(value) in [str(o) for o in opts]:
                 w.setCurrentText(str(value))
-            w.currentTextChanged.connect(lambda _t: self._refresh_price())   # mode drives Kling price
+            w.currentTextChanged.connect(lambda _t: self._refresh_price())
+            return w, lambda: w.currentText()
+        if enum:
+            w = QComboBox(); w.addItems([str(o) for o in enum])
+            w.setCurrentText(str(value))
             return w, lambda: w.currentText()
         if isinstance(value, bool):
             w = QCheckBox(); w.setChecked(value)
