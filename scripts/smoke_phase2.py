@@ -75,6 +75,57 @@ def test_comfy_prepare() -> None:
     print("comfy prepare_workflow OK: node-role map + heuristic fallback + --set")
 
 
+def test_dynamic_vram_gate() -> None:
+    # Mirrors ComfyUI's enables_dynamic_vram(): ON by default, off only with a disabler.
+    base = ["main.py", "--listen", "127.0.0.1", "--port", "8188"]
+    assert comfy_client.dynamic_vram_enabled(base) is True
+    assert comfy_client.dynamic_vram_enabled(base + ["--disable-dynamic-vram"]) is False
+    for disabler in ("--highvram", "--gpu-only", "--novram", "--cpu"):
+        assert comfy_client.dynamic_vram_enabled(base + [disabler]) is False, disabler
+    print("comfy dynamic-VRAM gate OK: default-on, off on each disabling flag")
+
+
+def test_comfy_launch_helpers() -> None:
+    cmd = comfy_client.build_launch_command()
+    assert cmd[1].endswith("main.py")
+    assert "--disable-dynamic-vram" in cmd and "--port" in cmd
+    # overriding a default flag drops its value too (no orphaned 8188), keeps the flag
+    over = comfy_client.build_launch_command(["--port", "8189"])
+    assert "8188" not in over and over[-2:] == ["--port", "8189"]
+    assert "--disable-dynamic-vram" in over
+    # status probe is non-raising and well-shaped whether or not a server is up
+    st = comfy_client.server_status(timeout=1)
+    assert set(st) == {"running", "version", "dynamic_vram", "argv"}
+    assert isinstance(st["running"], bool)
+    # monitor snapshot + models list are non-raising too (the monitor window relies on it)
+    snap = comfy_client.monitor_snapshot(timeout=1)
+    assert isinstance(snap, dict) and isinstance(snap["running"], bool)
+    if not snap["running"]:
+        assert snap == {"running": False}
+    assert isinstance(comfy_client.list_models(timeout=1), dict)
+    print("comfy launch helpers OK: command flags + non-raising status/monitor probes")
+
+
+def test_comfy_stop_helpers() -> None:
+    # pid-by-port lookup is read-only and non-raising (int when a server is up, else None)
+    pid = comfy_client._pid_on_port(comfy_client.COMFY_PORT)
+    assert pid is None or isinstance(pid, int)
+    # stop_work surfaces a ComfyError when ComfyUI is unreachable. Point at a dead port so
+    # this never touches a real server (which it would interrupt).
+    saved = comfy_client.COMFY_URL
+    comfy_client.COMFY_URL = "http://127.0.0.1:1"
+    try:
+        raised = False
+        try:
+            comfy_client.stop_work(timeout=1)
+        except comfy_client.ComfyError:
+            raised = True
+        assert raised, "stop_work should raise ComfyError when ComfyUI is unreachable"
+    finally:
+        comfy_client.COMFY_URL = saved
+    print("comfy stop helpers OK: pid-by-port probe + stop_work error path")
+
+
 def test_cost_summary() -> None:
     from ui.cost_confirm import build_summary
 
@@ -136,9 +187,62 @@ def test_job_manager() -> None:
     print("JobManager OK: pending->generating->done + failure path + signals")
 
 
+def test_cancel_pending() -> None:
+    import threading
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+    from store.models import STATUS_CANCELLED, STATUS_DONE, STATUS_GENERATING
+
+    app = QApplication.instance() or QApplication([])
+    st = Store(Path(tempfile.mkdtemp()) / "cancel.db")
+    cfg = st.add_config("kick", model_id="local-flf-wan14b")
+    jm = JobManager(st)
+
+    release = threading.Event()
+    active = st.add_result(cfg.id, status=STATUS_PENDING)
+    q1 = st.add_result(cfg.id, status=STATUS_PENDING)
+    q2 = st.add_result(cfg.id, status=STATUS_PENDING)
+
+    def blocker(progress):  # occupies the single local worker until released
+        release.wait(timeout=10)
+        return {"video_path": "x.mp4"}
+
+    def quick(progress):
+        return {"video_path": "y.mp4"}
+
+    jm.enqueue(active.id, "comfyui", blocker)   # local pool is max 1 -> this one runs,
+    jm.enqueue(q1.id, "comfyui", quick)         # these two wait in the queue
+    jm.enqueue(q2.id, "comfyui", quick)
+
+    for _ in range(100):  # wait until the blocker is actually generating
+        if st.get_result(active.id).status == STATUS_GENERATING:
+            break
+        time.sleep(0.02)
+    assert jm.pending_count() == 2, jm.pending_count()
+
+    n = jm.cancel_pending()
+    assert n == 2, n
+    release.set()
+    assert jm.wait_for_done(10000), "jobs did not finish"
+    app.processEvents()
+
+    assert st.get_result(q1.id).status == STATUS_CANCELLED
+    assert st.get_result(q2.id).status == STATUS_CANCELLED
+    assert st.get_result(active.id).status == STATUS_DONE  # the running one was untouched
+    st.close()
+    print("cancel_pending OK: queued cancelled, in-progress job left running")
+
+
 if __name__ == "__main__":
     test_build_input()
     test_comfy_prepare()
+    test_dynamic_vram_gate()
+    test_comfy_launch_helpers()
+    test_comfy_stop_helpers()
     test_cost_summary()
+    test_cancel_pending()
     test_job_manager()
     print("PHASE 2 SMOKE: PASS")

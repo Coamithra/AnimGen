@@ -14,7 +14,9 @@ from typing import Callable
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
 from store.db import Store
-from store.models import STATUS_DONE, STATUS_FAILED, STATUS_GENERATING
+from store.models import (
+    STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
+)
 
 Runner = Callable[[Callable[[str], None]], dict]
 
@@ -31,17 +33,22 @@ class _JobSignals(QObject):
 
 class GenerationJob(QRunnable):
     def __init__(self, store: Store, result_id: str, backend: str, runner: Runner,
-                 signals: _JobSignals):
+                 signals: _JobSignals, cancelled: set):
         super().__init__()
         self.store = store
         self.result_id = result_id
         self.backend = backend
         self.runner = runner
         self.signals = signals
+        self.cancelled = cancelled   # shared with JobManager; ids cancelled while queued
 
     @Slot()
     def run(self) -> None:
         rid = self.result_id
+        if rid in self.cancelled:    # cancelled while queued - never invoke the backend
+            self.store.update_result(rid, status=STATUS_CANCELLED, error="cancelled before start")
+            self.signals.status_changed.emit(rid, STATUS_CANCELLED)
+            return
         self.store.update_result(rid, status=STATUS_GENERATING)
         self.signals.status_changed.emit(rid, STATUS_GENERATING)
         job = self.store.add_job(rid, backend=self.backend, state="running")
@@ -91,14 +98,39 @@ class JobManager(QObject):
         self._hosted_pool.setMaxThreadCount(hosted_concurrency)
         self._local_pool = QThreadPool()
         self._local_pool.setMaxThreadCount(1)  # one GPU - serialize local renders
+        self._cancelled: set[str] = set()      # result ids cancelled while still queued
 
     def enqueue(self, result_id: str, backend: str, runner: Runner) -> None:
-        job = GenerationJob(self.store, result_id, backend, runner, self._signals)
+        job = GenerationJob(self.store, result_id, backend, runner, self._signals,
+                            self._cancelled)
         pool = self._local_pool if backend == "comfyui" else self._hosted_pool
         pool.start(job)
 
     def active_count(self) -> int:
         return self._hosted_pool.activeThreadCount() + self._local_pool.activeThreadCount()
+
+    def pending_count(self) -> int:
+        """Generations that are queued but haven't started rendering yet."""
+        return sum(1 for r in self.store.list_results() if r.status == STATUS_PENDING)
+
+    def cancel_pending(self) -> int:
+        """Cancel every queued-but-unstarted generation and return how many were cancelled.
+
+        Drops the not-yet-started runnables from both pools and marks each still-pending
+        result CANCELLED (immediate, so the UI updates now rather than only when the queue
+        eventually drains). The in-progress job, if any, is GENERATING (not pending) and is
+        left running - cancel that one with the backend's Stop control. The shared
+        `_cancelled` set is a safety net for a runnable already dequeued when we cleared.
+        """
+        self._hosted_pool.clear()
+        self._local_pool.clear()
+        pending = [r for r in self.store.list_results(include_deleted=False)
+                   if r.status == STATUS_PENDING]
+        for r in pending:
+            self._cancelled.add(r.id)
+            self.store.update_result(r.id, status=STATUS_CANCELLED, error="cancelled by user")
+            self._signals.status_changed.emit(r.id, STATUS_CANCELLED)
+        return len(pending)
 
     def wait_for_done(self, msecs: int = -1) -> bool:
         ok = self._hosted_pool.waitForDone(msecs)

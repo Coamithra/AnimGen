@@ -8,9 +8,11 @@ panel and refreshes the originating card. Export is wired in Phase 5.
 """
 from __future__ import annotations
 
+import threading
+import time
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QLabel, QMainWindow, QMessageBox,
@@ -25,12 +27,53 @@ from pipeline import export
 from store.db import Store
 from store.models import STATUS_PENDING
 from ui.config_card import ConfigCard
+from ui.comfy_monitor_window import ComfyMonitorWindow
 from ui.config_editor import ConfigEditor
 from ui.cost_confirm import confirm_launch
 from ui.model_library_window import ModelLibraryWindow
 
 # settings keys passed to the hosted client explicitly (everything else -> extra/--set)
 _EXPLICIT_SETTINGS = ("duration", "resolution", "seed", "length")
+
+
+class _ComfyController(QObject):
+    """Drives the Launch-ComfyUI flow entirely off the GUI thread.
+
+    Probing a down server costs a full socket timeout on Windows (a closed localhost
+    port drops SYNs rather than refusing), so even the initial "is it up?" check would
+    freeze the GUI. The whole probe -> launch -> poll sequence therefore runs on a daemon
+    thread and reports back via `result`, whose queued delivery hops to the GUI thread.
+    Outcomes: 'running', 'launching', 'ready', 'timeout', 'failed' (info is a status
+    dict, or {'message': ...} for 'failed').
+    """
+    result = Signal(str, object)
+
+    def __init__(self, attempts: int = 45, interval: float = 2.0):
+        super().__init__()
+        self._attempts = attempts
+        self._interval = interval
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        st = comfy_client.server_status(timeout=2)
+        if st["running"]:
+            self.result.emit("running", st)
+            return
+        try:
+            comfy_client.launch_server()
+        except comfy_client.ComfyError as e:
+            self.result.emit("failed", {"message": str(e)})
+            return
+        self.result.emit("launching", {})
+        for _ in range(self._attempts):
+            time.sleep(self._interval)
+            st = comfy_client.server_status(timeout=2)
+            if st["running"]:
+                self.result.emit("ready", st)
+                return
+        self.result.emit("timeout", {})
 
 
 class MainWindow(QMainWindow):
@@ -72,10 +115,23 @@ class MainWindow(QMainWindow):
         exp_view = QAction("Export view", self)
         exp_view.triggered.connect(self.export_current_view)
         tb.addAction(exp_view)
+        self.cancel_act = QAction("Cancel pending", self)
+        self.cancel_act.setToolTip("Cancel all queued generations that haven't started yet")
+        self.cancel_act.triggered.connect(self.cancel_pending)
+        self.cancel_act.setEnabled(False)
+        tb.addAction(self.cancel_act)
         tb.addSeparator()
         lib_act = QAction("Model Library", self)
         lib_act.triggered.connect(self.show_library)
         tb.addAction(lib_act)
+        comfy_act = QAction("Launch ComfyUI", self)
+        comfy_act.setToolTip("Start the local ComfyUI backend with --disable-dynamic-vram")
+        comfy_act.triggered.connect(self.launch_comfyui)
+        tb.addAction(comfy_act)
+        mon_act = QAction("ComfyUI Status", self)
+        mon_act.setToolTip("Live status, memory, queue, settings and installed models")
+        mon_act.triggered.connect(self.show_comfy_monitor)
+        tb.addAction(mon_act)
 
     def _build_body(self) -> None:
         self.cards_container = QWidget()
@@ -190,6 +246,16 @@ class MainWindow(QMainWindow):
         self._log(f"queued {result.id[:8]} ({cfg.name})")
         if cfg.id in self.cards:
             self.cards[cfg.id].refresh_results()
+        self._refresh_cancel_action()
+
+    def cancel_pending(self) -> None:
+        n = self.jobs.cancel_pending()
+        self._log(f"cancelled {n} pending generation(s)" if n
+                  else "no pending generations to cancel")
+        self._refresh_cancel_action()
+
+    def _refresh_cancel_action(self) -> None:
+        self.cancel_act.setEnabled(self.jobs.pending_count() > 0)
 
     def _make_runner(self, model, cfg, settings, result_id):
         out_path = paths.RESULTS_DIR / cfg.id / f"{result_id}.mp4"
@@ -272,6 +338,60 @@ class MainWindow(QMainWindow):
         self._library_window.setWindowFlag(Qt.WindowType.Window, True)
         self._library_window.show()
 
+    def show_comfy_monitor(self) -> None:
+        # keep a reference so the separate window isn't garbage-collected
+        self._comfy_monitor = ComfyMonitorWindow(self)
+        self._comfy_monitor.setWindowFlag(Qt.WindowType.Window, True)
+        self._comfy_monitor.show()
+
+    # ---- local backend --------------------------------------------------
+    def launch_comfyui(self) -> None:
+        """Start the local ComfyUI (with --disable-dynamic-vram) if it isn't already up.
+
+        Non-blocking: a _ComfyController does the probe/launch/poll off-thread and reports
+        back through _on_comfy_result, so the button never freezes the GUI.
+        """
+        self._log("checking ComfyUI…")
+        self.statusBar().showMessage("Checking ComfyUI…")
+        self._comfy_ctl = _ComfyController()  # kept on self so it isn't GC'd
+        self._comfy_ctl.result.connect(self._on_comfy_result)
+        self._comfy_ctl.start()
+
+    def _on_comfy_result(self, outcome: str, info: dict) -> None:
+        if outcome == "launching":
+            self._log("launching ComfyUI (--disable-dynamic-vram) - first model load can take a minute…")
+            self.statusBar().showMessage("Starting ComfyUI…")
+            return
+        if outcome == "failed":
+            self.statusBar().clearMessage()
+            self._log(f"ComfyUI launch failed: {info['message']}")
+            QMessageBox.warning(self, "Launch ComfyUI", info["message"])
+            return
+        if outcome == "timeout":
+            self._log("ComfyUI did not answer in time - check data/comfyui_server.log")
+            self.statusBar().showMessage("ComfyUI did not start", 6000)
+            return
+
+        # outcome is 'running' (already up) or 'ready' (we just launched it)
+        already = outcome == "running"
+        version = info.get("version") or "?"
+        if info.get("dynamic_vram"):  # via our launcher this won't happen; report it if it does
+            self._log("ComfyUI up with dynamic VRAM ENABLED - stop it and relaunch")
+            self.statusBar().showMessage("ComfyUI up (dynamic VRAM ENABLED!)", 6000)
+            QMessageBox.warning(
+                self, "ComfyUI",
+                f"ComfyUI is {'already ' if already else ''}running with DYNAMIC VRAM "
+                "ENABLED, so local generations will be blocked. Stop that server, then "
+                "click Launch ComfyUI again to start one with --disable-dynamic-vram.")
+        else:
+            self._log(f"ComfyUI {'already ' if already else ''}ready (v{version}) - dynamic VRAM disabled")
+            self.statusBar().showMessage("ComfyUI ready", 6000)
+            if already:
+                QMessageBox.information(
+                    self, "ComfyUI",
+                    f"ComfyUI is already running (v{version}) with dynamic VRAM disabled. "
+                    "Ready to generate.")
+
     # ---- job signal handlers -------------------------------------------
     def _log(self, line: str) -> None:
         self.log.appendPlainText(line)
@@ -288,9 +408,11 @@ class MainWindow(QMainWindow):
         card = self._card_for_result(result_id)
         if card:
             card.refresh_results()
+        self._refresh_cancel_action()
 
     def _after_job(self, result_id: str, msg: str) -> None:
         self._log(msg)
         card = self._card_for_result(result_id)
         if card:
             card.refresh_results()
+        self._refresh_cancel_action()

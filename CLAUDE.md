@@ -46,18 +46,19 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 | `library.py` / `model_library.json` | model-roster loader + the hand-authored roster |
 | `store/db.py` `store/models.py` | SQLite store (configs / results / jobs) + dataclasses |
 | `backends/replicate_client.py` | hosted generation (refactor of Fighter's `run_replicate.py`) |
-| `backends/comfy_client.py` | local ComfyUI generation (wraps `run_workflow.py`; node-role mapping) |
-| `backends/jobs.py` | `JobManager` on QThreadPool; hosted parallel, local serialized; status signals |
+| `backends/comfy_client.py` | local ComfyUI generation (node-role mapping); also server lifecycle/status/preflight: `launch_server` (tracks the Popen in `_server_proc`), `stop_work` (interrupt+clear queue), `stop_server` (terminate ours, else kill by port via `_pid_on_port`/`_kill_pid`), `server_status`, `monitor_snapshot`, `list_models`, `build_launch_command`, `preflight`, `dynamic_vram_enabled` |
+| `backends/jobs.py` | `JobManager` on QThreadPool; hosted parallel, local serialized; status signals; `cancel_pending`/`pending_count` (clears queued runnables + marks them `cancelled`; shared `_cancelled` set guards any already-dequeued job) |
 | `pipeline/framing.py` | keypose crop/normalize → 1254² magenta contract canvas |
 | `pipeline/extract.py` | frame extraction + thumbnails (PyAV) |
 | `pipeline/export.py` | `<name>_<timestamp>/` frames + `settings.txt` |
 | `pipeline/results_io.py` | bin / restore |
-| `ui/main_window.py` | config cards in a scroll area + global filters + Generate/Export wiring |
+| `ui/main_window.py` | config cards in a scroll area + global filters + Generate/Export wiring + **Cancel pending** button + **Launch ComfyUI** button (`_ComfyController`) + **ComfyUI Status** button |
+| `ui/comfy_monitor_window.py` | live ComfyUI monitor window: status/version, RAM+VRAM, queue, launch settings, installed models + Launch/Stop working/Shut down controls (off-thread poller + `_AsyncCall` for stop/shutdown, same closed-port-timeout reason) |
 | `ui/config_card.py` `ui/results_view.py` | expandable row + inline results folder grid |
 | `ui/config_editor.py` `ui/crop_widget.py` | create/edit config + the crop/framing tool |
 | `ui/cost_confirm.py` | the launch gate |
 | `ui/model_library_window.py` | read-only model roster window |
-| `scripts/` | `seed_configs.py` + `smoke_phase*.py` |
+| `scripts/` | `seed_configs.py` + `smoke_phase*.py` + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) |
 | `data/` | runtime (gitignored): `animgen.db`, `results/`, `bin/`, `exports/`, `thumbs/`, `keyposes/` |
 | `workflows/` | bundled ComfyUI templates for the local backend |
 
@@ -90,3 +91,16 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 8. Pyright may flag `from store... / from ui...` imports as unresolved — false
    positives (the repo root is on `sys.path` at runtime; `pyrightconfig.json` sets the
    venv). Runtime is the source of truth; smoke tests gate it.
+9. **Local backend MUST run with `--disable-dynamic-vram`.** ComfyUI's default
+   dynamic-VRAM (aimdo) engine stalls a 14B render past Windows' 2s GPU watchdog (TDR)
+   on the 12GB card → driver reset → server dies mid-job, no traceback (Fighter, a night
+   of crashes 2026-06-14; see `../Fighter/research/comfyui-gpu-watchdog-crash-and-aimdo.md`).
+   AnimGen doesn't start ComfyUI, so it can't pass the flag — instead `comfy_client.preflight()`
+   reads the server's launch `argv` from `/system_stats` and **refuses to submit a local
+   job** if dynamic VRAM is enabled (mirrors ComfyUI's own `enables_dynamic_vram()` gate).
+   Start ComfyUI with the flag baked in via the **Launch ComfyUI** toolbar button (detached,
+   logs to `data/comfyui_server.log`) or `scripts/launch_comfyui.py`/`.bat` — all three share
+   `comfy_client.build_launch_command()`. Escape hatch: `ANIMGEN_ALLOW_DYNAMIC_VRAM=1`.
+   Note: probing a *down* localhost port costs a full socket timeout on this machine (SYNs
+   to closed ports are dropped, not refused), so the launch flow runs probe→launch→poll on a
+   daemon thread (`_ComfyController`) — never block the GUI thread on `server_status()`.

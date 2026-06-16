@@ -11,16 +11,20 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import shutil
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
-from paths import COMFY_DIR, COMFY_INPUT_DIR
+from paths import COMFY_DIR, COMFY_INPUT_DIR, DATA_DIR
 
-COMFY_URL = "http://127.0.0.1:8188"
+COMFY_PORT = 8188
+COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
 COMFY_OUTPUT_DIR = COMFY_DIR / "output"
 
 ProgressCb = Optional[Callable[[str], None]]
@@ -45,6 +49,254 @@ def _api(path: str, data=None, timeout: int = 30) -> dict:
             return json.loads(r.read())
     except urllib.error.URLError as e:  # type: ignore[name-defined]
         raise ComfyError(f"ComfyUI unreachable at {COMFY_URL} ({e}). Is it running?") from e
+
+
+# Dynamic VRAM (ComfyUI's comfy-aimdo engine, default-ON) streams model weights
+# RAM<->VRAM mid-kernel over PCIe. On a 12GB card under heavy offload a 14B render can
+# stall one GPU op past Windows' 2s TDR watchdog -> driver reset -> ComfyUI dies
+# mid-render with no traceback (cost the Fighter project a night of crashes, 2026-06-14;
+# see ../Fighter/research/comfyui-gpu-watchdog-crash-and-aimdo.md). The fix is a server
+# LAUNCH flag (--disable-dynamic-vram). AnimGen doesn't start ComfyUI, so we can't pass
+# it - but /system_stats echoes the server's argv, so we can REFUSE to run a local job
+# against a server that has dynamic VRAM enabled. Bypass with ANIMGEN_ALLOW_DYNAMIC_VRAM=1.
+
+# Flags that switch dynamic VRAM off, mirroring ComfyUI's enables_dynamic_vram() gate
+# (comfy/cli_args.py): dynamic VRAM is ON unless one of these is on the command line.
+_DYNAMIC_VRAM_DISABLERS = frozenset({
+    "--disable-dynamic-vram", "--highvram", "--gpu-only", "--novram", "--cpu",
+})
+
+
+def dynamic_vram_enabled(argv: list[str]) -> bool:
+    """True if a ComfyUI launched with `argv` has dynamic VRAM (aimdo) enabled.
+
+    Pure mirror of ComfyUI's `enables_dynamic_vram()`: ON by default, off only when a
+    disabling flag is present. Split out from preflight() so it's unit-testable offline.
+    """
+    return not (_DYNAMIC_VRAM_DISABLERS & set(argv))
+
+
+def preflight(progress_cb: ProgressCb = None) -> None:
+    """Abort before launching a local job if the running ComfyUI has dynamic VRAM on.
+
+    Queries /system_stats (which echoes the server's launch argv) and raises ComfyError
+    with the fix if dynamic VRAM is enabled. No-op when ANIMGEN_ALLOW_DYNAMIC_VRAM is set.
+    Doubles as a reachability check (clear error if the server is down).
+    """
+    if os.environ.get("ANIMGEN_ALLOW_DYNAMIC_VRAM"):
+        _log(progress_cb, "preflight: dynamic-VRAM guard bypassed (ANIMGEN_ALLOW_DYNAMIC_VRAM)")
+        return
+    stats = _api("/system_stats")
+    argv = stats.get("system", {}).get("argv", [])
+    if dynamic_vram_enabled(argv):
+        raise ComfyError(
+            "ComfyUI is running with DYNAMIC VRAM ENABLED. On the 12GB card this trips "
+            "Windows' 2s GPU watchdog (TDR) on 14B renders and kills the server mid-job. "
+            "Restart ComfyUI with --disable-dynamic-vram - e.g. run "
+            "scripts/launch_comfyui.py (or .bat), or add the flag to your own launch "
+            "command. Set ANIMGEN_ALLOW_DYNAMIC_VRAM=1 to bypass this guard. Details: "
+            "../Fighter/research/comfyui-gpu-watchdog-crash-and-aimdo.md."
+        )
+    _log(progress_cb, "preflight: dynamic VRAM disabled - OK")
+
+
+# --- Server process management ----------------------------------------------
+# AnimGen can start the local ComfyUI itself (the "Launch ComfyUI" button / the
+# scripts/launch_comfyui.py CLI) so --disable-dynamic-vram is always applied.
+# build_launch_command() is the single source of truth for HOW to start it.
+
+REQUIRED_FLAGS = ["--disable-dynamic-vram"]
+_DEFAULT_FLAGS = [("--listen", "127.0.0.1"), ("--port", str(COMFY_PORT))]  # (flag, value)
+_server_proc: "Optional[subprocess.Popen]" = None  # the ComfyUI we launched, if any
+
+
+def comfy_python() -> Path:
+    """The ComfyUI venv interpreter, falling back to the current interpreter."""
+    venv_py = COMFY_DIR / "venv" / "Scripts" / "python.exe"
+    return venv_py if venv_py.exists() else Path(sys.executable)
+
+
+def build_launch_command(extra: Optional[list[str]] = None) -> list[str]:
+    """ComfyUI launch argv with our required flags. A default flag/value pair is dropped
+    whole when `extra` overrides that flag (so e.g. --port won't orphan its default 8188)."""
+    extra = list(extra or [])
+    cmd = [str(comfy_python()), str(COMFY_DIR / "main.py")]
+    for flag, value in _DEFAULT_FLAGS:
+        if flag not in extra:
+            cmd += [flag, value]
+    cmd += [f for f in REQUIRED_FLAGS if f not in extra]
+    cmd += extra
+    return cmd
+
+
+def server_status(timeout: int = 2) -> dict:
+    """Non-raising probe of the local ComfyUI server.
+
+    Returns {running, version, dynamic_vram, argv}. dynamic_vram is None when the server
+    is down, else True/False derived from its launch argv (the gate preflight enforces).
+    """
+    try:
+        system = _api("/system_stats", timeout=timeout).get("system", {})
+    except Exception:  # noqa: BLE001 - a status probe must never raise
+        return {"running": False, "version": None, "dynamic_vram": None, "argv": []}
+    argv = system.get("argv", [])
+    return {"running": True, "version": system.get("comfyui_version"),
+            "dynamic_vram": dynamic_vram_enabled(argv), "argv": argv}
+
+
+def launch_server(extra: Optional[list[str]] = None) -> "subprocess.Popen":
+    """Start a detached local ComfyUI with --disable-dynamic-vram, logging to
+    data/comfyui_server.log. Returns the Popen handle without waiting for readiness.
+    Raises ComfyError if the ComfyUI install isn't found."""
+    global _server_proc
+    if not (COMFY_DIR / "main.py").exists():
+        raise ComfyError(f"ComfyUI not found at {COMFY_DIR} (set ANIMGEN_COMFY_DIR).")
+    cmd = build_launch_command(extra)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    logfile = open(DATA_DIR / "comfyui_server.log", "ab")  # inherited by the child
+    flags = 0
+    if sys.platform == "win32":  # detach: no console window, outlives AnimGen
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "DETACHED_PROCESS", 0x8)
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(COMFY_DIR), stdout=logfile,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                creationflags=flags, close_fds=True)
+    finally:
+        logfile.close()  # the child keeps its own inherited handle
+    _server_proc = proc  # remembered so stop_server() can terminate exactly this one
+    return proc
+
+
+def monitor_snapshot(timeout: int = 2) -> dict:
+    """One-shot gather of live ComfyUI state for the monitor window. Non-raising.
+
+    Returns {"running": False} if the server is down, else running flag + version +
+    python/pytorch/os + launch argv (settings) + dynamic_vram + ram/vram totals/free +
+    a queue summary (running count, pending count, the running prompt id).
+    """
+    try:
+        st = _api("/system_stats", timeout=timeout)
+    except Exception:  # noqa: BLE001 - a monitor probe must never raise
+        return {"running": False}
+    system = st.get("system", {})
+    dev = (st.get("devices") or [{}])[0]
+    argv = system.get("argv", [])
+    py = (system.get("python_version") or "").split(" ")[0] or None
+    snap = {
+        "running": True, "version": system.get("comfyui_version"),
+        "python_version": py, "pytorch_version": system.get("pytorch_version"),
+        "os": system.get("os"), "argv": argv, "dynamic_vram": dynamic_vram_enabled(argv),
+        "ram_total": system.get("ram_total"), "ram_free": system.get("ram_free"),
+        "device_name": dev.get("name"), "vram_total": dev.get("vram_total"),
+        "vram_free": dev.get("vram_free"),
+        "queue_running": 0, "queue_pending": 0, "running_prompt": None,
+    }
+    try:  # queue is best-effort - a failure here shouldn't blank the whole snapshot
+        q = _api("/queue", timeout=timeout)
+        running, pending = q.get("queue_running") or [], q.get("queue_pending") or []
+        snap["queue_running"], snap["queue_pending"] = len(running), len(pending)
+        if running and len(running[0]) > 1:  # item shape: [number, prompt_id, prompt, ...]
+            snap["running_prompt"] = running[0][1]
+    except Exception:  # noqa: BLE001
+        pass
+    return snap
+
+
+def list_models(timeout: int = 10) -> dict:
+    """Map of model-folder -> filenames via /models then /models/{folder}. Non-raising;
+    returns {} if the server is down. Folders that error individually map to []."""
+    try:
+        folders = _api("/models", timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict = {}
+    for folder in folders:
+        try:
+            out[folder] = _api(f"/models/{folder}", timeout=timeout)
+        except Exception:  # noqa: BLE001
+            out[folder] = []
+    return out
+
+
+def _post(path: str, data: Optional[dict] = None, timeout: int = 5) -> None:
+    """Fire-and-forget POST that tolerates an empty / non-JSON body (the control
+    endpoints return a bare 200). Raises ComfyError on a transport/HTTP failure."""
+    req = urllib.request.Request(COMFY_URL + path, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.data = json.dumps(data or {}).encode()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read()
+    except urllib.error.URLError as e:  # includes HTTPError for 4xx/5xx
+        raise ComfyError(f"ComfyUI POST {path} failed ({e}). Is it running?") from e
+
+
+def stop_work(timeout: int = 5) -> None:
+    """Cancel current ComfyUI work without shutting the server down: wipe the pending
+    queue, then interrupt the running prompt. Raises ComfyError if the server is down."""
+    _post("/queue", {"clear": True}, timeout=timeout)   # drop anything not yet started
+    _post("/interrupt", {}, timeout=timeout)            # stop the one in progress
+
+
+def stop_server(timeout: int = 10) -> None:
+    """Shut the local ComfyUI down. Terminates the process we launched if we still have
+    it; otherwise finds and kills whatever is listening on COMFY_PORT (so a server started
+    by the CLI/script, or left over from a previous AnimGen run, can still be stopped).
+    No-op if nothing is running. Raises ComfyError if a live server can't be located."""
+    global _server_proc
+    pid = _server_proc.pid if (_server_proc and _server_proc.poll() is None) else None
+    if pid is None:
+        pid = _pid_on_port(COMFY_PORT)
+    if pid is None:
+        _server_proc = None
+        if server_status(timeout=2)["running"]:
+            raise ComfyError("ComfyUI is running but its process could not be located "
+                             "to stop it (try closing it from where it was launched).")
+        return  # already down - nothing to do
+    _kill_pid(pid, timeout=timeout)
+    _server_proc = None
+
+
+def _pid_on_port(port: int) -> Optional[int]:
+    """PID of the process LISTENING on `port` (loopback), or None. Uses psutil if present,
+    else parses netstat on Windows."""
+    try:
+        import psutil  # optional - not an AnimGen dependency, just a fast path
+        for c in psutil.net_connections(kind="inet"):
+            if c.laddr and c.laddr.port == port and c.status == psutil.CONN_LISTEN and c.pid:
+                return c.pid
+    except Exception:  # noqa: BLE001 - psutil missing or query failed; fall through
+        pass
+    if sys.platform != "win32":
+        return None
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    for line in out.splitlines():
+        parts = line.split()  # e.g. ['TCP','127.0.0.1:8188','0.0.0.0:0','LISTENING','12345']
+        if len(parts) >= 5 and parts[3].upper() == "LISTENING" and parts[1].endswith(f":{port}"):
+            try:
+                return int(parts[-1])
+            except ValueError:
+                return None
+    return None
+
+
+def _kill_pid(pid: int, timeout: int = 10) -> None:
+    if sys.platform == "win32":
+        r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            raise ComfyError(f"taskkill failed for PID {pid}: "
+                             f"{(r.stderr or r.stdout).strip()}")
+    else:
+        import signal
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
 
 def copy_input_image(path: str | Path) -> str:
@@ -133,6 +385,7 @@ def prepare_workflow(template: dict, *, start_img: Optional[str] = None,
 
 def submit(wf: dict, out_path: Path, progress_cb: ProgressCb = None,
            timeout_s: int = 3600, poll_s: int = 5) -> dict:
+    preflight(progress_cb)
     res = _api("/prompt", {"prompt": wf})
     pid = res["prompt_id"]
     _log(progress_cb, f"queued {pid}")

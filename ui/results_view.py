@@ -25,7 +25,7 @@ from store.db import Store
 _USER_ROLE = int(Qt.ItemDataRole.UserRole)
 _BADGE = {"pending": "⏳", "generating": "▶", "done": "", "failed": "✗"}
 _BADGE_COLOR = {"pending": "#b0b0b0", "generating": "#5aa0ff",
-                "done": "#7ade8c", "failed": "#ff6b6b"}
+                "done": "#7ade8c", "failed": "#ff6b6b", "cancelled": "#c0a060"}
 
 
 class ResultsView(QWidget):
