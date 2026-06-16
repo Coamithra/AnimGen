@@ -330,6 +330,8 @@ class MainWindow(QMainWindow):
             card = ShotCard(self.project, shot)
             card.generate_requested.connect(self.generate_shot)
             card.open_requested.connect(self.open_shot)
+            card.duplicate_requested.connect(self.duplicate_shot)
+            card.delete_requested.connect(self.delete_shot)
             card.export_takes_requested.connect(self.export_takes)
             if shot.id in expanded:
                 card.expand_btn.setChecked(True)
@@ -395,6 +397,36 @@ class MainWindow(QMainWindow):
         self._wire_shot_tab(tab)
         self.shot_tabs[shot_id] = tab
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
+
+    def duplicate_shot(self, shot_id: str) -> None:
+        dup = self.project.duplicate_shot(shot_id)
+        if not dup:
+            return
+        self.reload()
+        self._log(f"duplicated shot -> {dup.name}")
+
+    def delete_shot(self, shot_id: str) -> None:
+        shot = self.project.get_shot(shot_id)
+        if not shot:
+            return
+        takes = self.project.list_takes(shot_id, include_deleted=True)
+        msg = f"Delete shot '{shot.name}'?"
+        if takes:
+            msg += f"\n\nIts {len(takes)} take(s) will also be removed from the project."
+        if QMessageBox.question(
+                self, "Delete shot", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        tab = self.shot_tabs.pop(shot_id, None)   # close its open editor tab, if any
+        if tab is not None:
+            idx = self.tabs.indexOf(tab)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            tab.deleteLater()
+        self.project.delete_shot(shot_id)
+        self.reload()
+        self._log(f"deleted shot '{shot.name}'")
 
     def _commit_open_shot_tabs(self) -> None:
         """Flush every open shot-tab editor into the project buffer so File > Save
@@ -599,18 +631,40 @@ class MainWindow(QMainWindow):
             self.tabs.addTab(widget, title)
         self.tabs.setCurrentWidget(widget)
 
+    def _maybe_close_shot_tab(self, tab: ShotTab) -> bool:
+        """Confirm before closing a shot tab that has uncommitted editor edits. Returns
+        False to keep the tab (and its edits) open — Cancel. Save commits the edits into
+        the project buffer (same as the tab's own Save button; the title's * persists
+        until File > Save writes to disk); Discard drops them."""
+        if not tab.is_dirty():
+            return True
+        name = (tab.shot.name if tab.shot else tab.name.text().strip()) or "this shot"
+        choice = QMessageBox.question(
+            self, "Unsaved changes",
+            f"Save changes to '{name}' before closing this tab?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Save)
+        if choice == QMessageBox.StandardButton.Cancel:
+            return False
+        if choice == QMessageBox.StandardButton.Save:
+            tab.commit()            # flush the edit into the project buffer (no disk write)
+            self.reload()           # the new/updated shot's card now reflects it
+        return True
+
     def _on_tab_close(self, index: int) -> None:
         widget = self.tabs.widget(index)
-        if widget is self.comfy_tab:
-            self.comfy_tab.stop_monitoring()
         if isinstance(widget, ShotTab):
+            if not self._maybe_close_shot_tab(widget):
+                return              # Cancel - keep the tab open
             for sid, t in list(self.shot_tabs.items()):
                 if t is widget:
                     del self.shot_tabs[sid]
             self.tabs.removeTab(index)
             widget.deleteLater()
-        else:                       # fixed tab: detach but keep the widget for reopening
-            self.tabs.removeTab(index)
+            return
+        if widget is self.comfy_tab:  # fixed tab: detach but keep the widget for reopening
+            self.comfy_tab.stop_monitoring()
+        self.tabs.removeTab(index)
 
     def _refresh_shot(self, shot_id: str) -> None:
         """Refresh both the list card and the open detail tab (if any) for a shot."""

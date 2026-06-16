@@ -14,7 +14,7 @@ from typing import Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QToolButton, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QToolButton, QVBoxLayout, QWidget,
 )
 
 import library
@@ -70,7 +70,9 @@ def framed_thumb(shot, which: str, long: int = 88) -> QPixmap:
 
 class ShotCard(QFrame):
     generate_requested = Signal(str)
-    open_requested = Signal(str)            # open the shot in its own tab
+    open_requested = Signal(str)            # open the shot in its own tab (= Edit)
+    duplicate_requested = Signal(str)       # copy the shot into a new one
+    delete_requested = Signal(str)          # remove the shot (+ its takes)
     export_takes_requested = Signal(list)   # take ids (row obeys its view filter)
     changed = Signal()
 
@@ -89,6 +91,21 @@ class ShotCard(QFrame):
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt override
         self.open_requested.emit(self.shot.id)
         super().mouseDoubleClickEvent(event)
+
+    # Right-click the row for the common per-shot actions. Built in a helper (not inline)
+    # so the menu + its action wiring can be exercised headlessly without exec().
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._build_context_menu().exec(event.globalPos())
+
+    def _build_context_menu(self) -> QMenu:
+        sid = self.shot.id
+        menu = QMenu(self)
+        menu.addAction("Edit").triggered.connect(lambda: self.open_requested.emit(sid))
+        menu.addAction("Generate").triggered.connect(lambda: self.generate_requested.emit(sid))
+        menu.addAction("Duplicate").triggered.connect(lambda: self.duplicate_requested.emit(sid))
+        menu.addSeparator()
+        menu.addAction("Delete").triggered.connect(lambda: self.delete_requested.emit(sid))
+        return menu
 
     def _build(self) -> None:
         shot = self.shot

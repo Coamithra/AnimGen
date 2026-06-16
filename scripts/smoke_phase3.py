@@ -113,6 +113,20 @@ def test_placement_canvas() -> None:
     far = pc.get_placement()
     assert far["cx"] > near["cx"] and far["cy"] > near["cy"], (near, far)
 
+    # Off-frame clamp: a sprite can be pushed all the way out until its bounding box
+    # just touches a frame bound, but no further. (Position edits never change scale,
+    # so the sprite size captured here stays valid across the clamp below.)
+    s = pc.sprite_item.scale()
+    sw = pc._native.width() * s
+    sh = pc._native.height() * s
+    pc.x_box.setValue(99999); pc.y_box.setValue(99999)        # shove far past bottom-right
+    pos = pc.sprite_item.pos()
+    assert abs(pos.x() - pc._w) < 1 and abs(pos.y() - pc._h) < 1, (pos, pc._w, pc._h)
+    pc.x_box.setValue(-99999); pc.y_box.setValue(-99999)      # shove far past top-left
+    pos = pc.sprite_item.pos()
+    assert abs(pos.x() - (-sw)) < 1 and abs(pos.y() - (-sh)) < 1, (pos, sw, sh)
+    pc.set_placement({"scale": 0.5, "cx": 0.4, "cy": 0.6})    # recenter for later checks
+
     assert edits, "numeric edits must emit changed (marks the shot dirty)"
     # Programmatic refresh must not feed back into another edit (no runaway loop).
     pre = len(edits)
