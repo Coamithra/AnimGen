@@ -597,8 +597,9 @@ class MainWindow(QMainWindow):
             | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Save)
         if choice == QMessageBox.StandardButton.Cancel:
             return False
-        if choice == QMessageBox.StandardButton.Save and tab.commit():
-            self.reload()
+        if choice == QMessageBox.StandardButton.Save:
+            tab.commit()            # flush the edit into the project buffer (no disk write)
+            self.reload()           # the new/updated shot's card now reflects it
         return True
 
     def _on_tab_close(self, index: int) -> None:
