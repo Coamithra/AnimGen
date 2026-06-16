@@ -35,7 +35,7 @@ from ui.assets_view import AssetsView
 from ui.shot_card import ShotCard
 from ui.comfy_monitor_window import ComfyMonitorWindow
 from ui.shot_tab import ShotTab
-from ui.cost_confirm import confirm_launch
+from ui.cost_confirm import confirm_launch, total_price_text
 from ui.model_library_window import ModelLibraryWindow
 
 # settings keys passed to the hosted client explicitly (everything else -> extra/--set)
@@ -87,6 +87,16 @@ class MainWindow(QMainWindow):
         self.cancel_act.triggered.connect(self.cancel_pending)
         self.cancel_act.setEnabled(False)
         tb.addAction(self.cancel_act)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        self.total_price = QLabel()
+        self.total_price.setToolTip(
+            "Estimated cost to generate every shot in this project once "
+            "(summed over the per-shot estimates; local renders are free).")
+        self.total_price.setStyleSheet("font-weight: 600; padding-right: 6px;")
+        tb.addWidget(self.total_price)
         return tb
 
     def _build_menu(self) -> None:
@@ -312,7 +322,18 @@ class MainWindow(QMainWindow):
 
         self.cards_layout.addWidget(self._make_add_shot_card())
         self.statusBar().showMessage(f"{shown} shots shown · {len(shots)} total")
+        self._refresh_total_price(shots)
         self._update_title()
+
+    def _refresh_total_price(self, shots) -> None:
+        """Show the full-set generation cost: per-shot estimates over EVERY shot (the
+        card asks for the whole set, so this ignores the model/starred view filters)."""
+        costs = []
+        for shot in shots:
+            model = library.get_model(shot.model_id)
+            settings = {**((model or {}).get("default_params") or {}), **shot.settings}
+            costs.append(library.estimate_cost(shot.model_id, settings))
+        self.total_price.setText(total_price_text(costs))
 
     def _make_add_shot_card(self) -> QPushButton:
         """Placeholder '+ New Shot' card at the end of the list (also the empty state)."""

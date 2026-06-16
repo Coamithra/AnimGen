@@ -171,6 +171,17 @@ def test_comfy_stop_helpers() -> None:
     print("comfy stop helpers OK: pid-by-port probe + stop_work error path")
 
 
+def test_total_price() -> None:
+    from ui.cost_confirm import total_price_text
+
+    # Hosted estimates sum; local $0 adds nothing; None tallies as unknown.
+    assert total_price_text([0.72, 0.0, 1.28]) == "Full set: $2.00"
+    assert total_price_text([0.72, None, 0.0]) == "Full set: $0.72  (+1 unknown)"
+    assert total_price_text([]) == "Full set: $0.00"
+    assert total_price_text([None, None]) == "Full set: $0.00  (+2 unknown)"
+    print("cost_confirm total_price_text OK: sum, free, unknown tally, empty")
+
+
 def test_cost_summary() -> None:
     from ui.cost_confirm import build_summary
 
@@ -286,6 +297,7 @@ if __name__ == "__main__":
     test_dynamic_vram_gate()
     test_comfy_launch_helpers()
     test_comfy_stop_helpers()
+    test_total_price()
     test_cost_summary()
     test_cancel_pending()
     test_job_manager()
