@@ -125,7 +125,19 @@ def test_shot_tab() -> None:
     ed2 = ShotTab(project, shot=project.get_shot(shot.id))
     assert ed2.name.text() == "kick_heavy" and ed2._assets["start"] == asset
     assert ed2.selected_aspect() == "16:9"
-    print("ShotTab OK: per-model aspect dropdown + validation, asset pick, save/load")
+
+    # Copy Start -> End: disabled with no start, mirrors asset + placement once set
+    ed3 = ShotTab(project)
+    assert not ed3.copy_se_btn.isEnabled(), "copy disabled until a start frame exists"
+    ed3._set_asset("start", asset)
+    assert ed3.copy_se_btn.isEnabled()
+    ed3._frames["start"] = {"scale": 0.42, "cx": 0.3, "cy": 0.7}
+    ed3._select("end")   # end active: the live-capture path won't clobber the start frame
+    ed3._copy_start_to_end()
+    assert ed3._assets["end"] == asset, "end frame should mirror start asset"
+    assert ed3._frames["end"] == {"scale": 0.42, "cx": 0.3, "cy": 0.7}
+    assert ed3._frames["end"] is not ed3._frames["start"], "must copy, not alias"
+    print("ShotTab OK: per-model aspect dropdown + validation, asset pick, save/load, copy start->end")
 
 
 def test_render_keyposes() -> None:

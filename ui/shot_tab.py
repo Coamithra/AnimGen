@@ -175,7 +175,15 @@ class ShotTab(QWidget):
         row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(self._kf_card("start", "Start keyframe", self.start_btn, clr_start), 1)
         row.addWidget(self._kf_card("end", "End keyframe (optional)", self.end_btn, clr_end), 1)
-        host = QWidget(); host.setLayout(row)
+        self.copy_se_btn = QPushButton("Copy Start → End")
+        self.copy_se_btn.setToolTip("Use the start keyframe (image + framing) as the end keyframe")
+        self.copy_se_btn.clicked.connect(self._copy_start_to_end)
+        crow = QHBoxLayout(); crow.setContentsMargins(0, 0, 0, 0)
+        crow.addStretch(1); crow.addWidget(self.copy_se_btn)
+        box = QVBoxLayout(); box.setContentsMargins(0, 0, 0, 0); box.setSpacing(4)
+        box.addLayout(row); box.addLayout(crow)
+        host = QWidget(); host.setLayout(box)
+        self._refresh_copy_btn()
         return host
 
     def _kf_card(self, which: str, caption: str, btn: QPushButton, clr: QPushButton) -> QWidget:
@@ -281,11 +289,28 @@ class ShotTab(QWidget):
         if self._active == which:
             self.canvas.set_sprite(None)
 
+    def _copy_start_to_end(self) -> None:
+        """Mirror the start keyframe (image + placement) onto the end slot."""
+        if not self._assets["start"]:
+            return
+        if self._active in ("start", "end"):
+            self._frames[self._active] = self.canvas.get_placement()  # capture live edits
+        self._set_asset("end", self._assets["start"])
+        self._frames["end"] = dict(self._frames["start"])
+        if self._active == "end":
+            self.canvas.set_sprite(self._keyed_pixmap(self._assets["end"]))
+            self.canvas.set_placement(self._frames["end"])
+        self._update_kf_thumb("end")
+
+    def _refresh_copy_btn(self) -> None:
+        self.copy_se_btn.setEnabled(bool(self._assets["start"]))
+
     def _set_asset(self, which: str, path: Optional[str]) -> None:
         self._assets[which] = path or None
         name_lbl = self.start_name if which == "start" else self.end_name
         name_lbl.setText(Path(path).name if (path and Path(path).exists()) else "— none —")
         self._update_kf_thumb(which)
+        self._refresh_copy_btn()
 
     def _refresh_kf_styles(self) -> None:
         for which, btn in (("start", self.start_btn), ("end", self.end_btn)):
