@@ -58,6 +58,13 @@ def test_framing() -> None:
     assert framing.display_size("9:16", resolution="1080p") == (1080, 1920)
     assert framing.display_size("1:1", local=True) == framing.canvas_size("1:1", local=True)
     assert framing.display_size("16:9", resolution=None) == framing.canvas_size("16:9")
+    # keyed_sprite.max_side downsamples the source before keying (cheap row thumbnails)
+    big = tmp / "big.png"
+    bim = Image.new("RGB", (600, 600), (255, 0, 255))
+    ImageDraw.Draw(bim).rectangle([240, 120, 360, 480], fill=(0, 0, 0))
+    bim.save(big)
+    full, capped = framing.keyed_sprite(big), framing.keyed_sprite(big, max_side=128)
+    assert max(capped.size) <= 128 < max(full.size), (full.size, capped.size)
     print("framing OK: normalize_keypose + canvas_size (hosted long-side / local /16 budget)")
 
 

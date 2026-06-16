@@ -156,10 +156,16 @@ def display_size(aspect: str, *, resolution: Optional[str] = None,
     return short, max(2, round(short * hr / wr))   # portrait: width is the short side
 
 
-def keyed_sprite(src: str | Path, *, bg_thresh: int = 60, min_blob: int = 50) -> Image.Image:
+def keyed_sprite(src: str | Path, *, bg_thresh: int = 60, min_blob: int = 50,
+                 max_side: Optional[int] = None) -> Image.Image:
     """Key the foreground off the corner background; return it as an RGBA image cropped to
-    the sprite's bounding box (alpha = the kept mask). No foreground found -> whole image."""
+    the sprite's bounding box (alpha = the kept mask). No foreground found -> whole image.
+
+    max_side downsamples the source's longest side before keying (cheap previews/thumbnails
+    avoid keying at full contract resolution); None keys at native resolution."""
     im = Image.open(src).convert("RGB")
+    if max_side and max(im.size) > max_side:
+        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     arr = np.array(im)
     bg = arr[0, 0].astype(int)
     keep = _foreground(arr, bg, bg_thresh, min_blob)

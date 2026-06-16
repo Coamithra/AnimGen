@@ -7,6 +7,7 @@ the leader can keep counts fresh.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -22,9 +23,13 @@ from store.project import Project
 from ui.placement_widget import pil_to_pixmap
 from ui.takes_view import TakesView
 
-# Keyed sprites are placement-independent, so cache them by asset path: the Shots
-# list keys each asset at most once and reloads / shots sharing an asset are instant.
+# Keyed sprites are placement-independent, so cache them (keyed by path + stat so a
+# reused filename with new content misses): the Shots list keys each asset at most once
+# and reloads / shots sharing an asset are instant.
 _KEYED_CACHE: dict = {}
+_THUMB_KEY_MAX = 384   # cap the keyed-sprite source resolution - thumbnails don't need the
+                       # full 1254 contract canvas, and keying full-res for every row stalls
+                       # the first Shots-list paint (a 30+ shot project = 60+ keyings).
 
 
 def _thumb_canvas(shot, long: int = 88) -> tuple[int, int]:
@@ -51,10 +56,12 @@ def framed_thumb(shot, which: str, long: int = 88) -> QPixmap:
     if not (asset and Path(asset).exists()):
         return _placeholder(canvas)
     try:
-        sprite = _KEYED_CACHE.get(asset)
+        st = os.stat(asset)
+        cache_key = (asset, st.st_mtime_ns, st.st_size)
+        sprite = _KEYED_CACHE.get(cache_key)
         if sprite is None:
-            sprite = framing.keyed_sprite(asset)
-            _KEYED_CACHE[asset] = sprite
+            sprite = framing.keyed_sprite(asset, max_side=_THUMB_KEY_MAX)
+            _KEYED_CACHE[cache_key] = sprite
         placement = (shot.crop or {}).get(which) or {}
         return pil_to_pixmap(framing.render_placement(asset, placement, canvas, sprite=sprite))
     except Exception:  # noqa: BLE001 - unreadable image -> placeholder
