@@ -2,8 +2,8 @@
 
 Choose start/end keyframes from the project's assets (left-click a slot to frame it,
 double-click to pick), set the canvas aspect ratio (offered per the model), drag/scale
-each keyframe within the aspect canvas, write prompt + settings, and see/generate this
-shot's takes - all inline.
+each keyframe within the aspect canvas, write the prompt, tune the output/model
+settings, and see/generate this shot's takes - all inline.
 
 Placement is stored per keyframe under shot.crop = {aspect, start:{...}, end:{...}};
 the 1254-class (hosted) or pixel-budget (local) canvas is computed from the aspect, and
@@ -33,7 +33,7 @@ from ui.takes_view import TakesView
 _PARAM_ORDER = ["duration", "resolution", "seed", "camera_fixed", "mode", "length"]
 _DEFAULT_PLACEMENT = {"scale": 0.65, "cx": 0.5, "cy": 0.6}
 _WAN_FPS = 16                                          # local Wan renders at a fixed 16 fps
-_OUTPUT_PARAMS = {"resolution", "duration", "length"}  # live on the Output tab, not Model settings
+_OUTPUT_PARAMS = {"resolution", "duration", "length"}  # go in the output_form, not the Model settings group
 
 
 class _KeyframeButton(QPushButton):
@@ -158,13 +158,17 @@ class ShotTab(QWidget):
         self.fetch_btn.clicked.connect(self._fetch_schema)
         self.schema_status = QLabel("")
 
-        # Output tab: resolution + duration (both model-aware) + read-only fps.
+        # Output tab: resolution + duration (model-aware) + the Model settings group +
+        # read-only fps and est. price.
         self.output_form = QFormLayout()
         self.fps_value = QLabel("—"); self.fps_value.setStyleSheet("color: gray;")
         self.price_value = QLabel("—"); self.price_value.setStyleSheet("font-weight: bold;")
         output_tab = QWidget()
         ov = QVBoxLayout(output_tab)
         ov.addLayout(self.output_form)
+        ov.addWidget(self.params_box)
+        frow = QHBoxLayout(); frow.addWidget(self.fetch_btn); frow.addWidget(self.schema_status); frow.addStretch(1)
+        ov.addLayout(frow)
         fps_line = QHBoxLayout()
         fps_line.addWidget(QLabel("Output FPS")); fps_line.addWidget(self.fps_value, 1)
         ov.addLayout(fps_line)
@@ -175,12 +179,10 @@ class ShotTab(QWidget):
         tabs = QTabWidget()
         tabs.addTab(self.canvas, "Framing")
         tabs.addTab(output_tab, "Output")
-        settings_tab = QWidget()
-        sv = QVBoxLayout(settings_tab)
-        sv.addWidget(prompt_box); sv.addWidget(self.params_box)
-        frow = QHBoxLayout(); frow.addWidget(self.fetch_btn); frow.addWidget(self.schema_status); frow.addStretch(1)
-        sv.addLayout(frow)
-        tabs.addTab(settings_tab, "Prompt & settings")
+        prompt_tab = QWidget()
+        sv = QVBoxLayout(prompt_tab)
+        sv.addWidget(prompt_box)
+        tabs.addTab(prompt_tab, "Prompt")
 
         self._takes_host = QWidget()
         self._takes_layout = QVBoxLayout(self._takes_host)
@@ -225,7 +227,15 @@ class ShotTab(QWidget):
         row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(self._kf_card("start", "Start keyframe", self.start_btn, clr_start), 1)
         row.addWidget(self._kf_card("end", "End keyframe (optional)", self.end_btn, clr_end), 1)
-        host = QWidget(); host.setLayout(row)
+        self.copy_se_btn = QPushButton("Copy Start → End")
+        self.copy_se_btn.setToolTip("Use the start keyframe (image + framing) as the end keyframe")
+        self.copy_se_btn.clicked.connect(self._copy_start_to_end)
+        crow = QHBoxLayout(); crow.setContentsMargins(0, 0, 0, 0)
+        crow.addStretch(1); crow.addWidget(self.copy_se_btn)
+        box = QVBoxLayout(); box.setContentsMargins(0, 0, 0, 0); box.setSpacing(4)
+        box.addLayout(row); box.addLayout(crow)
+        host = QWidget(); host.setLayout(box)
+        self._refresh_copy_btn()
         return host
 
     def _kf_card(self, which: str, caption: str, btn: QPushButton, clr: QPushButton) -> QWidget:
@@ -335,11 +345,29 @@ class ShotTab(QWidget):
         if had_asset:                  # clearing an already-empty slot isn't an edit
             self._mark_dirty()
 
+    def _copy_start_to_end(self) -> None:
+        """Mirror the start keyframe (image + placement) onto the end slot."""
+        if not self._assets["start"]:
+            return
+        if self._active == "start":
+            self._frames["start"] = self.canvas.get_placement()  # flush live start edits
+        self._set_asset("end", self._assets["start"])
+        self._frames["end"] = dict(self._frames["start"])
+        if self._active == "end":
+            self.canvas.set_sprite(self._keyed_pixmap(self._assets["end"]))
+            self.canvas.set_placement(self._frames["end"])
+        self._update_kf_thumb("end")
+        self._mark_dirty()
+
+    def _refresh_copy_btn(self) -> None:
+        self.copy_se_btn.setEnabled(bool(self._assets["start"]))
+
     def _set_asset(self, which: str, path: Optional[str]) -> None:
         self._assets[which] = path or None
         name_lbl = self.start_name if which == "start" else self.end_name
         name_lbl.setText(Path(path).name if (path and Path(path).exists()) else "— none —")
         self._update_kf_thumb(which)
+        self._refresh_copy_btn()
 
     def _refresh_kf_styles(self) -> None:
         for which, btn in (("start", self.start_btn), ("end", self.end_btn)):

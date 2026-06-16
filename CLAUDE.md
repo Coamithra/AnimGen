@@ -67,7 +67,7 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 | `ui/comfy_monitor_window.py` | the **ComfyUI Status** tab: status/version, RAM+VRAM, queue, launch settings, installed models + **Launch ComfyUI**/Stop working/Shut down controls; `start_monitoring`/`stop_monitoring` poll only while the tab is visible (off-thread `_MonitorPoller` + `_AsyncCall` for stop/shutdown, same closed-port-timeout reason) |
 | `ui/shot_card.py` `ui/takes_view.py` | shot row (double-click opens its shot tab; Generate / Export) + inline takes folder grid |
 | `ui/shot_tab.py` | the **shot tab**: full editor + the shot's takes grid + Save/Generate/Export. Tab title shows a trailing `*` while the editor has uncommitted edits (`is_dirty`/`dirty_changed`; cleared on `commit()`, suppressed during load). Per-model **Aspect** dropdown (turns red + blocks Generate if invalid for the model); per-keyframe placement: left-click a keyframe to frame it, double-click to pick |
-| `ui/placement_widget.py` | the framing canvas: drag a keyed sprite to position + a Size slider to scale it on the magenta aspect canvas; placement stored normalized `{scale,cx,cy}` |
+| `ui/placement_widget.py` | the framing canvas: drag a keyed sprite to position + corner-handle scale on the magenta aspect canvas, plus an **editable readout panel** (X/Y px, W/H px, W%/H% spin boxes) for precise numeric entry — all linked views of the placement; placement stored normalized `{scale,cx,cy}` |
 | `ui/asset_picker.py` | the visual keyframe picker dialog (thumbnail grid + Import) |
 | `ui/assets_view.py` | the **Assets** tab: drag-drop / Import keyframe images into `.assets/`; thumbnail grid + delete |
 | `ui/cost_confirm.py` | the launch gate |

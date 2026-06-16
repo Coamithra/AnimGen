@@ -58,6 +58,13 @@ def test_framing() -> None:
     assert framing.display_size("9:16", resolution="1080p") == (1080, 1920)
     assert framing.display_size("1:1", local=True) == framing.canvas_size("1:1", local=True)
     assert framing.display_size("16:9", resolution=None) == framing.canvas_size("16:9")
+    # keyed_sprite.max_side downsamples the source before keying (cheap row thumbnails)
+    big = tmp / "big.png"
+    bim = Image.new("RGB", (600, 600), (255, 0, 255))
+    ImageDraw.Draw(bim).rectangle([240, 120, 360, 480], fill=(0, 0, 0))
+    bim.save(big)
+    full, capped = framing.keyed_sprite(big), framing.keyed_sprite(big, max_side=128)
+    assert max(capped.size) <= 128 < max(full.size), (full.size, capped.size)
     print("framing OK: normalize_keypose + canvas_size (hosted long-side / local /16 budget)")
 
 
@@ -78,6 +85,39 @@ def test_placement_canvas() -> None:
     assert abs(got["scale"] - 0.5) < 0.03 and abs(got["cx"] - 0.4) < 0.03 \
         and abs(got["cy"] - 0.6) < 0.03, got
     print("PlacementCanvas OK: aspect + keyed sprite + placement round-trip")
+
+    # --- editable numeric readout (precise-control entry) ----------------
+    edits = []
+    pc.changed.connect(lambda: edits.append(1))
+
+    # Editing a percentage drives the uniform sprite scale; center stays put.
+    # (get_placement returns the canvas-normalized scale, not the native %.)
+    before = pc.get_placement()
+    pc.w_pct_box.setValue(80)
+    after = pc.get_placement()
+    assert abs(pc.w_pct_box.value() - 80) < 1, pc.w_pct_box.value()       # round-trips
+    assert abs(pc.h_pct_box.value() - 80) < 1, pc.h_pct_box.value()       # H% linked to W%
+    assert abs(after["scale"] - before["scale"]) > 0.05, (before, after)  # scale actually changed
+    assert abs(after["cx"] - before["cx"]) < 0.01 \
+        and abs(after["cy"] - before["cy"]) < 0.01, (before, after)       # anchored about center
+    # W px box and W% box agree (W px == that % of the keyed-sprite native width).
+    nw = pc._native.width()
+    assert abs(pc.w_box.value() / nw * 100 - pc.w_pct_box.value()) < 1, \
+        (pc.w_box.value(), nw, pc.w_pct_box.value())
+
+    # Editing X/Y position moves the sprite (larger px -> center further right/down).
+    pc.x_box.setValue(100); pc.y_box.setValue(100)
+    near = pc.get_placement()
+    pc.x_box.setValue(300); pc.y_box.setValue(300)
+    far = pc.get_placement()
+    assert far["cx"] > near["cx"] and far["cy"] > near["cy"], (near, far)
+
+    assert edits, "numeric edits must emit changed (marks the shot dirty)"
+    # Programmatic refresh must not feed back into another edit (no runaway loop).
+    pre = len(edits)
+    pc.set_placement({"scale": 0.5, "cx": 0.4, "cy": 0.6})
+    assert len(edits) == pre, "set_placement readback should not emit changed"
+    print("PlacementCanvas OK: editable position/size/percentage fields drive placement")
 
 
 def test_shot_tab() -> None:
@@ -136,7 +176,23 @@ def test_shot_tab() -> None:
     assert not ed2.is_dirty() and ed2.title() == "kick_heavy", "reopened shot starts clean"
     ed2.prompt.setPlainText("fiercer kick")
     assert ed2.is_dirty() and ed2.title() == "kick_heavy*", "editing reopened shot marks dirty"
-    print("ShotTab OK: per-model aspect dropdown + validation, asset pick, save/load, dirty *")
+
+    # Copy Start -> End: disabled with no start; copies the LIVE start framing (driven
+    # through the canvas, start active) + the asset onto the end slot, without aliasing.
+    ed3 = ShotTab(project)
+    assert not ed3.copy_se_btn.isEnabled(), "copy disabled until a start frame exists"
+    ed3._set_asset("start", asset); ed3._select("start")   # start active, like the UI
+    assert ed3.copy_se_btn.isEnabled()
+    ed3.canvas.set_placement({"scale": 0.42, "cx": 0.3, "cy": 0.7})  # frame on the canvas
+    ed3._copy_start_to_end()
+    assert ed3._assets["end"] == asset, "end frame should mirror start asset"
+    assert ed3._frames["end"] == ed3._frames["start"], "end must equal the captured start frame"
+    assert ed3._frames["end"] is not ed3._frames["start"], "must copy, not alias"
+    assert ed3.is_dirty(), "copying start->end is an edit (marks the tab dirty)"
+    got = ed3._frames["end"]                                # captured live off the canvas
+    assert abs(got["scale"] - 0.42) < 0.05 and abs(got["cx"] - 0.3) < 0.05 \
+        and abs(got["cy"] - 0.7) < 0.05, got
+    print("ShotTab OK: aspect dropdown, asset pick, save/load, dirty *, copy start->end")
 
 
 def test_render_keyposes() -> None:
