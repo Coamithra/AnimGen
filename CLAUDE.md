@@ -63,10 +63,10 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 | `pipeline/extract.py` | frame extraction + thumbnails (PyAV) |
 | `pipeline/export.py` | `export_takes` → `<name>_<timestamp>/` frames + `settings.txt` |
 | `pipeline/takes_io.py` | bin / restore (only files under the project's `.assets/`; external refs left in place) |
-| `ui/main_window.py` | shot cards + global filters + Generate/Export + **Cancel pending** (in the Shots-tab control strip); **File** menu project lifecycle (**New/Open/Save/Save As** + **New Shot**) with dirty-marker title + save-prompt; **closable** tabbed central widget (Shots / Assets / Model Library / ComfyUI Status; reopen from **View**). Double-click a shot row (or **+ New Shot**) opens a shot tab; shot tabs tracked in `shot_tabs` |
+| `ui/main_window.py` | shot cards + global filters + Generate/Export + **Cancel pending** (in the Shots-tab control strip); **File** menu project lifecycle (**New/Open/Save/Save As** + **New Shot**) with dirty-marker title (`*` when the project is untitled, has buffered edits, or any open shot tab has uncommitted edits — `_has_unsaved_changes`) + save-prompt; **closable** tabbed central widget (Shots / Assets / Model Library / ComfyUI Status; reopen from **View**). Double-click a shot row (or **+ New Shot**) opens a shot tab; shot tabs tracked in `shot_tabs` |
 | `ui/comfy_monitor_window.py` | the **ComfyUI Status** tab: status/version, RAM+VRAM, queue, launch settings, installed models + **Launch ComfyUI**/Stop working/Shut down controls; `start_monitoring`/`stop_monitoring` poll only while the tab is visible (off-thread `_MonitorPoller` + `_AsyncCall` for stop/shutdown, same closed-port-timeout reason) |
 | `ui/shot_card.py` `ui/takes_view.py` | shot row (double-click opens its shot tab; Generate / Export) + inline takes folder grid |
-| `ui/shot_tab.py` | the **shot tab**: full editor + the shot's takes grid + Save/Generate/Export. Per-model **Aspect** dropdown (turns red + blocks Generate if invalid for the model); per-keyframe placement: left-click a keyframe to frame it, double-click to pick |
+| `ui/shot_tab.py` | the **shot tab**: full editor + the shot's takes grid + Save/Generate/Export. Tab title shows a trailing `*` while the editor has uncommitted edits (`is_dirty`/`dirty_changed`; cleared on `commit()`, suppressed during load). Per-model **Aspect** dropdown (turns red + blocks Generate if invalid for the model); per-keyframe placement: left-click a keyframe to frame it, double-click to pick |
 | `ui/placement_widget.py` | the framing canvas: drag a keyed sprite to position + corner-handle scale on the magenta aspect canvas, plus an **editable readout panel** (X/Y px, W/H px, W%/H% spin boxes) for precise numeric entry — all linked views of the placement; placement stored normalized `{scale,cx,cy}` |
 | `ui/asset_picker.py` | the visual keyframe picker dialog (thumbnail grid + Import) |
 | `ui/assets_view.py` | the **Assets** tab: drag-drop / Import keyframe images into `.assets/`; thumbnail grid + delete |
@@ -94,7 +94,9 @@ Setup if `.venv` is missing: `python -m venv .venv` then
   buffer in memory and set `dirty` (title shows `*`, prompt before discarding); a
   **completed Take auto-persists immediately** to `takes.json`. The split (shots in the
   `.animproj`, takes in `takes.json`) is what lets a finished render persist without
-  flushing buffered shot edits.
+  flushing buffered shot edits. Note shot-tab editor edits set the tab's own dirty flag
+  *before* they're committed to the buffer, so an open-but-unsaved shot tab shows `*` on
+  its tab and contributes to the project title `*` even while `project.dirty` is still False.
 - **Paths:** managed media + assets serialize **relative to `assets_dir`**; external
   references (seeded `../Fighter/out/*.gif`/`.mp4` takes) stay **absolute**. Untitled
   projects keep assets in `data/_scratch/<id>/` until the first **Save As**, which

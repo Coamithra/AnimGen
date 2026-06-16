@@ -98,7 +98,29 @@ def test_window_builds() -> None:
     for card in win.cards.values():
         ids.extend(card._row_export_ids())
     assert len(ids) == 1
-    print("MainWindow OK: builds with export wiring, row ids gathered")
+
+    # Unsaved-edit asterisks: a saved (clean) project shows no marker; editing an open
+    # shot tab puts a '*' on that tab's text AND on the window title.
+    p2 = Project.new()
+    s2 = p2.add_shot("kick", model_id="seedance-2.0-std")
+    p2.save_as(Path(tempfile.mkdtemp()) / "p2.animproj")   # titled + clean
+    w2 = MainWindow(p2)
+    assert not w2._has_unsaved_changes() and "*" not in w2.windowTitle()
+    w2.open_shot(s2.id)
+    tab = w2.shot_tabs[s2.id]
+    idx = w2.tabs.indexOf(tab)
+    assert w2.tabs.tabText(idx) == "kick", "a clean shot tab has no asterisk"
+    tab.prompt.setPlainText("edited")
+    assert tab.is_dirty() and w2.tabs.tabText(idx) == "kick*", "editing flags the tab text"
+    assert w2._has_unsaved_changes() and "*" in w2.windowTitle(), "title reflects the dirty tab"
+    # The discard/close guard must see the uncommitted tab edit, and Save must flush it
+    # (otherwise the title advertises unsaved work the discard path would silently drop).
+    assert w2._has_unsaved_edits(), "an uncommitted tab edit arms the save-prompt"
+    assert w2.save_project(), "Save (titled project -> no dialog) succeeds"
+    assert w2.project.get_shot(s2.id).prompt == "edited", "Save flushed the open tab"
+    assert not tab.is_dirty() and w2.tabs.tabText(idx) == "kick", "saving clears the marker"
+    assert not w2._has_unsaved_edits() and "*" not in w2.windowTitle()
+    print("MainWindow OK: builds with export wiring, row ids gathered, dirty * propagates")
 
 
 if __name__ == "__main__":

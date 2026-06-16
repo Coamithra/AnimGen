@@ -133,6 +133,15 @@ def test_shot_tab() -> None:
     asset = str(project.import_asset(src))
 
     ed = ShotTab(project)
+    assert not ed.is_dirty() and ed.title() == "New shot", "a fresh tab starts clean"
+    dirty_signals = []
+    ed.dirty_changed.connect(lambda: dirty_signals.append(ed.is_dirty()))
+    ed.name.setText("kick_heavy")                 # an edit -> tab goes dirty (asterisk)
+    assert ed.is_dirty() and ed.title() == "New shot*", "editing marks the tab dirty (*)"
+    assert dirty_signals == [True], "dirty_changed fires once on the first edit"
+    ed.prompt.setPlainText("fierce kick")
+    assert dirty_signals == [True], "an already-dirty tab doesn't re-emit dirty_changed"
+
     ed.model_combo.setCurrentIndex(ed.model_combo.findData("seedance-2.0-std"))
     aspects = [ed.aspect_combo.itemText(i) for i in range(ed.aspect_combo.count())]
     assert aspects == ["1:1", "16:9", "9:16"], aspects
@@ -140,14 +149,13 @@ def test_shot_tab() -> None:
     assert "aspect_ratio" not in ed._params()    # owned by the Aspect dropdown now
     assert ed._params()["resolution"] == "720p" and ed._params()["seed"] == 7
 
-    ed.name.setText("kick_heavy")
-    ed.prompt.setPlainText("fierce kick")
     ed._set_asset("start", asset); ed._select("start")
     ed.aspect_combo.setCurrentText("16:9")
     saved = []
     ed.saved.connect(saved.append)
     sid = ed._save()
     assert sid and saved == [sid], "save should emit saved(shot_id)"
+    assert not ed.is_dirty() and ed.title() == "kick_heavy", "saving clears the dirty marker"
 
     shot = project.list_shots()[0]
     assert shot.name == "kick_heavy" and shot.start_frame == asset
@@ -165,6 +173,9 @@ def test_shot_tab() -> None:
     ed2 = ShotTab(project, shot=project.get_shot(shot.id))
     assert ed2.name.text() == "kick_heavy" and ed2._assets["start"] == asset
     assert ed2.selected_aspect() == "16:9"
+    assert not ed2.is_dirty() and ed2.title() == "kick_heavy", "reopened shot starts clean"
+    ed2.prompt.setPlainText("fiercer kick")
+    assert ed2.is_dirty() and ed2.title() == "kick_heavy*", "editing reopened shot marks dirty"
 
     # Copy Start -> End: disabled with no start; copies the LIVE start framing (driven
     # through the canvas, start active) + the asset onto the end slot, without aliasing.
@@ -177,10 +188,11 @@ def test_shot_tab() -> None:
     assert ed3._assets["end"] == asset, "end frame should mirror start asset"
     assert ed3._frames["end"] == ed3._frames["start"], "end must equal the captured start frame"
     assert ed3._frames["end"] is not ed3._frames["start"], "must copy, not alias"
+    assert ed3.is_dirty(), "copying start->end is an edit (marks the tab dirty)"
     got = ed3._frames["end"]                                # captured live off the canvas
     assert abs(got["scale"] - 0.42) < 0.05 and abs(got["cx"] - 0.3) < 0.05 \
         and abs(got["cy"] - 0.7) < 0.05, got
-    print("ShotTab OK: per-model aspect dropdown + validation, asset pick, save/load, copy start->end")
+    print("ShotTab OK: aspect dropdown, asset pick, save/load, dirty *, copy start->end")
 
 
 def test_render_keyposes() -> None:
