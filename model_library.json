@@ -5,7 +5,7 @@
   "models": [
     {
       "id": "seedance-2.0-std",
-      "aspect_ratios": ["1:1", "16:9", "9:16"],
+      "aspect_ratios": ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"],
       "display_name": "Seedance 2.0 (Std)",
       "backend": "replicate",
       "replicate_model_id": "bytedance/seedance-2.0",
@@ -13,15 +13,15 @@
       "supports_end_frame": true,
       "requires_data_uri": false,
       "cost_per_second_usd": {"480p": 0.08, "720p": 0.18, "1080p": 0.45},
-      "duration_range": [1, 12],
+      "duration_range": [1, 15],
       "resolution_options": ["480p", "720p", "1080p"],
       "default_params": {"duration": 4, "resolution": "720p", "seed": 7, "aspect_ratio": "1:1", "camera_fixed": true},
       "required_params": {"aspect_ratio": "1:1"},
-      "notes": "Hero/production tier. MUST set aspect_ratio=1:1 or it defaults 16:9 and stretches/clips. Camera is stochastic (seed lottery). Two-part prompts soak duration padding. A tier/resolution change is a choreography REROLL, not an upgrade. Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.08, 720p=0.18, 1080p=0.45. Replicate lists 1080p for this model even though resolution_options here is 480/720."
+      "notes": "Hero/production tier. Always pass an explicit aspect_ratio (the editor injects the chosen aspect); omitting it defaults to 16:9 and stretches/clips a tighter-framed keypose. Camera is stochastic (seed lottery). Two-part prompts soak duration padding. A tier/resolution change is a choreography REROLL, not an upgrade. Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.08, 720p=0.18, 1080p=0.45. Resolution 480p/720p/1080p and the full aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) match Replicate's live schema; 'adaptive' is omitted (no fixed canvas)."
     },
     {
       "id": "seedance-2.0-fast",
-      "aspect_ratios": ["1:1", "16:9", "9:16"],
+      "aspect_ratios": ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"],
       "display_name": "Seedance 2.0 (Fast)",
       "backend": "replicate",
       "replicate_model_id": "bytedance/seedance-2.0-fast",
@@ -29,7 +29,7 @@
       "supports_end_frame": true,
       "requires_data_uri": false,
       "cost_per_second_usd": {"480p": 0.07, "720p": 0.15},
-      "duration_range": [1, 12],
+      "duration_range": [1, 15],
       "resolution_options": ["480p", "720p"],
       "default_params": {"duration": 4, "resolution": "480p", "seed": 7, "aspect_ratio": "1:1"},
       "required_params": {"aspect_ratio": "1:1"},
@@ -37,18 +37,18 @@
     },
     {
       "id": "vidu-q3-pro",
-      "aspect_ratios": ["1:1", "16:9", "9:16"],
+      "aspect_ratios": ["16:9", "9:16", "3:4", "4:3", "1:1"],
       "display_name": "Vidu Q3 Pro",
       "backend": "replicate",
       "replicate_model_id": "vidu/q3-pro",
       "tier": "airborne",
       "supports_end_frame": true,
       "requires_data_uri": true,
-      "cost_per_second_usd": 0.15,
+      "cost_per_second_usd": {"540p": 0.07, "720p": 0.15, "1080p": 0.16},
       "duration_range": [1, 16],
-      "resolution_options": ["720p"],
-      "default_params": {"duration": 2, "seed": 7},
-      "notes": "Best lane: single short airborne/structural actions. Files API unsupported -> data-uri REQUIRED (images < ~250KB: flatten bg to magenta, then quantize). Short durations fix bg pulsing. Never pack multiple moves (its lever is duration)."
+      "resolution_options": ["540p", "720p", "1080p"],
+      "default_params": {"duration": 2, "resolution": "720p", "seed": 7},
+      "notes": "Best lane: single short airborne/structural actions. Files API unsupported -> data-uri REQUIRED (images < ~250KB: flatten bg to magenta, then quantize). Short durations fix bg pulsing. Never pack multiple moves (its lever is duration). Resolution 540p/720p/1080p and aspects (16:9/9:16/3:4/4:3/1:1) match Replicate's live schema. Cost: $/s by resolution (Replicate model page 2026-06): 540p=0.07, 720p=0.15, 1080p=0.16 (default 720p kept)."
     },
     {
       "id": "veo-3.1-fast",
@@ -76,7 +76,7 @@
       "supports_end_frame": true,
       "requires_data_uri": false,
       "cost_per_second_usd": {"720p": 0.10, "1080p": 0.15},
-      "duration_range": [2, 8],
+      "duration_range": [2, 15],
       "resolution_options": ["720p", "1080p"],
       "default_params": {"duration": 4, "resolution": "720p", "seed": 7},
       "notes": "Cheap filler / prototyping (quality ~animation-student). Resolution defaults 1080p - set 720p. Two-part prompts help padding. 'audio' is a URL string, not a boolean toggle. Cost: $/s by resolution (Replicate 2026-06): 720p=0.10, 1080p=0.15."
@@ -90,12 +90,12 @@
       "tier": "retired",
       "supports_end_frame": true,
       "requires_data_uri": false,
-      "cost_per_second_usd": {"standard": 0.168, "pro": 0.224},
+      "cost_per_second_usd": {"standard": 0.168, "pro": 0.224, "4k": 0.42},
       "cost_by": "mode",
       "duration_range": [3, 15],
-      "resolution_options": ["720p", "1080p"],
+      "mode_options": ["standard", "pro", "4k"],
       "default_params": {"duration": 5, "seed": 7, "mode": "standard"},
-      "notes": "Stable backgrounds but low-fps cadence and invents actions (retired by human verdict). mode default=pro; set 'standard' for cheaper. Kept available for one-off comparisons. Cost: $/s by MODE, without-audio (Replicate 2026-06): standard=0.168, pro=0.224 (a 4k variant=0.42 isn't exposed). Resolution doesn't change the price."
+      "notes": "Stable backgrounds but low-fps cadence and invents actions (retired by human verdict). mode default=pro; set 'standard' for cheaper. Kept available for one-off comparisons. mode standard/pro/4k matches Replicate's live schema; Kling exposes NO resolution param (mode is the only quality axis). Cost: $/s by MODE, without-audio (Replicate 2026-06): standard=0.168, pro=0.224, 4k=0.42."
     },
     {
       "id": "local-flf-wan14b",
