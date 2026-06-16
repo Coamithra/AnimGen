@@ -123,7 +123,68 @@ def test_window_builds() -> None:
     print("MainWindow OK: builds with export wiring, row ids gathered, dirty * propagates")
 
 
+def test_close_dirty_tab_guard() -> None:
+    """Closing a shot tab with uncommitted edits must prompt; Cancel keeps it, Discard
+    drops the edits, Save flushes them to the buffer. A clean tab closes with no prompt."""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from ui import main_window
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    s = project.add_shot("kick", model_id="seedance-2.0-std")
+    project.save_as(Path(tempfile.mkdtemp()) / "p.animproj")
+    win = MainWindow(project)
+
+    # Stub the modal so it never blocks; record that it was asked and return a chosen button.
+    asked = {"n": 0}
+    Btn = QMessageBox.StandardButton
+
+    def stub(choice):
+        def _q(*_a, **_k):
+            asked["n"] += 1
+            return choice
+        return _q
+
+    # Clean tab -> no prompt, closes straight away.
+    win.open_shot(s.id)
+    tab = win.shot_tabs[s.id]
+    idx = win.tabs.indexOf(tab)
+    main_window.QMessageBox.question = stub(Btn.Cancel)
+    win._on_tab_close(idx)
+    assert asked["n"] == 0, "a clean tab closes without a prompt"
+    assert s.id not in win.shot_tabs, "clean tab actually closed"
+
+    # Dirty tab + Cancel -> prompted, tab stays open, edit preserved.
+    win.open_shot(s.id)
+    tab = win.shot_tabs[s.id]
+    tab.prompt.setPlainText("edited-cancel")
+    idx = win.tabs.indexOf(tab)
+    main_window.QMessageBox.question = stub(Btn.Cancel)
+    win._on_tab_close(idx)
+    assert asked["n"] == 1 and s.id in win.shot_tabs, "Cancel keeps the dirty tab open"
+    assert tab.is_dirty(), "Cancel preserves the uncommitted edit"
+
+    # Dirty tab + Discard -> prompted, tab closes, edit dropped (buffer unchanged).
+    main_window.QMessageBox.question = stub(Btn.Discard)
+    win._on_tab_close(win.tabs.indexOf(tab))
+    assert asked["n"] == 2 and s.id not in win.shot_tabs, "Discard closes the tab"
+    assert project.get_shot(s.id).prompt == "", "Discard did not commit the edit"
+
+    # Dirty tab + Save -> prompted, tab closes, edit flushed into the project buffer.
+    win.open_shot(s.id)
+    tab = win.shot_tabs[s.id]
+    tab.prompt.setPlainText("edited-save")
+    main_window.QMessageBox.question = stub(Btn.Save)
+    win._on_tab_close(win.tabs.indexOf(tab))
+    assert asked["n"] == 3 and s.id not in win.shot_tabs, "Save closes the tab"
+    assert project.get_shot(s.id).prompt == "edited-save", "Save flushed the edit to the buffer"
+    print("MainWindow OK: close-dirty-tab guard (clean/Cancel/Discard/Save)")
+
+
 if __name__ == "__main__":
     test_export()
     test_window_builds()
+    test_close_dirty_tab_guard()
     print("PHASE 5 SMOKE: PASS")
