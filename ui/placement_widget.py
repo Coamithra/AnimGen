@@ -16,8 +16,9 @@ from PySide6.QtGui import (
     QBrush, QColor, QImage, QPainter, QPen, QPixmap, QPolygon,
 )
 from PySide6.QtWidgets import (
-    QGraphicsItem, QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene,
-    QGraphicsView, QGridLayout, QHBoxLayout, QLabel, QWidget,
+    QAbstractSpinBox, QDoubleSpinBox, QGraphicsItem, QGraphicsPixmapItem,
+    QGraphicsRectItem, QGraphicsScene, QGraphicsView, QGridLayout, QHBoxLayout,
+    QLabel, QWidget,
 )
 
 MAGENTA = QColor(255, 0, 255)
@@ -236,6 +237,7 @@ class PlacementCanvas(QWidget):
         self._w = self._h = 1254
         self._native: Optional[QPixmap] = None
         self.sprite_item: Optional[_SpriteItem] = None
+        self._refreshing = False   # guards readback from re-triggering edit handlers
         self._build()
 
     def _build(self) -> None:
@@ -260,7 +262,7 @@ class PlacementCanvas(QWidget):
 
     def _build_info_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setMaximumWidth(170)
+        panel.setMaximumWidth(190)
         g = QGridLayout(panel)
         g.setContentsMargins(10, 0, 0, 0)
         g.setVerticalSpacing(3)
@@ -271,42 +273,107 @@ class PlacementCanvas(QWidget):
             lbl.setStyleSheet("font-weight: bold;")
             return lbl
 
-        self.x_val = QLabel("–"); self.y_val = QLabel("–")
-        self.w_val = QLabel("–"); self.h_val = QLabel("–")
-        self.w_pct = QLabel(""); self.h_pct = QLabel("")
-        for lbl in (self.w_pct, self.h_pct):
-            lbl.setStyleSheet("color: gray;")
+        def spin(suffix: str, lo: float, hi: float) -> QDoubleSpinBox:
+            sb = QDoubleSpinBox()
+            sb.setDecimals(0)
+            sb.setRange(lo, hi)
+            sb.setSingleStep(1)
+            sb.setSuffix(suffix)
+            sb.setKeyboardTracking(False)   # emit valueChanged on commit, not per keystroke
+            sb.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+            sb.setAlignment(Qt.AlignmentFlag.AlignRight)
+            return sb
+
+        # Position is the sprite's top-left in canvas px; size is canvas px and a
+        # % of the asset's native resolution. W/H/% are linked views of the single
+        # uniform scale, so editing any one drives the others.
+        self.x_box = spin(" px", -99999, 99999)
+        self.y_box = spin(" px", -99999, 99999)
+        self.w_box = spin(" px", 0, 99999)
+        self.h_box = spin(" px", 0, 99999)
+        self.w_pct_box = spin(" %", 0, 9999)
+        self.h_pct_box = spin(" %", 0, 9999)
+        for box in (self.w_pct_box, self.h_pct_box):
+            box.setStyleSheet("color: gray;")
+
+        self.x_box.valueChanged.connect(self._on_pos_edit)
+        self.y_box.valueChanged.connect(self._on_pos_edit)
+        self.w_box.valueChanged.connect(lambda *_: self._on_size_edit("w_px"))
+        self.h_box.valueChanged.connect(lambda *_: self._on_size_edit("h_px"))
+        self.w_pct_box.valueChanged.connect(lambda *_: self._on_size_edit("w_pct"))
+        self.h_pct_box.valueChanged.connect(lambda *_: self._on_size_edit("h_pct"))
 
         r = 0
-        g.addWidget(header("Position"), r, 0, 1, 3); r += 1
-        g.addWidget(QLabel("X"), r, 0); g.addWidget(self.x_val, r, 1, 1, 2); r += 1
-        g.addWidget(QLabel("Y"), r, 0); g.addWidget(self.y_val, r, 1, 1, 2); r += 1
+        g.addWidget(header("Position"), r, 0, 1, 2); r += 1
+        g.addWidget(QLabel("X"), r, 0); g.addWidget(self.x_box, r, 1); r += 1
+        g.addWidget(QLabel("Y"), r, 0); g.addWidget(self.y_box, r, 1); r += 1
         g.addWidget(QLabel(""), r, 0); r += 1
-        g.addWidget(header("Size"), r, 0, 1, 3); r += 1
-        g.addWidget(QLabel("W"), r, 0); g.addWidget(self.w_val, r, 1); g.addWidget(self.w_pct, r, 2); r += 1
-        g.addWidget(QLabel("H"), r, 0); g.addWidget(self.h_val, r, 1); g.addWidget(self.h_pct, r, 2); r += 1
+        g.addWidget(header("Size"), r, 0, 1, 2); r += 1
+        g.addWidget(QLabel("W"), r, 0); g.addWidget(self.w_box, r, 1); r += 1
+        g.addWidget(QLabel("W %"), r, 0); g.addWidget(self.w_pct_box, r, 1); r += 1
+        g.addWidget(QLabel("H"), r, 0); g.addWidget(self.h_box, r, 1); r += 1
+        g.addWidget(QLabel("H %"), r, 0); g.addWidget(self.h_pct_box, r, 1); r += 1
         g.setColumnStretch(1, 1)
         g.setRowStretch(r, 1)
         return panel
 
+    @property
+    def _boxes(self) -> tuple:
+        return (self.x_box, self.y_box, self.w_box, self.h_box,
+                self.w_pct_box, self.h_pct_box)
+
     def _update_info(self) -> None:
-        """Refresh the readout: sprite position + size in canvas pixels, with the
-        size as a % of the raw input asset's native resolution."""
-        if self.sprite_item and self._native and self._native.width() and self._native.height():
-            s = self.sprite_item.scale()
-            pos = self.sprite_item.pos()
-            cw = self._native.width() * s
-            ch = self._native.height() * s
-            self.x_val.setText(f"{pos.x():.0f} px")
-            self.y_val.setText(f"{pos.y():.0f} px")
-            self.w_val.setText(f"{cw:.0f} px")
-            self.h_val.setText(f"{ch:.0f} px")
-            self.w_pct.setText(f"{cw / self._native.width() * 100:.0f}%")
-            self.h_pct.setText(f"{ch / self._native.height() * 100:.0f}%")
+        """Refresh the readout boxes: sprite position + size in canvas pixels, with
+        the size as a % of the raw input asset's native resolution. Guarded so the
+        programmatic setValue doesn't re-fire the edit handlers."""
+        sprite, native = self.sprite_item, self._native
+        has = bool(sprite and native and native.width() and native.height())
+        self._refreshing = True
+        try:
+            for box in self._boxes:
+                box.setEnabled(has)
+            if not (sprite and native and native.width() and native.height()):
+                return
+            s = sprite.scale()
+            pos = sprite.pos()
+            cw = native.width() * s
+            ch = native.height() * s
+            self.x_box.setValue(pos.x())
+            self.y_box.setValue(pos.y())
+            self.w_box.setValue(cw)
+            self.h_box.setValue(ch)
+            self.w_pct_box.setValue(cw / native.width() * 100)
+            self.h_pct_box.setValue(ch / native.height() * 100)
+        finally:
+            self._refreshing = False
+
+    # ---- numeric editing ------------------------------------------------
+    def _on_pos_edit(self) -> None:
+        if self._refreshing or not (self.sprite_item and self._native):
+            return
+        self.sprite_item.setPos(
+            self.view._clamp_pos(QPointF(self.x_box.value(), self.y_box.value())))
+        self.view.viewport().update()
+        self.changed.emit()
+        self._update_info()
+
+    def _on_size_edit(self, source: str) -> None:
+        if self._refreshing or not (self.sprite_item and self._native
+                                    and self._native.width() and self._native.height()):
+            return
+        if source == "w_px":
+            s = self.w_box.value() / self._native.width()
+        elif source == "h_px":
+            s = self.h_box.value() / self._native.height()
+        elif source == "w_pct":
+            s = self.w_pct_box.value() / 100.0
         else:
-            for lbl in (self.x_val, self.y_val, self.w_val, self.h_val):
-                lbl.setText("–")
-            self.w_pct.setText(""); self.h_pct.setText("")
+            s = self.h_pct_box.value() / 100.0
+        cx, cy = self._center()                          # anchor about the center
+        self._apply_norm(s * self._native.height() / self._h)   # clamps norm to [_MIN, _MAX]
+        self._place_center(cx, cy)
+        self.changed.emit()
+        self._update_info()
 
     # ---- configuration --------------------------------------------------
     def set_aspect(self, w: int, h: int) -> None:
