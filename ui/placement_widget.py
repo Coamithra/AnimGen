@@ -103,15 +103,17 @@ class _PlacementView(QGraphicsView):
         return -1
 
     def _clamp_pos(self, pos: QPointF) -> QPointF:
-        """Keep the sprite's center inside the canvas so it can always be grabbed.
-        The sprite may still hang off any edge by up to half its size."""
+        """Clamp so the sprite's bounding box stays attached to the canvas: it may be
+        dragged all the way off-frame until one edge just touches a frame bound, but no
+        further. This permits a fully partial sprite while ensuring it can never be lost
+        entirely past the frame (and the numeric X/Y readout can always recover it)."""
         assert self.sprite_item is not None
         w = self.sprite_item.pixmap().width() * self.sprite_item.scale()
         h = self.sprite_item.pixmap().height() * self.sprite_item.scale()
         canvas = self.scene().sceneRect()
-        cx = min(max(pos.x() + w / 2, canvas.left()), canvas.right())
-        cy = min(max(pos.y() + h / 2, canvas.top()), canvas.bottom())
-        return QPointF(cx - w / 2, cy - h / 2)
+        x = min(max(pos.x(), canvas.left() - w), canvas.right())
+        y = min(max(pos.y(), canvas.top() - h), canvas.bottom())
+        return QPointF(x, y)
 
     def _clamp_pscale(self, pscale: float) -> float:
         """Clamp a pixmap-item scale so normalized scale stays in [_MIN, _MAX]."""
