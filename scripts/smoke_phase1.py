@@ -166,7 +166,9 @@ def test_gui_build() -> None:
     win.show()
     app.processEvents()
     assert win.windowTitle().endswith("Animation Generator")
-    print("GUI OK: MainWindow built + shown offscreen")
+    # An untitled (never-saved) project carries the unsaved-changes marker.
+    assert win._has_unsaved_changes() and win.windowTitle().startswith("Untitled*")
+    print("GUI OK: MainWindow built + shown offscreen, untitled shows *")
 
 
 if __name__ == "__main__":

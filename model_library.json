@@ -34,6 +34,36 @@
       "notes": "Cheap choreography auditions only. Validates prompt/staging; never the final frame source (tier change = reroll). Fast-tier bg shimmer is keyed out. Resolution 480p/720p and the full aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) match Replicate's live schema; 'adaptive' is omitted (no fixed canvas). Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.07, 720p=0.15."
     },
     {
+      "id": "seedance-1.0-pro",
+      "aspect_ratios": ["1:1", "16:9", "9:16"],
+      "display_name": "Seedance 1.0 Pro",
+      "backend": "replicate",
+      "replicate_model_id": "bytedance/seedance-1-pro",
+      "tier": "production",
+      "supports_end_frame": true,
+      "requires_data_uri": false,
+      "cost_per_second_usd": {"480p": 0.024, "720p": 0.054, "1080p": 0.122},
+      "duration_range": [2, 12],
+      "resolution_options": ["480p", "720p", "1080p"],
+      "default_params": {"duration": 5, "resolution": "720p", "seed": 7, "camera_fixed": true},
+      "notes": "Prior-gen ByteDance Seedance, image-to-video. Start frame -> 'image', end frame -> 'last_frame_image' (both already in replicate_client.ALIASES). Unlike seedance-2.0 there is NO required aspect lock: aspect_ratio is IGNORED when an image is supplied (per live schema), and AnimGen always sends a start keyframe, so the output follows the framing canvas - aspect_ratio is deliberately left out of default_params. camera_fixed=true stabilises the camera for sprite work. fps fixed at 24. Cost: token-billed (tokens = h*w*fps*duration/1024 at $2.5/1M tokens for pro); the per-second table is the 16:9 equivalent {480p~0.024, 720p~0.054, 1080p~0.122} - true cost scales with the chosen aspect's pixel count. Replicate IDs/fields verified via live schema fetch 2026-06-16."
+    },
+    {
+      "id": "seedance-1.0-lite",
+      "aspect_ratios": ["1:1", "16:9", "9:16"],
+      "display_name": "Seedance 1.0 Lite",
+      "backend": "replicate",
+      "replicate_model_id": "bytedance/seedance-1-lite",
+      "tier": "audition",
+      "supports_end_frame": true,
+      "requires_data_uri": false,
+      "cost_per_second_usd": {"480p": 0.017, "720p": 0.039, "1080p": 0.087},
+      "duration_range": [4, 12],
+      "resolution_options": ["480p", "720p", "1080p"],
+      "default_params": {"duration": 5, "resolution": "720p", "seed": 7, "camera_fixed": true},
+      "notes": "Cheaper prior-gen Seedance, image-to-video (the Lite sibling of seedance-1.0-pro). Same field mapping (start='image', end='last_frame_image') and same aspect-ignored-when-image behaviour, so no required aspect lock. Also exposes reference_images (1-4) which AnimGen doesn't use. fps fixed at 24; duration floor is 4s (vs 2s on pro). Cost: token-billed at $1.8/1M tokens; per-second 16:9 equivalent {480p~0.017, 720p~0.039, 1080p~0.087} - scales with aspect pixel count. Replicate IDs/fields verified via live schema fetch 2026-06-16."
+    },
+    {
       "id": "vidu-q3-pro",
       "aspect_ratios": ["16:9", "9:16", "3:4", "4:3", "1:1"],
       "display_name": "Vidu Q3 Pro",

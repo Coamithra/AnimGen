@@ -2,8 +2,8 @@
 
 Choose start/end keyframes from the project's assets (left-click a slot to frame it,
 double-click to pick), set the canvas aspect ratio (offered per the model), drag/scale
-each keyframe within the aspect canvas, write prompt + settings, and see/generate this
-shot's takes - all inline.
+each keyframe within the aspect canvas, write the prompt, tune the output/model
+settings, and see/generate this shot's takes - all inline.
 
 Placement is stored per keyframe under shot.crop = {aspect, start:{...}, end:{...}};
 the 1254-class (hosted) or pixel-budget (local) canvas is computed from the aspect, and
@@ -33,7 +33,7 @@ from ui.takes_view import TakesView
 _PARAM_ORDER = ["duration", "resolution", "seed", "camera_fixed", "mode", "length"]
 _DEFAULT_PLACEMENT = {"scale": 0.65, "cx": 0.5, "cy": 0.6}
 _WAN_FPS = 16                                          # local Wan renders at a fixed 16 fps
-_OUTPUT_PARAMS = {"resolution", "duration", "length"}  # live on the Output tab, not Model settings
+_OUTPUT_PARAMS = {"resolution", "duration", "length"}  # go in the output_form, not the Model settings group
 
 
 class _KeyframeButton(QPushButton):
@@ -48,6 +48,7 @@ class ShotTab(QWidget):
     saved = Signal(str)              # shot_id (after a successful save)
     generate_requested = Signal(str)  # shot_id
     export_requested = Signal(list)   # take ids
+    dirty_changed = Signal()          # this tab's unsaved-edits state flipped
 
     def __init__(self, project: Project, shot=None, parent=None):
         super().__init__(parent)
@@ -61,26 +62,72 @@ class ShotTab(QWidget):
                                           "end": dict(_DEFAULT_PLACEMENT)}
         self._keyed_cache: dict = {}   # asset path -> keyed PIL sprite (thumb reuse)
         self._active = "start"
+        self._dirty = False
+        self._suppress = True          # block dirty-marking while building/loading widgets
         self._build()
         if shot:
             self._load(shot)
         else:
             self._select("start")
         self._update_action_state()
+        self._suppress = False         # subsequent widget changes are real user edits
 
     def title(self) -> str:
-        return self.shot.name if self.shot else "New shot"
+        base = self.shot.name if self.shot else "New shot"
+        return f"{base}*" if self._dirty else base
+
+    # ---- dirty tracking -------------------------------------------------
+    def is_dirty(self) -> bool:
+        return self._dirty
+
+    def _mark_dirty(self) -> None:
+        if self._suppress or self._dirty:
+            return
+        self._dirty = True
+        self.dirty_changed.emit()
+
+    def _clear_dirty(self) -> None:
+        if self._dirty:
+            self._dirty = False
+            self.dirty_changed.emit()
+
+    def _wire_dirty(self, widget: QWidget) -> None:
+        """Mark this tab dirty whenever a built editor widget changes. Param/output rows
+        are sometimes a container host (today only the length spin + hint), so fall back to
+        its concrete child editors. QLineEdit is intentionally absent from the descend set:
+        no container hosts a free-text field, and including it would also match the private
+        line edit inside a QSpinBox. Top-level QLineEdit rows are still handled by _wire_one."""
+        if not self._wire_one(widget):
+            for cls in (QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox):
+                for child in widget.findChildren(cls):
+                    self._wire_one(child)
+
+    def _wire_one(self, w: QWidget) -> bool:
+        if isinstance(w, QCheckBox):
+            w.toggled.connect(self._mark_dirty)
+        elif isinstance(w, QComboBox):
+            w.currentIndexChanged.connect(self._mark_dirty)
+        elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+            w.valueChanged.connect(self._mark_dirty)
+        elif isinstance(w, QLineEdit):
+            w.textChanged.connect(self._mark_dirty)
+        else:
+            return False
+        return True
 
     # ---- construction ---------------------------------------------------
     def _build(self) -> None:
         self.name = QLineEdit()
+        self.name.textChanged.connect(self._mark_dirty)
         self.model_combo = QComboBox()
         for m in library.models():
             self.model_combo.addItem(m["display_name"], m["id"])
         self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        self.model_combo.currentIndexChanged.connect(self._mark_dirty)
 
         self.aspect_combo = QComboBox()
         self.aspect_combo.currentIndexChanged.connect(self._on_aspect_changed)
+        self.aspect_combo.currentIndexChanged.connect(self._mark_dirty)
         self.canvas_lbl = QLabel("")
         self.canvas_lbl.setStyleSheet("color: gray;")
 
@@ -93,9 +140,12 @@ class ShotTab(QWidget):
 
         self.canvas = PlacementCanvas()
         self.canvas.changed.connect(self._on_placement_changed)
+        self.canvas.changed.connect(self._mark_dirty)
 
         self.prompt = QPlainTextEdit(); self.prompt.setPlaceholderText("Prompt…")
+        self.prompt.textChanged.connect(self._mark_dirty)
         self.negative = QPlainTextEdit(); self.negative.setPlaceholderText("Negative prompt…")
+        self.negative.textChanged.connect(self._mark_dirty)
         self.negative.setPlainText(library.default_negative_prompt())
         prompt_box = QGroupBox("Prompt")
         pv = QVBoxLayout(prompt_box)
@@ -108,13 +158,17 @@ class ShotTab(QWidget):
         self.fetch_btn.clicked.connect(self._fetch_schema)
         self.schema_status = QLabel("")
 
-        # Output tab: resolution + duration (both model-aware) + read-only fps.
+        # Output tab: resolution + duration (model-aware) + the Model settings group +
+        # read-only fps and est. price.
         self.output_form = QFormLayout()
         self.fps_value = QLabel("—"); self.fps_value.setStyleSheet("color: gray;")
         self.price_value = QLabel("—"); self.price_value.setStyleSheet("font-weight: bold;")
         output_tab = QWidget()
         ov = QVBoxLayout(output_tab)
         ov.addLayout(self.output_form)
+        ov.addWidget(self.params_box)
+        frow = QHBoxLayout(); frow.addWidget(self.fetch_btn); frow.addWidget(self.schema_status); frow.addStretch(1)
+        ov.addLayout(frow)
         fps_line = QHBoxLayout()
         fps_line.addWidget(QLabel("Output FPS")); fps_line.addWidget(self.fps_value, 1)
         ov.addLayout(fps_line)
@@ -125,12 +179,10 @@ class ShotTab(QWidget):
         tabs = QTabWidget()
         tabs.addTab(self.canvas, "Framing")
         tabs.addTab(output_tab, "Output")
-        settings_tab = QWidget()
-        sv = QVBoxLayout(settings_tab)
-        sv.addWidget(prompt_box); sv.addWidget(self.params_box)
-        frow = QHBoxLayout(); frow.addWidget(self.fetch_btn); frow.addWidget(self.schema_status); frow.addStretch(1)
-        sv.addLayout(frow)
-        tabs.addTab(settings_tab, "Prompt & settings")
+        prompt_tab = QWidget()
+        sv = QVBoxLayout(prompt_tab)
+        sv.addWidget(prompt_box)
+        tabs.addTab(prompt_tab, "Prompt")
 
         self._takes_host = QWidget()
         self._takes_layout = QVBoxLayout(self._takes_host)
@@ -283,11 +335,15 @@ class ShotTab(QWidget):
         if dlg.exec() and dlg.selected():
             self._set_asset(which, dlg.selected())
             self._select(which)
+            self._mark_dirty()
 
     def _clear(self, which: str) -> None:
+        had_asset = self._assets[which] is not None
         self._set_asset(which, None)
         if self._active == which:
             self.canvas.set_sprite(None)
+        if had_asset:                  # clearing an already-empty slot isn't an edit
+            self._mark_dirty()
 
     def _copy_start_to_end(self) -> None:
         """Mirror the start keyframe (image + placement) onto the end slot."""
@@ -301,6 +357,7 @@ class ShotTab(QWidget):
             self.canvas.set_sprite(self._keyed_pixmap(self._assets["end"]))
             self.canvas.set_placement(self._frames["end"])
         self._update_kf_thumb("end")
+        self._mark_dirty()
 
     def _refresh_copy_btn(self) -> None:
         self.copy_se_btn.setEnabled(bool(self._assets["start"]))
@@ -391,12 +448,14 @@ class ShotTab(QWidget):
                 widget, getter = self._make_output_widget(name, merged[name], model)
                 self.output_form.addRow(label, widget)
                 self._param_getters[name] = getter
+                self._wire_dirty(widget)
         ordered = [k for k in _PARAM_ORDER if k in merged and k not in _OUTPUT_PARAMS]
         ordered += [k for k in merged if k not in ordered and k not in _OUTPUT_PARAMS]
         for name in ordered:
             widget, getter = self._make_param_widget(name, merged[name], model)
             self.params_form.addRow(name, widget)
             self._param_getters[name] = getter
+            self._wire_dirty(widget)
         self.fetch_btn.setEnabled(model["backend"] == "replicate")
         self._refresh_price()
 
@@ -529,7 +588,11 @@ class ShotTab(QWidget):
             props, _ = replicate_client.get_input_schema(replicate_client.load_token(), rid)
             self._schema = props
             self.schema_status.setText(f"schema: {len(props)} fields")
-            self._rebuild_params(self._params())
+            self._suppress = True   # re-populating with the same values isn't a user edit
+            try:
+                self._rebuild_params(self._params())
+            finally:
+                self._suppress = False
         except Exception as e:  # noqa: BLE001
             self.schema_status.setText(f"fetch failed: {e}")
         finally:
@@ -598,6 +661,7 @@ class ShotTab(QWidget):
         self.shot = self.project.get_shot(sid)
         self._ensure_takes_view()
         self._update_action_state()
+        self._clear_dirty()
         return sid
 
     def _save(self) -> Optional[str]:

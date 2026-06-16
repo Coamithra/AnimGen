@@ -7,6 +7,7 @@ the leader can keep counts fresh.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -17,19 +18,54 @@ from PySide6.QtWidgets import (
 )
 
 import library
+from pipeline import framing
 from store.project import Project
+from ui.placement_widget import pil_to_pixmap
 from ui.takes_view import TakesView
 
+# Keyed sprites are placement-independent, so cache them (keyed by path + stat so a
+# reused filename with new content misses): the Shots list keys each asset at most once
+# and reloads / shots sharing an asset are instant.
+_KEYED_CACHE: dict = {}
+_THUMB_KEY_MAX = 384   # cap the keyed-sprite source resolution - thumbnails don't need the
+                       # full 1254 contract canvas, and keying full-res for every row stalls
+                       # the first Shots-list paint (a 30+ shot project = 60+ keyings).
 
-def _thumb(path: Optional[str], size: int = 64) -> QPixmap:
-    pm = QPixmap(size, size)
-    if path and Path(path).exists():
-        loaded = QPixmap(path)
-        if not loaded.isNull():
-            return loaded.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
-                                 Qt.TransformationMode.SmoothTransformation)
+
+def _thumb_canvas(shot, long: int = 88) -> tuple[int, int]:
+    """A small thumbnail canvas matching the shot's generation aspect."""
+    w = getattr(shot, "canvas_w", None) or 1254
+    h = getattr(shot, "canvas_h", None) or 1254
+    if w >= h:
+        return long, max(1, round(long * h / w))
+    return max(1, round(long * w / h)), long
+
+
+def _placeholder(size: tuple[int, int]) -> QPixmap:
+    pm = QPixmap(size[0], size[1])
     pm.fill(Qt.GlobalColor.darkGray)
     return pm
+
+
+def framed_thumb(shot, which: str, long: int = 88) -> QPixmap:
+    """The shot's start/end keyframe AS FRAMED - the keyed sprite placed on the magenta
+    aspect canvas per shot.crop, i.e. what actually gets generated (mirrors
+    shot_tab._framed_pixmap). Missing/unreadable asset -> a gray placeholder."""
+    canvas = _thumb_canvas(shot, long)
+    asset = getattr(shot, "start_frame" if which == "start" else "end_frame", None)
+    if not (asset and Path(asset).exists()):
+        return _placeholder(canvas)
+    try:
+        st = os.stat(asset)
+        cache_key = (asset, st.st_mtime_ns, st.st_size)
+        sprite = _KEYED_CACHE.get(cache_key)
+        if sprite is None:
+            sprite = framing.keyed_sprite(asset, max_side=_THUMB_KEY_MAX)
+            _KEYED_CACHE[cache_key] = sprite
+        placement = (shot.crop or {}).get(which) or {}
+        return pil_to_pixmap(framing.render_placement(asset, placement, canvas, sprite=sprite))
+    except Exception:  # noqa: BLE001 - unreadable image -> placeholder
+        return _placeholder(canvas)
 
 
 class ShotCard(QFrame):
@@ -61,8 +97,8 @@ class ShotCard(QFrame):
         self.expand_btn.setCheckable(True)
         self.expand_btn.toggled.connect(self._on_toggle)
 
-        self.start_thumb = QLabel(); self.start_thumb.setPixmap(_thumb(shot.start_frame))
-        self.end_thumb = QLabel(); self.end_thumb.setPixmap(_thumb(shot.end_frame))
+        self.start_thumb = QLabel(); self.start_thumb.setPixmap(framed_thumb(shot, "start"))
+        self.end_thumb = QLabel(); self.end_thumb.setPixmap(framed_thumb(shot, "end"))
 
         name = QLabel(f"<b>{shot.name}</b>")
         model = library.get_model(shot.model_id)
