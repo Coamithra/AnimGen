@@ -47,6 +47,53 @@ def test_build_input() -> None:
     print("replicate build_input OK: canonical->schema mapping, audio off, extra coerced")
 
 
+def test_resolve_enums() -> None:
+    # Replicate stores enums as $ref/allOf/anyOf/oneOf into components.schemas, not inline.
+    # _resolve_enums must pull them onto the property so the shot editor sees prop['enum'].
+    schemas = {
+        "resolution": {"type": "string", "enum": ["480p", "720p", "1080p"]},
+        "mode": {"type": "string", "enum": ["standard", "pro"]},
+        "duration": {"type": "integer", "enum": [5, 10]},
+    }
+    props = {
+        "resolution": {"allOf": [{"$ref": "#/components/schemas/resolution"}], "default": "720p"},
+        "mode": {"$ref": "#/components/schemas/mode"},                      # bare $ref
+        "duration": {"anyOf": [{"$ref": "#/components/schemas/duration"}]}, # anyOf combiner
+        "fps": {"oneOf": [{"enum": [16, 24]}]},                            # inline enum in combiner
+        "seed": {"type": "integer"},                                       # no enum -> unchanged
+        "prompt": {"type": "string"},
+    }
+    resolved = replicate_client._resolve_enums(props, schemas)
+    assert resolved["resolution"]["enum"] == ["480p", "720p", "1080p"]
+    assert resolved["resolution"]["default"] == "720p"        # existing keys preserved
+    assert resolved["resolution"]["type"] == "string"         # type pulled from the component
+    assert resolved["mode"]["enum"] == ["standard", "pro"]
+    assert resolved["duration"]["enum"] == [5, 10] and resolved["duration"]["type"] == "integer"
+    assert resolved["fps"]["enum"] == [16, 24]
+    assert "enum" not in resolved["seed"] and "enum" not in resolved["prompt"]
+    assert props["resolution"].get("enum") is None            # inputs not mutated
+    print("replicate _resolve_enums OK: $ref/allOf/anyOf/oneOf + inline + passthrough, no mutation")
+
+
+def test_app_settings() -> None:
+    from store import app_settings
+
+    saved = paths.APP_SETTINGS
+    paths.APP_SETTINGS = Path(tempfile.mkdtemp()) / "app_settings.json"
+    try:
+        # Default when the file doesn't exist yet (registered default is False).
+        assert app_settings.get_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP) is False
+        app_settings.set_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP, True)
+        assert app_settings.get_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP) is True
+        assert paths.APP_SETTINGS.exists()                    # persisted, not just in-memory
+        app_settings.set_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP, False)
+        assert app_settings.get_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP) is False
+        assert app_settings.get_bool("nonexistent_key", True) is True   # explicit fallback
+    finally:
+        paths.APP_SETTINGS = saved
+    print("app_settings OK: default, set->get round-trip, persistence, explicit fallback")
+
+
 def test_roster_integrity() -> None:
     # Every roster entry is well-formed for its backend (offline: no schema fetch).
     for m in library.models():
@@ -292,6 +339,8 @@ def test_cancel_pending() -> None:
 
 if __name__ == "__main__":
     test_build_input()
+    test_resolve_enums()
+    test_app_settings()
     test_roster_integrity()
     test_comfy_prepare()
     test_dynamic_vram_gate()

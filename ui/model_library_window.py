@@ -147,6 +147,11 @@ class ModelLibraryWindow(QWidget):
         lay.addWidget(self.table)
 
     # ---- live-schema fetch ----------------------------------------------
+    def start_schema_fetch(self) -> None:
+        """Public entry to kick off the off-thread schema fetch — used both by the
+        Fetch button and by MainWindow's 'update model data on startup' setting."""
+        self._fetch_all()
+
     def _fetch_all(self) -> None:
         rids = list(self._row_by_rid)
         if not rids:
