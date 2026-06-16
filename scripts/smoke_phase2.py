@@ -47,6 +47,38 @@ def test_build_input() -> None:
     print("replicate build_input OK: canonical->schema mapping, audio off, extra coerced")
 
 
+def test_roster_integrity() -> None:
+    # Every roster entry is well-formed for its backend (offline: no schema fetch).
+    for m in library.models():
+        mid = m.get("id")
+        assert mid and m.get("display_name") and m.get("backend"), m
+        assert library.aspect_ratios(mid), mid                 # never empty (falls back to 1:1)
+        if m["backend"] == "replicate":
+            assert m.get("replicate_model_id"), mid
+        elif m["backend"] == "comfyui":
+            assert m.get("workflow_template") and m.get("comfy_nodes"), mid
+
+    # The two Seedance 1 entries added for card #14 (Replicate IDs verified live 2026-06-16).
+    expected = {
+        "seedance-1.0-pro":  ("bytedance/seedance-1-pro",  [2, 12], 0.27),
+        "seedance-1.0-lite": ("bytedance/seedance-1-lite", [4, 12], 0.195),
+    }
+    for mid, (rmid, dur_range, cost_720p_5s) in expected.items():
+        m = library.get_model(mid)
+        assert m, f"{mid} missing from roster"
+        assert m["replicate_model_id"] == rmid, m["replicate_model_id"]
+        assert m["supports_end_frame"] is True and m["duration_range"] == dur_range, mid
+        assert m["resolution_options"] == ["480p", "720p", "1080p"], mid
+        assert set(m["cost_per_second_usd"]) == {"480p", "720p", "1080p"}, mid
+        dp = m["default_params"]
+        assert dp["camera_fixed"] is True, mid
+        # aspect_ratio is ignored when an image is supplied, so it must NOT be a default
+        # param (else shot_tab would send it) - this is the contract that drops the lock.
+        assert "aspect_ratio" not in dp, mid
+        assert abs(library.estimate_cost(mid, {"resolution": "720p", "duration": 5}) - cost_720p_5s) < 1e-9, mid
+    print("roster integrity OK: backends well-formed + Seedance 1 pro/lite contract")
+
+
 def test_comfy_prepare() -> None:
     from PIL import Image
 
@@ -249,6 +281,7 @@ def test_cancel_pending() -> None:
 
 if __name__ == "__main__":
     test_build_input()
+    test_roster_integrity()
     test_comfy_prepare()
     test_dynamic_vram_gate()
     test_comfy_launch_helpers()
