@@ -1,11 +1,15 @@
 """Model Library window - a view of model_library.json plus live-schema fetching.
 
-Lists every available model with backend, cost, capabilities and notes. The roster itself
-is authored in model_library.json and not user-editable (per spec), but per-parameter
-input schemas are fetched LIVE from Replicate. The **Fetch live schemas** button pulls the
-current input schema for every Replicate model and caches it (store.schema_cache); shot
-editors then reuse those cached schemas (correct enums/types) instead of each re-fetching.
-The Schema column shows the cached field count per model.
+Lists every available model with backend, cost, capabilities and notes. The roster's
+canonical metadata (IDs, costs, notes, aspect_ratios) is authored in model_library.json,
+but per-parameter input schemas are fetched LIVE from Replicate. The **Refresh from
+Replicate** button pulls the current input schema for every Replicate model, caches it
+(store.schema_cache), AND derives each model's capability flags (negative prompt / fixed
+camera / end frame) from that schema and writes them back into model_library.json
+(library.sync_model_capabilities). Shot editors reuse the cached schemas (correct
+enums/types). The Schema column shows the cached field count; the Capabilities column
+shows the synced flags. (Pricing is NOT exposed by Replicate's API, so costs stay
+authored - the refresh deliberately leaves them alone.)
 """
 from __future__ import annotations
 
@@ -20,7 +24,10 @@ from PySide6.QtWidgets import (
 import library
 from store import schema_cache
 
-_COLUMNS = ["Model", "Backend", "Cost", "End frame", "Data-URI", "Duration", "Schema", "Notes"]
+_COLUMNS = ["Model", "Backend", "Cost", "End frame", "Capabilities", "Data-URI",
+            "Duration", "Schema", "Notes"]
+_END_COL = _COLUMNS.index("End frame")
+_CAPS_COL = _COLUMNS.index("Capabilities")
 _SCHEMA_COL = _COLUMNS.index("Schema")
 _NOTES_COL = _COLUMNS.index("Notes")
 
@@ -53,18 +60,32 @@ def _schema_cell(m: dict) -> str:
     return f"{e['fields']} fields" if e else "not fetched"
 
 
+def _caps_cell(m: dict) -> str:
+    """Short tags for the Capabilities column from the synced flags (end frame has its own
+    column, so it's omitted here)."""
+    tags = []
+    if m.get("supports_negative_prompt"):
+        tags.append("negative")
+    if m.get("supports_camera_fixed"):
+        tags.append("camera-fixed")
+    return ", ".join(tags) if tags else "-"
+
+
 class _SchemaFetcher(QObject):
-    """Fetches every Replicate model's input schema off the GUI thread, caching each.
+    """Refreshes every Replicate model off the GUI thread: fetches its input schema (caching
+    each), derives capability flags from that schema, and syncs the flags into
+    model_library.json.
 
     One daemon thread walks the model list; results are emitted back as queued signals so
     the table updates on the GUI thread (mirrors the ComfyUI tab's off-thread callers).
     """
-    result = Signal(str, int, str)   # replicate_model_id, field_count (-1 = failed), error
-    finished = Signal(int, int)      # ok_count, fail_count
+    # replicate_model_id, field_count (-1 = failed), error, capabilities dict (or None)
+    result = Signal(str, int, str, object)
+    finished = Signal(int, int, int)   # ok_count, fail_count, capability_change_count
 
-    def __init__(self, replicate_ids: list[str]):
+    def __init__(self, models: list[dict]):
         super().__init__()
-        self._ids = replicate_ids
+        self._models = models          # replicate models only; need both id and replicate id
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True).start()
@@ -74,21 +95,26 @@ class _SchemaFetcher(QObject):
         try:
             token = replicate_client.load_token()
         except Exception as e:  # noqa: BLE001 - no token -> the whole batch fails the same way
-            for rid in self._ids:
-                self.result.emit(rid, -1, str(e))
-            self.finished.emit(0, len(self._ids))
+            for m in self._models:
+                self.result.emit(m["replicate_model_id"], -1, str(e), None)
+            self.finished.emit(0, len(self._models), 0)
             return
-        ok = fail = 0
-        for rid in self._ids:
+        ok = fail = changed = 0
+        for m in self._models:
+            rid = m["replicate_model_id"]
             try:
                 props, _ = replicate_client.get_input_schema(token, rid)
                 schema_cache.put(rid, props)
+                caps = replicate_client.derive_capabilities(props)
+                diff = library.sync_model_capabilities(m["id"], caps)
+                if diff:
+                    changed += 1
                 ok += 1
-                self.result.emit(rid, len(props), "")
+                self.result.emit(rid, len(props), "", caps)
             except Exception as e:  # noqa: BLE001 - report per-model and keep going
                 fail += 1
-                self.result.emit(rid, -1, str(e))
-        self.finished.emit(ok, fail)
+                self.result.emit(rid, -1, str(e), None)
+        self.finished.emit(ok, fail, changed)
 
 
 class ModelLibraryWindow(QWidget):
@@ -112,7 +138,7 @@ class ModelLibraryWindow(QWidget):
         for row, m in enumerate(self.models):
             cells = [
                 m["display_name"], m["backend"], _cost(m),
-                "yes" if m.get("supports_end_frame") else "no",
+                "yes" if m.get("supports_end_frame") else "no", _caps_cell(m),
                 "required" if m.get("requires_data_uri") else "-",
                 _duration(m), _schema_cell(m), m.get("notes", ""),
             ]
@@ -131,9 +157,12 @@ class ModelLibraryWindow(QWidget):
         hh.setSectionResizeMode(_NOTES_COL, QHeaderView.ResizeMode.Stretch)
         self.table.resizeRowsToContents()
 
-        self.fetch_btn = QPushButton("Fetch live schemas")
-        self.fetch_btn.setToolTip("Fetch every Replicate model's current input schema and cache "
-                                  "it for the shot editor (no spend - schema read only).")
+        self.fetch_btn = QPushButton("Refresh from Replicate")
+        self.fetch_btn.setToolTip("Fetch every Replicate model's current input schema (cached "
+                                  "for the shot editor) and sync its capability flags "
+                                  "(negative prompt / fixed camera / end frame) into "
+                                  "model_library.json. No spend - schema read only. "
+                                  "Pricing isn't exposed by the API, so costs are left alone.")
         self.fetch_btn.clicked.connect(self._fetch_all)
         self.status = QLabel("")
         self.status.setStyleSheet("color: gray;")
@@ -142,34 +171,50 @@ class ModelLibraryWindow(QWidget):
         actions.addWidget(self.status, 1)
 
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Available models (roster read-only - edit model_library.json to change):"))
+        lay.addWidget(QLabel("Available models (costs/notes authored in model_library.json; "
+                             "capabilities synced by Refresh from Replicate):"))
         lay.addLayout(actions)
         lay.addWidget(self.table)
 
-    # ---- live-schema fetch ----------------------------------------------
+    # ---- refresh from Replicate (schema + capability sync) --------------
     def _fetch_all(self) -> None:
-        rids = list(self._row_by_rid)
-        if not rids:
+        rep_models = [m for m in self.models
+                      if m.get("backend") == "replicate" and m.get("replicate_model_id")]
+        if not rep_models:
             return
         self.fetch_btn.setEnabled(False)
-        self.status.setText(f"Fetching {len(rids)} schema(s)…")
-        self._fetcher = _SchemaFetcher(rids)       # kept on self so it isn't GC'd mid-fetch
+        self.status.setText(f"Refreshing {len(rep_models)} model(s)…")
+        self._fetcher = _SchemaFetcher(rep_models)   # kept on self so it isn't GC'd mid-fetch
         self._fetcher.result.connect(self._on_result)
         self._fetcher.finished.connect(self._on_finished)
         self._fetcher.start()
 
-    def _on_result(self, replicate_model_id: str, fields: int, error: str) -> None:
+    def _on_result(self, replicate_model_id: str, fields: int, error: str, caps) -> None:
         row = self._row_by_rid.get(replicate_model_id)
         if row is None:
             return
         item = self.table.item(row, _SCHEMA_COL)
-        if item is None:
-            return
-        item.setText(f"{fields} fields" if fields >= 0 else "fetch failed")
-        item.setToolTip(error)
+        if item is not None:
+            item.setText(f"{fields} fields" if fields >= 0 else "fetch failed")
+            item.setToolTip(error)
+        if caps:                                   # update the live-derived capability cells
+            end_item = self.table.item(row, _END_COL)
+            if end_item is not None:
+                end_item.setText("yes" if caps.get("supports_end_frame") else "no")
+            caps_item = self.table.item(row, _CAPS_COL)
+            if caps_item is not None:
+                tags = []
+                if caps.get("supports_negative_prompt"):
+                    tags.append("negative")
+                if caps.get("supports_camera_fixed"):
+                    tags.append("camera-fixed")
+                caps_item.setText(", ".join(tags) if tags else "-")
         self.table.resizeRowsToContents()
 
-    def _on_finished(self, ok: int, fail: int) -> None:
+    def _on_finished(self, ok: int, fail: int, changed: int) -> None:
         self.fetch_btn.setEnabled(True)
-        msg = f"Cached {ok} schema(s)" + (f", {fail} failed" if fail else "")
+        msg = f"Cached {ok} schema(s)"
+        msg += f", synced capabilities ({changed} changed)" if ok else ""
+        if fail:
+            msg += f", {fail} failed"
         self.status.setText(msg)

@@ -47,6 +47,37 @@ def test_build_input() -> None:
     print("replicate build_input OK: canonical->schema mapping, audio off, extra coerced")
 
 
+def test_capability_sync() -> None:
+    # derive_capabilities reads field presence off a live input schema (card #22).
+    caps = replicate_client.derive_capabilities(
+        {"prompt": {}, "negative_prompt": {}, "last_frame_image": {}})
+    assert caps == {"supports_negative_prompt": True, "supports_camera_fixed": False,
+                    "supports_end_frame": True}, caps
+    # camera_fixed present, no negative, no end-frame alias
+    caps2 = replicate_client.derive_capabilities({"image": {}, "camera_fixed": {"type": "boolean"}})
+    assert caps2 == {"supports_negative_prompt": False, "supports_camera_fixed": True,
+                     "supports_end_frame": False}, caps2
+
+    # _apply_capabilities is pure (no IO): merges + reports only the changed flags.
+    doc = {"models": [{"id": "x", "supports_negative_prompt": False, "supports_camera_fixed": True}]}
+    diff = library._apply_capabilities(
+        doc, "x", {"supports_negative_prompt": True, "supports_camera_fixed": True,
+                   "supports_end_frame": True})
+    assert diff == {"supports_negative_prompt": (False, True),
+                    "supports_end_frame": (None, True)}, diff
+    assert doc["models"][0]["supports_negative_prompt"] is True
+    assert library._apply_capabilities(doc, "x", {"supports_negative_prompt": True}) == {}  # no-op
+    assert library._apply_capabilities(doc, "missing", {"supports_end_frame": True}) == {}
+
+    # Every Replicate roster entry carries the three boolean capability flags (kept current
+    # by the Model Library tab's Refresh from Replicate).
+    for m in library.models():
+        if m["backend"] == "replicate":
+            for k in ("supports_negative_prompt", "supports_camera_fixed", "supports_end_frame"):
+                assert isinstance(m.get(k), bool), (m["id"], k)
+    print("capability sync OK: derive + apply merge/no-op + roster flags well-formed")
+
+
 def test_roster_integrity() -> None:
     # Every roster entry is well-formed for its backend (offline: no schema fetch).
     for m in library.models():
@@ -292,6 +323,7 @@ def test_cancel_pending() -> None:
 
 if __name__ == "__main__":
     test_build_input()
+    test_capability_sync()
     test_roster_integrity()
     test_comfy_prepare()
     test_dynamic_vram_gate()

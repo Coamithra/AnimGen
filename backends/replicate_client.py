@@ -138,6 +138,17 @@ def get_input_schema(token: str, replicate_model_id: str) -> tuple[dict, list]:
     return props, comp.get("required", [])
 
 
+def derive_capabilities(props: dict) -> dict:
+    """Capability flags inferred from a model's live input schema, for the Model Library
+    refresh to sync into model_library.json. Field-presence is the signal (mirrors the
+    shot editor's own negative-prompt check over ALIASES["negative"])."""
+    return {
+        "supports_negative_prompt": any(n in props for n in ALIASES["negative"]),
+        "supports_camera_fixed": "camera_fixed" in props,
+        "supports_end_frame": any(n in props for n in ALIASES["end"]),
+    }
+
+
 def _pick_field(props: dict, concept: str) -> Optional[str]:
     for name in ALIASES[concept]:
         if name in props:
