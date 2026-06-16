@@ -551,7 +551,10 @@ class ShotTab(QWidget):
             w.setCurrentText(str(value))
             return w, lambda: w.currentText()
         if name == "mode":
-            w = QComboBox(); w.addItems(["standard", "pro"]); w.setCurrentText(str(value))
+            opts = model.get("mode_options") or ["standard", "pro"]
+            w = QComboBox(); w.addItems([str(o) for o in opts])
+            if str(value) in [str(o) for o in opts]:
+                w.setCurrentText(str(value))
             w.currentTextChanged.connect(lambda _t: self._refresh_price())   # mode drives Kling price
             return w, lambda: w.currentText()
         if isinstance(value, bool):

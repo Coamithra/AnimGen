@@ -47,6 +47,55 @@ def test_library() -> None:
     print(f"library OK: {len(lib['models'])} models; seedance 4s est ${cost:.2f}")
 
 
+def test_model_options() -> None:
+    """Authored option lists match Replicate's live schema (verified 2026-06-16) and stay
+    internally consistent (default in options, range ordered, default aspect allowed)."""
+    # Vidu now exposes all three resolution tiers; 1080p must cost more than 540p.
+    vidu = library.get_model("vidu-q3-pro")
+    assert vidu["resolution_options"] == ["540p", "720p", "1080p"], vidu["resolution_options"]
+    v540 = library.estimate_cost("vidu-q3-pro", {"duration": 4, "resolution": "540p"})
+    v1080 = library.estimate_cost("vidu-q3-pro", {"duration": 4, "resolution": "1080p"})
+    assert v540 is not None and v1080 is not None and v540 < v1080, (v540, v1080)
+
+    # Kling takes no resolution param; mode is the quality axis and now includes 4k.
+    kling = library.get_model("kling-3.0")
+    assert "resolution_options" not in kling, "Kling has no resolution param"
+    assert kling["mode_options"] == ["standard", "pro", "4k"], kling["mode_options"]
+    k4k = library.estimate_cost("kling-3.0", {"duration": 5, "mode": "4k"})
+    kpro = library.estimate_cost("kling-3.0", {"duration": 5, "mode": "pro"})
+    assert k4k is not None and kpro is not None and kpro < k4k, (kpro, k4k)
+
+    # Every Seedance model exposes Replicate's full aspect set (sans 'adaptive', no canvas).
+    for mid in ("seedance-2.0-std", "seedance-2.0-fast", "seedance-1.0-pro", "seedance-1.0-lite"):
+        sa = library.aspect_ratios(mid)
+        assert set(sa) == {"16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"}, (mid, sa)
+        assert "adaptive" not in sa
+
+    # Duration maxima were widened to Replicate's live limits.
+    for mid in ("seedance-2.0-std", "seedance-2.0-fast", "wan-2.7-i2v"):
+        assert library.get_model(mid)["duration_range"][1] == 15, mid
+
+    # Every model: defaults must be valid against their own option lists / ranges.
+    for m in library.models():
+        dp = m.get("default_params", {})
+        ro = m.get("resolution_options")
+        if ro and dp.get("resolution"):
+            assert dp["resolution"] in ro, (m["id"], dp["resolution"], ro)
+        mo = m.get("mode_options")
+        if mo and dp.get("mode"):
+            assert dp["mode"] in mo, (m["id"], dp["mode"], mo)
+        dr = m.get("duration_range")
+        if dr:
+            lo, hi = dr
+            assert lo <= hi, (m["id"], dr)
+            if dp.get("duration") is not None:
+                assert lo <= dp["duration"] <= hi, (m["id"], dp["duration"], dr)
+        da = dp.get("aspect_ratio")
+        if da:
+            assert da in library.aspect_ratios(m["id"]), (m["id"], da)
+    print("model options OK: vidu res tiers, kling modes (incl 4k), seedance aspects, defaults valid")
+
+
 def test_project() -> None:
     p = Project.new()
     assert p.is_untitled and not p.dirty
@@ -125,6 +174,7 @@ def test_gui_build() -> None:
 
 if __name__ == "__main__":
     test_library()
+    test_model_options()
     test_project()
     test_hybrid_persistence()
     test_gui_build()

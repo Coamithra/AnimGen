@@ -144,7 +144,7 @@ def test_shot_tab() -> None:
 
     ed.model_combo.setCurrentIndex(ed.model_combo.findData("seedance-2.0-std"))
     aspects = [ed.aspect_combo.itemText(i) for i in range(ed.aspect_combo.count())]
-    assert aspects == ["1:1", "16:9", "9:16"], aspects
+    assert aspects == ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"], aspects
     assert ed.aspect_valid()
     assert "aspect_ratio" not in ed._params()    # owned by the Aspect dropdown now
     assert ed._params()["resolution"] == "720p" and ed._params()["seed"] == 7
