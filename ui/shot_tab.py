@@ -287,8 +287,9 @@ class ShotTab(QWidget):
         t = self.template_combo.currentData()
         if not t:
             return
-        self.prompt.setPlainText(t["positive"])
-        self.negative.setPlainText(t["negative"])
+        self.prompt.setPlainText(t["positive"])      # fires textChanged -> marks dirty
+        self._set_negative(t["negative"])             # stash-aware (kept hidden while masked)
+        self._mark_dirty()
 
     def _save_template(self) -> None:
         suggested = self.template_combo.currentText()
@@ -302,7 +303,7 @@ class ShotTab(QWidget):
                                     f"A template named “{name}” already exists. Overwrite it?"
                                     ) != QMessageBox.StandardButton.Yes:
                 return
-        prompt_library.save(name, self.prompt.toPlainText(), self.negative.toPlainText())
+        prompt_library.save(name, self.prompt.toPlainText(), self._negative_value())
         self._reload_templates(select=name)
 
     def _delete_template(self) -> None:
@@ -720,7 +721,7 @@ class ShotTab(QWidget):
         if idx >= 0:
             self.model_combo.setCurrentIndex(idx)
         self.prompt.setPlainText(shot.prompt)
-        self.negative.setPlainText(shot.negative_prompt)
+        self._set_negative(shot.negative_prompt)   # stash-aware (the model's box may be masked)
         self._rebuild_params(shot.settings)
         crop = shot.crop or {}
         for which, field in (("start", "start_frame"), ("end", "end_frame")):
@@ -764,7 +765,7 @@ class ShotTab(QWidget):
         w, h = framing.canvas_size(aspect, local=self._is_local())
 
         fields = dict(model_id=model["id"], prompt=self.prompt.toPlainText().strip(),
-                      negative_prompt=self.negative.toPlainText().strip(), settings=settings,
+                      negative_prompt=self._negative_value().strip(), settings=settings,
                       start_frame=self._assets["start"], end_frame=self._assets["end"],
                       canvas_w=w, canvas_h=h, crop=crop)
         if self.shot:

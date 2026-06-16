@@ -230,6 +230,19 @@ def test_negative_and_templates() -> None:
     ed.model_combo.setCurrentIndex(ed.model_combo.findData("wan-2.7-i2v"))
     assert ed._negative_supported() is None and ed.negative.isEnabled()
 
+    # Masking: switching to an unsupported model clears the box to a placeholder message,
+    # stashes the real text (never shown as a stale value), and restores it on switch-back.
+    ed.model_combo.setCurrentIndex(ed.model_combo.findData("veo-3.1-fast"))
+    ed.negative.setPlainText("no blur, no warping")
+    ed.model_combo.setCurrentIndex(ed.model_combo.findData("seedance-2.0-std"))  # unsupported
+    assert ed.negative.toPlainText() == "", "masked box shows no stale text"
+    assert "does not support" in ed.negative.placeholderText().lower(), ed.negative.placeholderText()
+    assert ed._negative_value() == "no blur, no warping", "real negative preserved while masked"
+    assert ed.commit() and ed.project.get_shot(ed.shot.id).negative_prompt == "no blur, no warping"
+    ed.model_combo.setCurrentIndex(ed.model_combo.findData("veo-3.1-fast"))        # supported again
+    assert ed.negative.toPlainText() == "no blur, no warping", "negative restored on switch-back"
+    assert ed.negative.isEnabled() and ed.negative.placeholderText() == "Negative prompt…"
+
     # Template combo: seeded prefabs present; Apply replaces both prompt boxes.
     names = [ed.template_combo.itemText(i) for i in range(ed.template_combo.count())]
     assert "Camera-locked action" in names, names
