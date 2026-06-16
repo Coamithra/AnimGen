@@ -59,6 +59,32 @@ def _schema_cell(m: dict) -> str:
     return f"{e['fields']} fields" if e else "not fetched"
 
 
+class _WrapTable(QTableWidget):
+    """A table whose word-wrapped rows recompute their height once the columns settle.
+
+    The Notes column is Stretch, so its real width is only known after the table has
+    been laid out. If we size rows before that (while Notes is still at its default
+    narrow width), each long note wraps into a tall, skinny column and the row balloons
+    to fill the viewport — and Qt never shrinks it back once the column widens. Sizing
+    rows from resizeEvent (after super() has applied the stretch) keeps heights correct
+    on first show and on every window resize. The guard stops the row-height change from
+    re-entering via the scrollbar appearing/disappearing."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sizing = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._sizing:
+            return
+        self._sizing = True
+        try:
+            self.resizeRowsToContents()
+        finally:
+            self._sizing = False
+
+
 def _caps_tags(caps: dict) -> str:
     """Render the synced capability flags as short tags for the Capabilities column (end
     frame has its own column, so it's omitted here). Shared by the initial table build and
@@ -128,7 +154,7 @@ class ModelLibraryWindow(QWidget):
         self._build()
 
     def _build(self) -> None:
-        self.table = QTableWidget(len(self.models), len(_COLUMNS))
+        self.table = _WrapTable(len(self.models), len(_COLUMNS))
         self.table.setHorizontalHeaderLabels(_COLUMNS)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
