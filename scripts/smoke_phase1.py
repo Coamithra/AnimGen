@@ -70,6 +70,10 @@ def test_model_options() -> None:
     assert set(seed_aspects) == {"16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"}, seed_aspects
     assert "adaptive" not in seed_aspects
 
+    # Duration maxima were widened to Replicate's live limits.
+    for mid in ("seedance-2.0-std", "seedance-2.0-fast", "wan-2.7-i2v"):
+        assert library.get_model(mid)["duration_range"][1] == 15, mid
+
     # Every model: defaults must be valid against their own option lists / ranges.
     for m in library.models():
         dp = m.get("default_params", {})

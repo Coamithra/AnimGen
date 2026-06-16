@@ -16,7 +16,6 @@
       "duration_range": [1, 15],
       "resolution_options": ["480p", "720p", "1080p"],
       "default_params": {"duration": 4, "resolution": "720p", "seed": 7, "aspect_ratio": "1:1", "camera_fixed": true},
-      "required_params": {"aspect_ratio": "1:1"},
       "notes": "Hero/production tier. Always pass an explicit aspect_ratio (the editor injects the chosen aspect); omitting it defaults to 16:9 and stretches/clips a tighter-framed keypose. Camera is stochastic (seed lottery). Two-part prompts soak duration padding. A tier/resolution change is a choreography REROLL, not an upgrade. Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.08, 720p=0.18, 1080p=0.45. Resolution 480p/720p/1080p and the full aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) match Replicate's live schema; 'adaptive' is omitted (no fixed canvas)."
     },
     {
@@ -32,8 +31,7 @@
       "duration_range": [1, 15],
       "resolution_options": ["480p", "720p"],
       "default_params": {"duration": 4, "resolution": "480p", "seed": 7, "aspect_ratio": "1:1"},
-      "required_params": {"aspect_ratio": "1:1"},
-      "notes": "Cheap choreography auditions only. Validates prompt/staging; never the final frame source (tier change = reroll). Fast-tier bg shimmer is keyed out. Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.07, 720p=0.15."
+      "notes": "Cheap choreography auditions only. Validates prompt/staging; never the final frame source (tier change = reroll). Fast-tier bg shimmer is keyed out. Resolution 480p/720p and the full aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) match Replicate's live schema; 'adaptive' is omitted (no fixed canvas). Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.07, 720p=0.15."
     },
     {
       "id": "vidu-q3-pro",
@@ -95,7 +93,7 @@
       "duration_range": [3, 15],
       "mode_options": ["standard", "pro", "4k"],
       "default_params": {"duration": 5, "seed": 7, "mode": "standard"},
-      "notes": "Stable backgrounds but low-fps cadence and invents actions (retired by human verdict). mode default=pro; set 'standard' for cheaper. Kept available for one-off comparisons. mode standard/pro/4k matches Replicate's live schema; Kling exposes NO resolution param (mode is the only quality axis). Cost: $/s by MODE, without-audio (Replicate 2026-06): standard=0.168, pro=0.224, 4k=0.42."
+      "notes": "Stable backgrounds but low-fps cadence and invents actions (retired by human verdict). mode default=pro; set 'standard' for cheaper. Kept available for one-off comparisons. Replicate's API default is pro; we default to standard (cheapest). mode standard/pro/4k matches Replicate's live schema; Kling exposes NO resolution param (mode is the only quality axis). Cost: $/s by MODE, without-audio (Replicate 2026-06): standard=0.168, pro=0.224, 4k=0.42."
     },
     {
       "id": "local-flf-wan14b",
