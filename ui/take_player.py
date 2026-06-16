@@ -39,6 +39,30 @@ def take_source(take) -> Optional[str]:
     return None
 
 
+def decode_strip(source: str, max_side: int = 256, max_frames: int = 48,
+                 raw_cap: int = 600) -> list:
+    """Decode a clip to a list of small QImages for an animated grid thumbnail.
+
+    Unlike QMovie (gif-only), this goes through PyAV, so it animates the real .mp4 renders
+    too - which is what actually matters, since we don't generate gif previews. Each frame
+    is downscaled to `max_side`, then the strip is sampled down to at most `max_frames` so a
+    long clip stays light (the grid loop only needs to read as motion, not be frame-exact).
+    Runs off the GUI thread: QImage is safe to build there; the caller turns them into
+    QPixmaps on the GUI thread."""
+    from pipeline import extract
+    small = []
+    for i, im in enumerate(extract.iter_frames(source)):
+        if i >= raw_cap:
+            break
+        im = im.convert("RGBA")
+        im.thumbnail((max_side, max_side))
+        small.append(pil_to_qimage(im))
+    if len(small) > max_frames:                       # sample evenly down to the cap
+        step = len(small) / max_frames
+        small = [small[int(k * step)] for k in range(max_frames)]
+    return small
+
+
 class _FrameLoader(QObject):
     """Decodes a clip to QImages on a daemon thread, then hands them back on the GUI thread.
 
