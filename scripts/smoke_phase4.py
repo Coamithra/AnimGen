@@ -155,10 +155,42 @@ def test_card_and_window() -> None:
     print("ShotCard + MainWindow OK: counts, expand, card routing")
 
 
+def test_framed_row_thumbs() -> None:
+    from PySide6.QtWidgets import QApplication
+
+    from ui.shot_card import framed_thumb
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    tmp = Path(tempfile.mkdtemp())
+    # an asset with a real foreground blob (distinct from the corner bg) so keying runs
+    img = Image.new("RGB", (64, 64), (0, 200, 0))
+    for y in range(20, 50):
+        for x in range(20, 50):
+            img.putpixel((x, y), (200, 0, 0))
+    src = tmp / "kf.png"; img.save(src)
+
+    project = Project.new()
+    asset = str(project.import_asset(src))
+    shot = project.add_shot("framed", model_id="seedance-2.0-std", start_frame=asset,
+                            canvas_w=1254, canvas_h=706,
+                            crop={"aspect": "16:9", "start": {"scale": 0.6, "cx": 0.5, "cy": 0.6}})
+    short = max(1, round(88 * 706 / 1254))
+
+    pm = framed_thumb(shot, "start", long=88)
+    assert not pm.isNull(), "framed start thumb should render"
+    assert (pm.width(), pm.height()) == (88, short), "thumb matches the shot's aspect"
+
+    # missing end_frame -> gray placeholder at the same aspect canvas
+    ph = framed_thumb(shot, "end", long=88)
+    assert not ph.isNull() and (ph.width(), ph.height()) == (88, short)
+    print("framed_thumb OK: start renders framed keypose, missing end -> placeholder")
+
+
 if __name__ == "__main__":
     test_bin_restore()
     test_takes_view()
     test_assets_view()
     test_asset_picker()
     test_card_and_window()
+    test_framed_row_thumbs()
     print("PHASE 4 SMOKE: PASS")
