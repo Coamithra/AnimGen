@@ -65,10 +65,11 @@ def test_model_options() -> None:
     kpro = library.estimate_cost("kling-3.0", {"duration": 5, "mode": "pro"})
     assert k4k is not None and kpro is not None and kpro < k4k, (kpro, k4k)
 
-    # Seedance exposes Replicate's full aspect set (sans 'adaptive', which has no canvas).
-    seed_aspects = library.aspect_ratios("seedance-2.0-std")
-    assert set(seed_aspects) == {"16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"}, seed_aspects
-    assert "adaptive" not in seed_aspects
+    # Every Seedance model exposes Replicate's full aspect set (sans 'adaptive', no canvas).
+    for mid in ("seedance-2.0-std", "seedance-2.0-fast", "seedance-1.0-pro", "seedance-1.0-lite"):
+        sa = library.aspect_ratios(mid)
+        assert set(sa) == {"16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21"}, (mid, sa)
+        assert "adaptive" not in sa
 
     # Duration maxima were widened to Replicate's live limits.
     for mid in ("seedance-2.0-std", "seedance-2.0-fast", "wan-2.7-i2v"):
