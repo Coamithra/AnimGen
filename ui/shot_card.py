@@ -74,6 +74,7 @@ class ShotCard(QFrame):
     duplicate_requested = Signal(str)       # copy the shot into a new one
     delete_requested = Signal(str)          # remove the shot (+ its takes)
     export_takes_requested = Signal(list)   # take ids (row obeys its view filter)
+    open_take_requested = Signal(str)       # take id -> open in the frame-by-frame viewer
     changed = Signal()
 
     def __init__(self, project: Project, shot):
@@ -169,8 +170,11 @@ class ShotCard(QFrame):
             self.takes_view = TakesView(self.project, self.shot.id)
             self.takes_view.changed.connect(self._on_takes_changed)
             self.takes_view.export_requested.connect(self.export_takes_requested)
+            self.takes_view.open_take_requested.connect(self.open_take_requested)
             self.body.layout().addWidget(self.takes_view)
         self.body.setVisible(on)
+        if self.takes_view is not None:
+            self.takes_view.set_animating(on)   # don't decode gifs for a collapsed row
 
     def _on_takes_changed(self) -> None:
         self.refresh_counts()

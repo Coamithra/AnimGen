@@ -51,6 +51,7 @@ class ShotTab(QWidget):
     saved = Signal(str)              # shot_id (after a successful save)
     generate_requested = Signal(str)  # shot_id
     export_requested = Signal(list)   # take ids
+    open_take_requested = Signal(str)  # take id -> open in the frame-by-frame viewer tab
     dirty_changed = Signal()          # this tab's unsaved-edits state flipped
 
     def __init__(self, project: Project, shot=None, parent=None):
@@ -308,6 +309,7 @@ class ShotTab(QWidget):
             self._takes_placeholder.hide()
             self._takes_view = TakesView(self.project, self.shot.id)
             self._takes_view.export_requested.connect(self.export_requested)
+            self._takes_view.open_take_requested.connect(self.open_take_requested)
             self._takes_layout.insertWidget(1, self._takes_view, 1)
 
     def refresh_takes(self) -> None:

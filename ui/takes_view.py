@@ -10,7 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QStandardItem, QStandardItemModel
+from PySide6.QtGui import (
+    QColor, QIcon, QMovie, QPainter, QPixmap, QStandardItem, QStandardItemModel,
+)
 from PySide6.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QListView, QMenu, QPushButton, QSlider,
     QVBoxLayout, QWidget,
@@ -28,11 +30,15 @@ _BADGE_COLOR = {"pending": "#b0b0b0", "generating": "#5aa0ff",
 class TakesView(QWidget):
     changed = Signal()
     export_requested = Signal(list)   # list[take_id]
+    open_take_requested = Signal(str)  # take_id -> open it in the frame-by-frame viewer tab
 
     def __init__(self, project: Project, shot_id: str):
         super().__init__()
         self.project = project
         self.shot_id = shot_id
+        self._items: dict[str, QStandardItem] = {}   # take_id -> grid item (for live frames)
+        self._movies: dict[str, QMovie] = {}         # take_id -> looping gif preview
+        self._animating = True
         self._build()
         self.load()
 
@@ -70,7 +76,7 @@ class TakesView(QWidget):
         self.view.setSpacing(8)
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._context_menu)
-        self.view.doubleClicked.connect(self._open_selected)
+        self.view.doubleClicked.connect(self._open_in_viewer)
         self._apply_icon_size()
 
         lay = QVBoxLayout(self)
@@ -82,13 +88,64 @@ class TakesView(QWidget):
     def load(self) -> None:
         fav = self.filter.currentText() == "Favorites"
         takes = self.project.list_takes(self.shot_id, starred_only=fav)
+        self._clear_movies()
         self.model.clear()
+        self._items.clear()
         for t in takes:
             item = QStandardItem(self._icon_for(t), self._label(t))
             item.setData(t.id, _USER_ROLE)
             item.setEditable(False)
             self.model.appendRow(item)
+            self._items[t.id] = item
         self.count_label.setText(f"{len(takes)} shown")
+        self._build_movies(takes)
+
+    # ---- animated previews (gif loops over the static thumbnails) -------
+    def _clear_movies(self) -> None:
+        for m in self._movies.values():
+            m.stop()
+            m.deleteLater()
+        self._movies.clear()
+
+    def _build_movies(self, takes) -> None:
+        """Give each take with a gif preview a looping QMovie so the grid tiles animate.
+        QMovie streams the gif (cheap memory) and each frame is pushed onto the take's icon;
+        QIcon scales it to the current icon size keeping aspect, so non-square clips aren't
+        distorted. Animation is paused while the view is collapsed/hidden (set_animating)."""
+        for t in takes:
+            gif = t.preview_gif
+            if not (gif and Path(gif).exists()):
+                continue
+            movie = QMovie(gif, parent=self)
+            movie.setCacheMode(QMovie.CacheMode.CacheAll)
+            movie.frameChanged.connect(lambda _f, tid=t.id: self._on_movie_frame(tid))
+            self._movies[t.id] = movie
+            if self._animating:
+                movie.start()
+
+    def _on_movie_frame(self, take_id: str) -> None:
+        movie = self._movies.get(take_id)
+        item = self._items.get(take_id)
+        if movie is not None and item is not None:
+            item.setIcon(QIcon(movie.currentPixmap()))
+
+    def set_animating(self, on: bool) -> None:
+        """Play/pause the grid animations - the card pauses them while collapsed so a
+        long shot list isn't decoding dozens of gifs no one is looking at."""
+        self._animating = on
+        for m in self._movies.values():
+            if on and m.state() != QMovie.MovieState.Running:
+                m.start()
+            elif not on:
+                m.setPaused(True)
+
+    def hideEvent(self, event):  # noqa: N802 - Qt override: pause when the view goes off screen
+        self.set_animating(False)
+        super().hideEvent(event)
+
+    def showEvent(self, event):  # noqa: N802 - Qt override
+        self.set_animating(True)
+        super().showEvent(event)
 
     def _label(self, t) -> str:
         badge = _BADGE.get(t.status, "")
@@ -138,19 +195,23 @@ class TakesView(QWidget):
         if not ids:
             return
         menu = QMenu(self)
+        act_view = menu.addAction("Open in viewer")
+        act_ext = menu.addAction("Open in external player")
+        menu.addSeparator()
         act_star = menu.addAction("Toggle star")
         act_del = menu.addAction("Delete (to bin)")
         act_exp = menu.addAction("Export selected")
-        act_open = menu.addAction("Open video")
         chosen = menu.exec(self.view.mapToGlobal(pos))
-        if chosen == act_star:
+        if chosen == act_view:
+            self._open_in_viewer()
+        elif chosen == act_ext:
+            self._open_selected()
+        elif chosen == act_star:
             self.toggle_star(ids)
         elif chosen == act_del:
             self.delete(ids)
         elif chosen == act_exp:
             self.export_requested.emit(ids)
-        elif chosen == act_open:
-            self._open_selected()
 
     def toggle_star(self, ids: list) -> None:
         for tid in ids:
@@ -167,6 +228,13 @@ class TakesView(QWidget):
                 takes_io.move_to_bin(t, self.project)
         self.load()
         self.changed.emit()
+
+    def _open_in_viewer(self, *_) -> None:
+        """Open the (first) selected take in the in-app frame-by-frame viewer tab. Bubbles
+        up to MainWindow, which owns the tab widget."""
+        ids = self.selected_take_ids()
+        if ids:
+            self.open_take_requested.emit(ids[0])
 
     def _open_selected(self, *_) -> None:
         import os

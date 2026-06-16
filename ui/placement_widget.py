@@ -36,12 +36,20 @@ _DIAG_CURSOR = {0: Qt.CursorShape.SizeFDiagCursor, 2: Qt.CursorShape.SizeFDiagCu
                 1: Qt.CursorShape.SizeBDiagCursor, 3: Qt.CursorShape.SizeBDiagCursor}
 
 
-def pil_to_pixmap(im) -> QPixmap:
-    """PIL RGBA -> QPixmap (preserves alpha)."""
+def pil_to_qimage(im) -> QImage:
+    """PIL image -> a standalone QImage that owns its buffer (the .copy() detaches it
+    from the temporary `tobytes` bytes). Safe to build off the GUI thread - unlike
+    QPixmap - so the frame loader can decode to QImage in a worker and convert to
+    QPixmap on the GUI thread."""
     im = im.convert("RGBA")
     qimg = QImage(im.tobytes("raw", "RGBA"), im.width, im.height, im.width * 4,
                   QImage.Format.Format_RGBA8888)
-    return QPixmap.fromImage(qimg.copy())
+    return qimg.copy()
+
+
+def pil_to_pixmap(im) -> QPixmap:
+    """PIL RGBA -> QPixmap (preserves alpha)."""
+    return QPixmap.fromImage(pil_to_qimage(im))
 
 
 class _SpriteItem(QGraphicsPixmapItem):

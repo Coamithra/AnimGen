@@ -19,9 +19,9 @@ from typing import Optional
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QLabel, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTabWidget,
-    QToolBar, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDockWidget, QFileDialog, QLabel, QMainWindow,
+    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+    QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
 import library
@@ -38,6 +38,8 @@ from ui.comfy_monitor_window import ComfyMonitorWindow
 from ui.shot_tab import ShotTab
 from ui.cost_confirm import confirm_launch, total_price_text
 from ui.model_library_window import ModelLibraryWindow
+from ui.queue_view import QueueView
+from ui.take_player import TakePlayerTab
 
 # settings keys passed to the hosted client explicitly (everything else -> extra/--set)
 _EXPLICIT_SETTINGS = ("duration", "resolution", "seed", "length")
@@ -50,6 +52,7 @@ class MainWindow(QMainWindow):
         self.project = project
         self.cards: dict[str, ShotCard] = {}
         self.shot_tabs: dict[str, ShotTab] = {}   # shot_id -> its open detail/edit tab
+        self.take_tabs: dict[str, TakePlayerTab] = {}  # take_id -> its open viewer tab
 
         self.jobs = JobManager(project)
         self.jobs.progress.connect(self._on_progress)
@@ -70,10 +73,6 @@ class MainWindow(QMainWindow):
         tab, not above the tabs, since every control here acts only on that view."""
         tb = QToolBar("Shot controls")
         tb.setMovable(False)
-        reload_act = QAction("Reload", self)
-        reload_act.triggered.connect(self.reload)
-        tb.addAction(reload_act)
-        tb.addSeparator()
         tb.addWidget(QLabel(" Model: "))
         self.model_filter = QComboBox()
         self.model_filter.currentIndexChanged.connect(self.reload)
@@ -121,11 +120,6 @@ class MainWindow(QMainWindow):
         new_shot_act.triggered.connect(self.new_shot)
         file_menu.addAction(new_shot_act)
         file_menu.addSeparator()
-        reload_act = QAction("&Reload", self)
-        reload_act.setShortcut("F5")
-        reload_act.triggered.connect(self.reload)
-        file_menu.addAction(reload_act)
-        file_menu.addSeparator()
         quit_act = QAction("E&xit", self)
         quit_act.setShortcut("Ctrl+Q")
         quit_act.triggered.connect(self.close)
@@ -137,6 +131,9 @@ class MainWindow(QMainWindow):
             act.triggered.connect(
                 lambda _checked=False, w=widget, t=name: self._show_fixed_tab(w, t))
             view_menu.addAction(act)
+        view_menu.addSeparator()
+        # toggleViewAction is a checkable Show/Hide for the dock that tracks its visibility.
+        view_menu.addAction(self.log_dock.toggleViewAction())
 
         settings_menu = bar.addMenu("&Settings")
         self.startup_fetch_act = QAction("Update Replicate model data on startup", self)
@@ -162,24 +159,16 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.cards_container)
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setPlaceholderText("Generation log...")
-
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(scroll)
-        splitter.addWidget(self.log)
-        splitter.setSizes([640, 160])
-
         shots_tab = QWidget()
         shots_layout = QVBoxLayout(shots_tab)
         shots_layout.setContentsMargins(0, 0, 0, 0)
         shots_layout.addWidget(self._build_controls())
-        shots_layout.addWidget(splitter, 1)
+        shots_layout.addWidget(scroll, 1)
 
         # Model Library and ComfyUI Status used to be separate top-level windows; they're
         # now tabs alongside the shots view. The monitor only polls while its tab is on
         # screen (see _on_tab_changed) to avoid hammering a down port in the background.
+        self.queue_tab = QueueView(self.project, self.jobs)
         self.assets_tab = AssetsView(self.project)
         self.library_tab = ModelLibraryWindow(self)
         self.comfy_tab = ComfyMonitorWindow(self)
@@ -187,7 +176,8 @@ class MainWindow(QMainWindow):
         self.shots_tab = shots_tab
         # Fixed tabs are closable (the x) and reopen from the View menu; shot tabs are
         # dynamic (reopen by opening the shot again).
-        self._fixed_tabs = [(shots_tab, "Shots"), (self.assets_tab, "Assets"),
+        self._fixed_tabs = [(shots_tab, "Shots"), (self.queue_tab, "Queue"),
+                            (self.assets_tab, "Assets"),
                             (self.library_tab, "Model Library"),
                             (self.comfy_tab, "ComfyUI Status")]
 
@@ -199,6 +189,23 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabCloseRequested.connect(self._on_tab_close)
         self.setCentralWidget(self.tabs)
+
+        self._build_log_dock()
+
+    def _build_log_dock(self) -> None:
+        """The generation log lives in a dock panel at the bottom of the window, not inside
+        the Shots tab: jobs fire from any shot/tab, so the log persists across tab switches.
+        The dock has a drag-to-resize splitter handle and a close (x); reopen from View > Log."""
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("Generation log...")
+        self.log_dock = QDockWidget("Log", self)
+        self.log_dock.setObjectName("logDock")
+        self.log_dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.TopDockWidgetArea)
+        self.log_dock.setWidget(self.log)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
+        self.resizeDocks([self.log_dock], [160], Qt.Orientation.Vertical)
 
     # ---- project lifecycle ----------------------------------------------
     def _update_title(self) -> None:
@@ -226,15 +233,25 @@ class MainWindow(QMainWindow):
         self._update_title()
 
     def _switch_project(self, project: Project) -> None:
-        for tab in list(self.shot_tabs.values()):   # old shot tabs reference the old project
+        # Both shot tabs and take-viewer tabs reference the old project's shots/takes - close
+        # them before swapping the document so nothing dangles.
+        for tab in list(self.shot_tabs.values()):
             idx = self.tabs.indexOf(tab)
             if idx >= 0:
                 self.tabs.removeTab(idx)
             tab.deleteLater()
         self.shot_tabs.clear()
+        for vtab in list(self.take_tabs.values()):
+            idx = self.tabs.indexOf(vtab)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            vtab.close_player()
+            vtab.deleteLater()
+        self.take_tabs.clear()
         self.project = project
         self.jobs.set_project(project)
         self.assets_tab.set_project(project)
+        self.queue_tab.set_project(project)
         self.reload()
 
     def _maybe_save_changes(self) -> bool:
@@ -333,6 +350,7 @@ class MainWindow(QMainWindow):
             card.duplicate_requested.connect(self.duplicate_shot)
             card.delete_requested.connect(self.delete_shot)
             card.export_takes_requested.connect(self.export_takes)
+            card.open_take_requested.connect(self.open_take)
             if shot.id in expanded:
                 card.expand_btn.setChecked(True)
             self.cards_layout.addWidget(card)
@@ -398,6 +416,21 @@ class MainWindow(QMainWindow):
         self.shot_tabs[shot_id] = tab
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
 
+    def open_take(self, take_id: str) -> None:
+        """Open a take in its own frame-by-frame viewer tab (one tab per take; re-opening a
+        take just focuses the existing tab)."""
+        if take_id in self.take_tabs:
+            self.tabs.setCurrentWidget(self.take_tabs[take_id])
+            return
+        take = self.project.get_take(take_id)
+        if not take:
+            return
+        shot = self.project.get_shot(take.shot_id)
+        title = f"▶ {shot.name if shot else take.shot_id[:6]} · {take_id[:6]}"
+        tab = TakePlayerTab(self.project, take_id)
+        self.take_tabs[take_id] = tab
+        self.tabs.setCurrentIndex(self.tabs.addTab(tab, title))
+
     def duplicate_shot(self, shot_id: str) -> None:
         dup = self.project.duplicate_shot(shot_id)
         if not dup:
@@ -452,6 +485,7 @@ class MainWindow(QMainWindow):
         tab.dirty_changed.connect(lambda t=tab: self._on_shot_dirty_changed(t))
         tab.generate_requested.connect(self.generate_shot)
         tab.export_requested.connect(self.export_takes)
+        tab.open_take_requested.connect(self.open_take)
 
     def _on_shot_saved(self, shot_id: str, tab: ShotTab) -> None:
         # A blank tab just became a real shot (or an existing shot was re-saved): register
@@ -518,6 +552,7 @@ class MainWindow(QMainWindow):
         self._log(f"queued {take.id[:8]} ({shot.name})")
         self._refresh_shot(shot.id)
         self._refresh_cancel_action()
+        self.queue_tab.refresh()   # a freshly-queued take emits no signal until it starts
 
     def cancel_pending(self) -> None:
         n = self.jobs.cancel_pending()
@@ -653,6 +688,12 @@ class MainWindow(QMainWindow):
 
     def _on_tab_close(self, index: int) -> None:
         widget = self.tabs.widget(index)
+        if isinstance(widget, TakePlayerTab):
+            widget.close_player()              # stop its playback timer before disposal
+            self.take_tabs.pop(widget.take_id, None)
+            self.tabs.removeTab(index)
+            widget.deleteLater()
+            return
         if isinstance(widget, ShotTab):
             if not self._maybe_close_shot_tab(widget):
                 return              # Cancel - keep the tab open

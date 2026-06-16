@@ -120,6 +120,22 @@ class JobManager(QObject):
         """Generations that are queued but haven't started rendering yet."""
         return sum(1 for t in self.project.list_takes() if t.status == STATUS_PENDING)
 
+    def cancel_take(self, take_id: str) -> bool:
+        """Cancel one queued-but-unstarted generation; return whether it was cancellable.
+
+        Only a still-PENDING take can be cancelled here (mark it CANCELLED now and add it
+        to the shared `_cancelled` set so the runnable skips the backend when its slot
+        comes up). A take that's already GENERATING isn't pending - it's mid-render and
+        must be stopped via the backend's own Stop control, so this returns False for it.
+        """
+        t = self.project.get_take(take_id)
+        if not t or t.status != STATUS_PENDING:
+            return False
+        self._cancelled.add(take_id)
+        self.project.update_take(take_id, status=STATUS_CANCELLED, error="cancelled by user")
+        self._signals.status_changed.emit(take_id, STATUS_CANCELLED)
+        return True
+
     def cancel_pending(self) -> int:
         """Cancel every queued-but-unstarted generation and return how many were cancelled.
 
