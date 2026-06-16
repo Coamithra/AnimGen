@@ -15,8 +15,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QGuiApplication, QIcon
+from PySide6.QtCore import QSize, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 import library
 from pipeline import framing
+from store import schema_cache
 from store.project import Project
 from ui.asset_picker import AssetPickerDialog
 from ui.placement_widget import PlacementCanvas, pil_to_pixmap
@@ -154,9 +155,6 @@ class ShotTab(QWidget):
 
         self.params_box = QGroupBox("Model settings")
         self.params_form = QFormLayout(self.params_box)
-        self.fetch_btn = QPushButton("Fetch live schema")
-        self.fetch_btn.clicked.connect(self._fetch_schema)
-        self.schema_status = QLabel("")
 
         # Output tab: resolution + duration (model-aware) + the Model settings group +
         # read-only fps and est. price.
@@ -167,8 +165,6 @@ class ShotTab(QWidget):
         ov = QVBoxLayout(output_tab)
         ov.addLayout(self.output_form)
         ov.addWidget(self.params_box)
-        frow = QHBoxLayout(); frow.addWidget(self.fetch_btn); frow.addWidget(self.schema_status); frow.addStretch(1)
-        ov.addLayout(frow)
         fps_line = QHBoxLayout()
         fps_line.addWidget(QLabel("Output FPS")); fps_line.addWidget(self.fps_value, 1)
         ov.addLayout(fps_line)
@@ -422,8 +418,6 @@ class ShotTab(QWidget):
         return library.get_model(self.model_combo.currentData())
 
     def _on_model_changed(self) -> None:
-        self._schema = None
-        self.schema_status.setText("")
         self.negative.setPlainText(self.negative.toPlainText() or library.default_negative_prompt())
         self._rebuild_params()
         self._populate_aspects()      # offer this model's aspects; flag if current is invalid
@@ -436,7 +430,11 @@ class ShotTab(QWidget):
         self._refresh_fps_label()
         model = self._current_model()
         if not model:
+            self._schema = None
             return
+        # Per-param schema (enums/types) comes from the live-schema cache the Model Library
+        # tab populates ("Fetch live schemas"); None for local/never-fetched models.
+        self._schema = schema_cache.get(model.get("replicate_model_id"))
         merged = dict(model.get("default_params", {}))
         if values:
             merged.update(values)
@@ -456,7 +454,6 @@ class ShotTab(QWidget):
             self.params_form.addRow(name, widget)
             self._param_getters[name] = getter
             self._wire_dirty(widget)
-        self.fetch_btn.setEnabled(model["backend"] == "replicate")
         self._refresh_price()
 
     def _refresh_fps_label(self) -> None:
@@ -576,27 +573,6 @@ class ShotTab(QWidget):
 
     def _params(self) -> dict:
         return {name: getter() for name, getter in self._param_getters.items()}
-
-    def _fetch_schema(self) -> None:
-        from backends import replicate_client
-        model = self._current_model()
-        rid = model.get("replicate_model_id")
-        if not rid:
-            return
-        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            props, _ = replicate_client.get_input_schema(replicate_client.load_token(), rid)
-            self._schema = props
-            self.schema_status.setText(f"schema: {len(props)} fields")
-            self._suppress = True   # re-populating with the same values isn't a user edit
-            try:
-                self._rebuild_params(self._params())
-            finally:
-                self._suppress = False
-        except Exception as e:  # noqa: BLE001
-            self.schema_status.setText(f"fetch failed: {e}")
-        finally:
-            QGuiApplication.restoreOverrideCursor()
 
     # ---- load / save ----------------------------------------------------
     def _load(self, shot) -> None:

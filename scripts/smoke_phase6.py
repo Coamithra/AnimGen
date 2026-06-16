@@ -70,20 +70,43 @@ def test_seed() -> None:
           f"{with_video} with video, {with_thumb} with preview thumb; idempotent + round-trip")
 
 
+def test_schema_cache() -> None:
+    """Round-trip the live-schema cache the Model Library populates / the shot editor reads."""
+    from store import schema_cache
+
+    paths.SCHEMA_CACHE = Path(tempfile.mkdtemp()) / "schema_cache.json"
+    assert schema_cache.get("nobody/none") is None              # missing file -> empty
+    props = {"resolution": {"enum": ["480p", "720p"]}, "seed": {"type": "integer"}}
+    rec = schema_cache.put("acme/model", props)
+    assert rec["fields"] == 2 and rec["fetched"] > 0
+    assert schema_cache.get("acme/model") == props              # persisted + reread
+    assert schema_cache.entry("acme/model")["fields"] == 2
+    assert schema_cache.get(None) is None                       # local models have no rid
+    print("schema_cache OK: put/get/entry round-trip, missing-key tolerant")
+
+
 def test_library_window() -> None:
-    from PySide6.QtWidgets import QApplication, QTableWidget
+    from PySide6.QtWidgets import QApplication, QPushButton, QTableWidget
 
     import library
-    from ui.model_library_window import ModelLibraryWindow
+    from ui.model_library_window import _COLUMNS, ModelLibraryWindow
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
     win = ModelLibraryWindow()
     table = win.findChild(QTableWidget)
     assert table is not None and table.rowCount() == len(library.models())
-    print(f"ModelLibraryWindow OK: {table.rowCount()} model rows")
+    assert table.columnCount() == len(_COLUMNS) and "Schema" in _COLUMNS
+    # the fetch-all control exists; Schema column reflects per-backend state (no fetch yet)
+    assert any(isinstance(b, QPushButton) and b.text() == "Fetch live schemas"
+               for b in win.findChildren(QPushButton))
+    schema_col = _COLUMNS.index("Schema")
+    cells = {table.item(r, schema_col).text() for r in range(table.rowCount())}
+    assert cells <= {"n/a", "not fetched"}, f"unexpected Schema cells: {cells}"
+    print(f"ModelLibraryWindow OK: {table.rowCount()} model rows, Schema column present")
 
 
 if __name__ == "__main__":
     test_seed()
+    test_schema_cache()
     test_library_window()
     print("PHASE 6 SMOKE: PASS")

@@ -71,7 +71,8 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 | `ui/asset_picker.py` | the visual keyframe picker dialog (thumbnail grid + Import) |
 | `ui/assets_view.py` | the **Assets** tab: drag-drop / Import keyframe images into `.assets/`; thumbnail grid + delete |
 | `ui/cost_confirm.py` | the launch gate |
-| `ui/model_library_window.py` | the **Model Library** tab: read-only model roster |
+| `ui/model_library_window.py` | the **Model Library** tab: read-only model roster + a **Fetch live schemas** button (off-thread `_SchemaFetcher`) that pulls every Replicate model's input schema into `store/schema_cache.py`; a **Schema** column shows the cached field count per model |
+| `store/schema_cache.py` | persistent cache of Replicate input schemas (`data/schema_cache.json`, keyed by `replicate_model_id`); lock-guarded, atomic writes (reuses `store.project._atomic_write_json`). Populated by the Model Library tab; read by the shot editor for per-param enums/types |
 | `scripts/` | `seed_configs.py` (writes `Fighter.animproj`, imports keyframes as assets) + `smoke_phase*.py` + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) |
 | `data/` | runtime (gitignored): `*.animproj` project files (default `Fighter.animproj`) + their sidecar `<name>.assets/` (flat keyframe images + `takes/`, `thumbs/`, `.bin/`); plus `exports/`, `_scratch/` (untitled-project assets), `app_state.json` (last opened) |
 | `workflows/` | bundled ComfyUI templates for the local backend |
@@ -127,7 +128,10 @@ Setup if `.venv` is missing: `python -m venv .venv` then
    untitled-project scratch stays out of `data/`. `build_summary` / pure functions are
    split out for exactly this reason.
 5. **`model_library.json` is authored, not generated.** Replicate IDs/fields were
-   verified via live schema fetch; per-param schemas are fetched live in the editor.
+   verified via live schema fetch; per-param schemas are fetched live (Replicate) via the
+   **Model Library** tab's *Fetch live schemas* button, cached to `data/schema_cache.json`
+   (`store/schema_cache.py`, keyed by `replicate_model_id`), and read from there by the
+   shot editor — the editor no longer fetches per shot.
 6. **Windows/MINGW:** use `python` (not `python3`); set `PYTHONIOENCODING=utf-8`.
    `rm -rf` is guarded — don't rely on it for cleanup. Pass Windows-style paths
    (`C:/...`) to `sys.path.insert`, not MINGW (`/c/...`) paths.
