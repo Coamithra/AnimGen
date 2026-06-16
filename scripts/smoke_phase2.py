@@ -48,34 +48,52 @@ def test_build_input() -> None:
 
 
 def test_capability_sync() -> None:
-    # derive_capabilities reads field presence off a live input schema (card #22).
+    # derive_capabilities reads field presence off a live input schema (card #22). It syncs
+    # only the two NEW flags - supports_end_frame stays hand-authored, so it's NOT derived.
     caps = replicate_client.derive_capabilities(
         {"prompt": {}, "negative_prompt": {}, "last_frame_image": {}})
-    assert caps == {"supports_negative_prompt": True, "supports_camera_fixed": False,
-                    "supports_end_frame": True}, caps
-    # camera_fixed present, no negative, no end-frame alias
+    assert caps == {"supports_negative_prompt": True, "supports_camera_fixed": False}, caps
     caps2 = replicate_client.derive_capabilities({"image": {}, "camera_fixed": {"type": "boolean"}})
-    assert caps2 == {"supports_negative_prompt": False, "supports_camera_fixed": True,
-                     "supports_end_frame": False}, caps2
+    assert caps2 == {"supports_negative_prompt": False, "supports_camera_fixed": True}, caps2
 
     # _apply_capabilities is pure (no IO): merges + reports only the changed flags.
     doc = {"models": [{"id": "x", "supports_negative_prompt": False, "supports_camera_fixed": True}]}
     diff = library._apply_capabilities(
-        doc, "x", {"supports_negative_prompt": True, "supports_camera_fixed": True,
-                   "supports_end_frame": True})
-    assert diff == {"supports_negative_prompt": (False, True),
-                    "supports_end_frame": (None, True)}, diff
+        doc, "x", {"supports_negative_prompt": True, "supports_camera_fixed": True})
+    assert diff == {"supports_negative_prompt": (False, True)}, diff
     assert doc["models"][0]["supports_negative_prompt"] is True
     assert library._apply_capabilities(doc, "x", {"supports_negative_prompt": True}) == {}  # no-op
-    assert library._apply_capabilities(doc, "missing", {"supports_end_frame": True}) == {}
+    assert library._apply_capabilities(doc, "missing", {"supports_camera_fixed": True}) == {}
 
-    # Every Replicate roster entry carries the three boolean capability flags (kept current
-    # by the Model Library tab's Refresh from Replicate).
+    # sync_model_capabilities: the lock + atomic-write wrapper. Point the loader at a temp
+    # roster so the real model_library.json is untouched, then assert it only rewrites on a
+    # real change and the diff round-trips through disk.
+    saved_path = library.MODEL_LIBRARY_PATH
+    tmp = Path(tempfile.mkdtemp()) / "roster.json"
+    tmp.write_text(json.dumps({"version": 1, "models": [
+        {"id": "m1", "supports_negative_prompt": False, "supports_camera_fixed": False}]}),
+        encoding="utf-8")
+    library.MODEL_LIBRARY_PATH = tmp
+    try:
+        diff = library.sync_model_capabilities(
+            "m1", {"supports_negative_prompt": True, "supports_camera_fixed": False})
+        assert diff == {"supports_negative_prompt": (False, True)}, diff
+        assert library.get_model("m1")["supports_negative_prompt"] is True  # persisted to disk
+        before = tmp.read_bytes()
+        # no-op: identical caps must NOT rewrite the file (empty diff, bytes unchanged)
+        assert library.sync_model_capabilities(
+            "m1", {"supports_negative_prompt": True, "supports_camera_fixed": False}) == {}
+        assert tmp.read_bytes() == before, "no-op sync rewrote the file"
+    finally:
+        library.MODEL_LIBRARY_PATH = saved_path
+
+    # Every Replicate roster entry carries well-formed boolean capability flags (the two
+    # synced flags + the authored supports_end_frame).
     for m in library.models():
         if m["backend"] == "replicate":
             for k in ("supports_negative_prompt", "supports_camera_fixed", "supports_end_frame"):
                 assert isinstance(m.get(k), bool), (m["id"], k)
-    print("capability sync OK: derive + apply merge/no-op + roster flags well-formed")
+    print("capability sync OK: derive + apply + sync write/no-op + roster flags well-formed")
 
 
 def test_roster_integrity() -> None:

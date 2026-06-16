@@ -5,7 +5,7 @@ canonical metadata (IDs, costs, notes, aspect_ratios) is authored in model_libra
 but per-parameter input schemas are fetched LIVE from Replicate. The **Refresh from
 Replicate** button pulls the current input schema for every Replicate model, caches it
 (store.schema_cache), AND derives each model's capability flags (negative prompt / fixed
-camera / end frame) from that schema and writes them back into model_library.json
+camera) from that schema and writes them back into model_library.json
 (library.sync_model_capabilities). Shot editors reuse the cached schemas (correct
 enums/types). The Schema column shows the cached field count; the Capabilities column
 shows the synced flags. (Pricing is NOT exposed by Replicate's API, so costs stay
@@ -26,7 +26,6 @@ from store import schema_cache
 
 _COLUMNS = ["Model", "Backend", "Cost", "End frame", "Capabilities", "Data-URI",
             "Duration", "Schema", "Notes"]
-_END_COL = _COLUMNS.index("End frame")
 _CAPS_COL = _COLUMNS.index("Capabilities")
 _SCHEMA_COL = _COLUMNS.index("Schema")
 _NOTES_COL = _COLUMNS.index("Notes")
@@ -60,18 +59,19 @@ def _schema_cell(m: dict) -> str:
     return f"{e['fields']} fields" if e else "not fetched"
 
 
-def _caps_cell(m: dict) -> str:
-    """Short tags for the Capabilities column from the synced flags (end frame has its own
-    column, so it's omitted here)."""
+def _caps_tags(caps: dict) -> str:
+    """Render the synced capability flags as short tags for the Capabilities column (end
+    frame has its own column, so it's omitted here). Shared by the initial table build and
+    the live refresh update so the tag vocabulary stays in one place."""
     tags = []
-    if m.get("supports_negative_prompt"):
+    if caps.get("supports_negative_prompt"):
         tags.append("negative")
-    if m.get("supports_camera_fixed"):
+    if caps.get("supports_camera_fixed"):
         tags.append("camera-fixed")
     return ", ".join(tags) if tags else "-"
 
 
-class _SchemaFetcher(QObject):
+class _ReplicateRefresher(QObject):
     """Refreshes every Replicate model off the GUI thread: fetches its input schema (caching
     each), derives capability flags from that schema, and syncs the flags into
     model_library.json.
@@ -124,7 +124,7 @@ class ModelLibraryWindow(QWidget):
         self.resize(960, 480)
         self.models = library.models()
         self._row_by_rid: dict[str, int] = {}      # replicate_model_id -> table row
-        self._fetcher: _SchemaFetcher | None = None
+        self._refresher: _ReplicateRefresher | None = None
         self._build()
 
     def _build(self) -> None:
@@ -138,7 +138,7 @@ class ModelLibraryWindow(QWidget):
         for row, m in enumerate(self.models):
             cells = [
                 m["display_name"], m["backend"], _cost(m),
-                "yes" if m.get("supports_end_frame") else "no", _caps_cell(m),
+                "yes" if m.get("supports_end_frame") else "no", _caps_tags(m),
                 "required" if m.get("requires_data_uri") else "-",
                 _duration(m), _schema_cell(m), m.get("notes", ""),
             ]
@@ -157,17 +157,17 @@ class ModelLibraryWindow(QWidget):
         hh.setSectionResizeMode(_NOTES_COL, QHeaderView.ResizeMode.Stretch)
         self.table.resizeRowsToContents()
 
-        self.fetch_btn = QPushButton("Refresh from Replicate")
-        self.fetch_btn.setToolTip("Fetch every Replicate model's current input schema (cached "
-                                  "for the shot editor) and sync its capability flags "
-                                  "(negative prompt / fixed camera / end frame) into "
-                                  "model_library.json. No spend - schema read only. "
-                                  "Pricing isn't exposed by the API, so costs are left alone.")
-        self.fetch_btn.clicked.connect(self._fetch_all)
+        self.refresh_btn = QPushButton("Refresh from Replicate")
+        self.refresh_btn.setToolTip("Fetch every Replicate model's current input schema (cached "
+                                    "for the shot editor) and sync its capability flags "
+                                    "(negative prompt / fixed camera) into model_library.json. "
+                                    "No spend - schema read only. Pricing isn't exposed by the "
+                                    "API, so costs are left alone.")
+        self.refresh_btn.clicked.connect(self._refresh_all)
         self.status = QLabel("")
         self.status.setStyleSheet("color: gray;")
         actions = QHBoxLayout()
-        actions.addWidget(self.fetch_btn)
+        actions.addWidget(self.refresh_btn)
         actions.addWidget(self.status, 1)
 
         lay = QVBoxLayout(self)
@@ -177,17 +177,17 @@ class ModelLibraryWindow(QWidget):
         lay.addWidget(self.table)
 
     # ---- refresh from Replicate (schema + capability sync) --------------
-    def _fetch_all(self) -> None:
+    def _refresh_all(self) -> None:
         rep_models = [m for m in self.models
                       if m.get("backend") == "replicate" and m.get("replicate_model_id")]
         if not rep_models:
             return
-        self.fetch_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
         self.status.setText(f"Refreshing {len(rep_models)} model(s)…")
-        self._fetcher = _SchemaFetcher(rep_models)   # kept on self so it isn't GC'd mid-fetch
-        self._fetcher.result.connect(self._on_result)
-        self._fetcher.finished.connect(self._on_finished)
-        self._fetcher.start()
+        self._refresher = _ReplicateRefresher(rep_models)  # kept on self so it isn't GC'd mid-run
+        self._refresher.result.connect(self._on_result)
+        self._refresher.finished.connect(self._on_finished)
+        self._refresher.start()
 
     def _on_result(self, replicate_model_id: str, fields: int, error: str, caps) -> None:
         row = self._row_by_rid.get(replicate_model_id)
@@ -197,22 +197,14 @@ class ModelLibraryWindow(QWidget):
         if item is not None:
             item.setText(f"{fields} fields" if fields >= 0 else "fetch failed")
             item.setToolTip(error)
-        if caps:                                   # update the live-derived capability cells
-            end_item = self.table.item(row, _END_COL)
-            if end_item is not None:
-                end_item.setText("yes" if caps.get("supports_end_frame") else "no")
+        if caps:                                   # refresh the live-derived capability cell
             caps_item = self.table.item(row, _CAPS_COL)
             if caps_item is not None:
-                tags = []
-                if caps.get("supports_negative_prompt"):
-                    tags.append("negative")
-                if caps.get("supports_camera_fixed"):
-                    tags.append("camera-fixed")
-                caps_item.setText(", ".join(tags) if tags else "-")
+                caps_item.setText(_caps_tags(caps))
         self.table.resizeRowsToContents()
 
     def _on_finished(self, ok: int, fail: int, changed: int) -> None:
-        self.fetch_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
         msg = f"Cached {ok} schema(s)"
         msg += f", synced capabilities ({changed} changed)" if ok else ""
         if fail:
