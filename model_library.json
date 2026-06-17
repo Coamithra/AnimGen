@@ -40,10 +40,9 @@
         "duration": 4,
         "resolution": "720p",
         "seed": -1,
-        "aspect_ratio": "1:1",
-        "camera_fixed": true
+        "aspect_ratio": "1:1"
       },
-      "notes": "Hero/production tier. Always pass an explicit aspect_ratio (the editor injects the chosen aspect); omitting it defaults to 16:9 and stretches/clips a tighter-framed keypose. Camera is stochastic (seed lottery) - the live schema has NO camera_fixed field, so supports_camera_fixed is false even though default_params still carries a (now-ignored) camera_fixed:true. Two-part prompts soak duration padding. A tier/resolution change is a choreography REROLL, not an upgrade. Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.08, 720p=0.18, 1080p=0.45. Resolution 480p/720p/1080p and the full aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) match Replicate's live schema; 'adaptive' is omitted (no fixed canvas)."
+      "notes": "Hero/production tier. Always pass an explicit aspect_ratio (the editor injects the chosen aspect); omitting it defaults to 16:9 and stretches/clips a tighter-framed keypose. Camera is stochastic (seed lottery) - the live schema has NO camera_fixed field, so supports_camera_fixed is false and camera_fixed is deliberately omitted from default_params (it would otherwise be forwarded to Replicate as an unsupported phantom param). Two-part prompts soak duration padding. A tier/resolution change is a choreography REROLL, not an upgrade. Cost: $/s of output, non_video_in (image-input) variant, scraped from the Replicate pricing JSON 2026-06: 480p=0.08, 720p=0.18, 1080p=0.45. Resolution 480p/720p/1080p and the full aspect set (1:1/16:9/9:16/4:3/3:4/21:9/9:21) match Replicate's live schema; 'adaptive' is omitted (no fixed canvas)."
     },
     {
       "id": "seedance-2.0-fast",
