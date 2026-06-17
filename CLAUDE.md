@@ -200,8 +200,17 @@ Setup if `.venv` is missing: `python -m venv .venv` then
     wrapped in `crash_recovery.run_with_crash_recovery` (`ui/main_window._make_runner`): the
     **crash signal is "the server is down at the moment the render failed"** (`server_status()`)
     — a failure with the server still *up* is a genuine workflow error and propagates, failing
-    only that take. On a crash it `restart_server()`s (which relaunches with the safe flags via
+    only that take. The "down" reading is **reconfirmed up to `CRASH_PROBES` (3) times**
+    (`_looks_crashed`) before committing to a restart so a transient `/system_stats` blip on a
+    still-alive server isn't misread as a crash; the *first* "up" is trusted immediately, so the
+    common workflow-error path still probes exactly once (no slowdown), and on a genuinely down
+    server each probe already eats a full socket timeout so the reconfirmation needs no sleep.
+    On a crash it `restart_server()`s (which relaunches with the safe flags via
     `build_launch_command`, fixing the root cause) and retries the **same** take *in place*.
+    `restart_server` waits `RESTART_SETTLE_S` (2s) after the kill so the OS releases `COMFY_PORT`
+    before the relaunch rebinds it, and watches the relaunched process (`proc.poll()` via
+    `wait_until_responsive(is_alive=...)`) so a bind loss / immediate exit fails fast instead of
+    stalling the full `ready_timeout_s` (120s).
     Because the local pool is serialized, retrying in the blocked worker makes "requeue the
     rest" automatic — the other queued takes just wait behind it; nothing is re-enqueued. After
     `MAX_ATTEMPTS` (3) crashes on one take it raises `QueueAbandoned` -> `jobs.abandon_local()`
