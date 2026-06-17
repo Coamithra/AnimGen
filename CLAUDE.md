@@ -130,7 +130,12 @@ Full mechanism + invariants in **Hard-won rule #13**.
   drag/scale-placed on that canvas at generation time; `scale` is the **original image
   height** as a fraction of the canvas (not the cutout), so two source frames drawn to-scale
   with each other render at the same size when given the same scale. No baked keypose files /
-  no `keyposes/<hash>/` folders.
+  no `keyposes/<hash>/` folders. **Migration note (2026-06-17):** `scale` switched from
+  cutout-relative to original-relative with no data migration — the stored number is
+  reinterpreted, so shots authored before this change render the character a bit smaller
+  (original frame height ≥ cutout height) and may need re-framing. Existing takes are
+  unaffected (their `settings_snapshot` framing is frozen); the seeder writes no custom crop,
+  so seeded shots only pick up the new default semantics.
 - **Hybrid persistence:** authoring edits (add/rename/delete shots, prompts, framing)
   buffer in memory and set `dirty` (title shows `*`, prompt before discarding); a
   **completed Take auto-persists immediately** to `takes.json`. The split (shots in the
