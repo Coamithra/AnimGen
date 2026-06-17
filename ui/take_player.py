@@ -45,7 +45,7 @@ def format_generation_settings(take, shot=None) -> str:
     model_id = snap.get("model_id", "")
     model = library.get_model(model_id) if model_id else None
     lines = [f"Model:     {model['display_name'] if model else (model_id or '?')}"]
-    backend = snap.get("backend") or (model["backend"] if model else "")
+    backend = snap.get("backend") or (model.get("backend") if model else "")
     if backend:
         lines.append(f"Backend:   {backend}")
     if snap.get("replicate_model_id"):
@@ -54,7 +54,7 @@ def format_generation_settings(take, shot=None) -> str:
         lines.append(f"Workflow:  {snap['workflow_template']}")
 
     canvas = snap.get("canvas") or []
-    if any(canvas):
+    if len(canvas) >= 2 and any(canvas):
         lines.append(f"Canvas:    {canvas[0]} x {canvas[1]}")
     aspect = (snap.get("crop") or {}).get("aspect")
     if aspect:
@@ -240,8 +240,7 @@ class TakePlayerTab(QWidget):
         if self._settings_loaded:
             return
         take = self.project.get_take(self.take_id)
-        shot = self.project.get_shot(take.shot_id) if take else None
-        self.settings_panel.setPlainText(format_generation_settings(take, shot))
+        self.settings_panel.setPlainText(format_generation_settings(take))
         self._settings_loaded = True
 
     def show_settings(self) -> None:

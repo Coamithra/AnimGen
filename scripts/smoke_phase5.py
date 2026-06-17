@@ -208,9 +208,15 @@ def test_format_generation_settings() -> None:
     assert "duration: 4" in txt and "mode: std" in txt
     assert "seed: 7" not in txt                   # not duplicated inside Parameters
 
+    # An unframed shot snapshots canvas [None, None] -> the Canvas line is suppressed,
+    # not rendered as "None x None" (and a malformed 1-element canvas can't IndexError).
+    sparse = format_generation_settings(Take(id="y", shot_id="s", settings_snapshot={
+        "model_id": "seedance-2.0-std", "canvas": [None, None], "prompt": "p"}))
+    assert "Canvas:" not in sparse and "None x None" not in sparse
+
     empty = format_generation_settings(Take(id="x", shot_id="s"))
     assert "No generation settings" in empty
-    print("take_player OK: format_generation_settings (full + empty)")
+    print("take_player OK: format_generation_settings (full + sparse + empty)")
 
 
 def test_snapshot_includes_framing() -> None:
@@ -235,12 +241,14 @@ def test_snapshot_includes_framing() -> None:
     win = MainWindow(project)
 
     orig_confirm = main_window.confirm_launch
+    orig_enqueue = win.jobs.enqueue
     main_window.confirm_launch = lambda *a, **k: True   # auto-confirm the launch gate
     win.jobs.enqueue = lambda *a, **k: None             # don't actually render
     try:
         win.generate_shot(shot.id)
     finally:
         main_window.confirm_launch = orig_confirm
+        win.jobs.enqueue = orig_enqueue
 
     snap = project.list_takes(shot.id)[-1].settings_snapshot
     assert snap["canvas"] == [1254, 704], snap.get("canvas")
