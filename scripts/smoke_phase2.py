@@ -1239,6 +1239,92 @@ def test_pause_requeue_current() -> None:
     print("pause_requeue_current OK: in-flight take halted, reset PENDING, re-ran on resume")
 
 
+def test_clear_local_pause() -> None:
+    """clear_local_pause lifts the pause flag without re-enqueuing anything (the non-batch
+    manual-stop drain path, card #42) - distinct from resume_local which re-runs held takes."""
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+
+    QApplication.instance() or QApplication([])
+    jm = JobManager(Project.new())
+    assert jm.is_local_paused() is False
+    jm.pause_local()                     # nothing queued, but the flag flips on
+    assert jm.is_local_paused() is True
+    jm.clear_local_pause()
+    assert jm.is_local_paused() is False  # cleared, and (unlike resume_local) re-enqueued nothing
+    print("clear_local_pause OK: pause flag lifted with no re-enqueue")
+
+
+def test_stop_pauses_nonbatch_local() -> None:
+    """A deliberate ComfyUI stop with non-batch local work in flight (card #42): the local
+    queue is paused (so crash-recovery won't fight the stop) and the queued local takes are
+    cancelled (no Resume UI). Mirrors MainWindow._pause_local_on_stop_intent without Qt wiring:
+    pause_local() + cancel_take() per held id, then clear_local_pause() once drained."""
+    import threading
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+    from store.models import STATUS_CANCELLED, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    jm = JobManager(project)
+
+    local_snap = {"backend": "comfyui"}
+    gate = threading.Event()
+    active = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+    q1 = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+    q2 = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+
+    started = {"q": False}
+    def active_runner(progress):
+        gate.wait(timeout=10)                 # held until the "stop" fires, then fails
+        raise RuntimeError("ComfyUI shut down")
+    def quick(progress):
+        started["q"] = True                   # must never run - these get cancelled
+        return {"video_path": "q.mp4"}
+
+    jm.enqueue(active.id, "comfyui", active_runner)
+    jm.enqueue(q1.id, "comfyui", quick)
+    jm.enqueue(q2.id, "comfyui", quick)
+
+    for _ in range(100):
+        if project.get_take(active.id).status == STATUS_GENERATING:
+            break
+        time.sleep(0.02)
+    assert project.get_take(active.id).status == STATUS_GENERATING
+
+    # The stop-intent path: pause the local queue, then cancel the held (queued) local takes.
+    held = jm.pause_local()
+    assert jm.is_local_paused() is True
+    assert set(held) == {q1.id, q2.id}, held
+    for tid in held:
+        assert jm.cancel_take(tid) is True
+    assert project.get_take(q1.id).status == STATUS_CANCELLED
+    assert project.get_take(q2.id).status == STATUS_CANCELLED
+
+    # The GENERATING take now fails; while paused it must NOT be requeued/restarted - it just
+    # ends terminal (FAILED here, since this stub isn't flagged via request_stop).
+    gate.set()
+    for _ in range(200):
+        if project.get_take(active.id).status == STATUS_FAILED:
+            break
+        time.sleep(0.02)
+    app.processEvents()
+    assert project.get_take(active.id).status == STATUS_FAILED, project.get_take(active.id).status
+
+    # Drained: lift the transient pause. The cancelled takes never ran.
+    jm.clear_local_pause()
+    assert jm.is_local_paused() is False
+    time.sleep(0.1)
+    assert started["q"] is False, "cancelled queued local takes must never run after a stop"
+    print("stop_pauses_nonbatch_local OK: queue paused, queued takes cancelled, no restart")
+
+
 def test_batch() -> None:
     from backends import batch
 
@@ -1425,6 +1511,8 @@ if __name__ == "__main__":
     test_abandon_local()
     test_pause_resume_local()
     test_pause_requeue_current()
+    test_clear_local_pause()
+    test_stop_pauses_nonbatch_local()
     test_total_price()
     test_cost_summary()
     test_cancel_pending()

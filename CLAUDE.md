@@ -354,9 +354,22 @@ Full mechanism + invariants in **Hard-won rule #13**.
     to PENDING) so there's no `settings_snapshot` drift. UI: a **Pause batch / Resume batch**
     toggle in the Shots-tab control strip (enabled only while `self._batch` is active; the Pause
     dialog offers *pause after current* vs *halt current & re-add*), and the **ComfyUI Status**
-    tab's *Stop working* / *Shut down* emit `stop_intent` → `MainWindow._pause_batch_if_running`
+    tab's *Stop working* / *Shut down* emit `stop_intent` → `MainWindow._pause_local_on_stop_intent`
     pauses an active batch first so the stop sticks. `held` + `paused` live on the in-memory
     `BatchRun`; `cancel_pending` clears the pause flag (aborting the whole queue). Scope: **local
     (ComfyUI) queue only** — hosted (Replicate) takes are a separate pool with no crash/restart
     issue and keep running. Pure logic is smoke-tested in `smoke_phase2` (`test_pause_resume_local`,
     `test_pause_requeue_current`, and crash_recovery case (g)).
+    **The same `stop_intent` handler also covers a non-batch local queue (card #42):** a manual
+    ComfyUI stop with single local takes in flight (queued *not* via *Generate batch…*) would
+    otherwise be fought by crash-recovery exactly like the batch case (server down → read as a
+    crash → relaunch + retry). With no batch active, `_pause_local_on_stop_intent` calls
+    `jobs.pause_local()` to set the flag (so the in-flight take fails cleanly, no restart) and
+    — since there is **no Resume UI** for single takes — `cancel_take`s each queued local take
+    (leaving them held PENDING would either zombie the queue or re-launch the server via the
+    runner's `ensure_server`). The pause is **transient**: `_on_status_changed` calls
+    `jobs.clear_local_pause()` (clears the flag, re-enqueues nothing — distinct from
+    `resume_local`) once `_local_work_in_flight()` reports the local queue has drained, so a
+    later render recovers from a genuine crash normally and the flag can't stick True. Marked by
+    `MainWindow._stop_paused_local` (reset by `cancel_pending` too). Smoke-tested in
+    `smoke_phase2` (`test_clear_local_pause`, `test_stop_pauses_nonbatch_local`).
