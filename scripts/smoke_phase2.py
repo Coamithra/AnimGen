@@ -742,7 +742,43 @@ def test_crash_recovery() -> None:
     except QueueAbandoned:
         pass
     assert len(abandons) == 1 and "restart failed" in abandons[0]
-    print("crash_recovery OK: success/retry/abandon/workflow-error/restart-fail + format_elapsed")
+
+    # (f) hardened crash signal: a single transient "down" that re-probes "up" is a workflow
+    # error, not a crash -> the failure propagates and no restart fires. We trust the first
+    # "up" reading, so the common workflow-error path still consults the server exactly once.
+    probe_seq = [False, True]   # first probe down (the race), second probe up (really alive)
+    probe_calls = [0]
+    def flaky_server_running():
+        probe_calls[0] += 1
+        return probe_seq.pop(0) if probe_seq else True
+    notes, restarts, abandons = [], [], []
+    try:
+        run_with_crash_recovery(
+            render=workflow_error, server_running=flaky_server_running,
+            restart_server=lambda: restarts.append(1),
+            note=notes.append, on_abandon=abandons.append, clock=make_clock())
+        assert False, "expected the workflow error to propagate"
+    except comfy_client.ComfyError as e:
+        assert not isinstance(e, QueueAbandoned)
+    assert not restarts and not abandons, "a transient down that re-probes up must not restart"
+    assert probe_calls[0] == 2, "should keep probing until it sees the server is up"
+
+    # ...and a server up on the very first probe is consulted exactly once (no slowdown).
+    one_probe = [0]
+    def up_once():
+        one_probe[0] += 1
+        return True
+    try:
+        run_with_crash_recovery(
+            render=workflow_error, server_running=up_once,
+            restart_server=lambda: None, note=lambda *_: None,
+            on_abandon=lambda *_: None, clock=make_clock())
+        assert False, "expected the workflow error to propagate"
+    except comfy_client.ComfyError:
+        pass
+    assert one_probe[0] == 1, "common workflow-error path must probe the server only once"
+    print("crash_recovery OK: success/retry/abandon/workflow-error/restart-fail/"
+          "transient-down + format_elapsed")
 
 
 def test_wait_until_responsive() -> None:
@@ -760,14 +796,31 @@ def test_wait_until_responsive() -> None:
 
         comfy_client.server_status = lambda timeout=2: {"running": False}  # never comes up
         assert comfy_client.wait_until_responsive(timeout_s=0, poll_s=0.0) is False
+
+        # is_alive=False short-circuits: a dead process bails out before the timeout elapses.
+        probes = [0]
+        def down(timeout=2):
+            probes[0] += 1
+            return {"running": False}
+        comfy_client.server_status = down
+        assert comfy_client.wait_until_responsive(
+            timeout_s=600, poll_s=0.0, is_alive=lambda: False) is False
+        assert probes[0] == 1, "a dead process should stop polling after the first probe"
     finally:
         comfy_client.server_status = saved_status
-    print("wait_until_responsive OK: returns on running, False on timeout")
+    print("wait_until_responsive OK: returns on running, False on timeout/dead-process")
 
 
 def test_restart_server() -> None:
-    # restart_server orchestration: stop (tolerating ComfyError) -> launch -> wait. Stub all
-    # three so no real process/socket; verify call order and the "didn't come up" failure.
+    # restart_server orchestration: stop (tolerating ComfyError) -> settle -> launch -> wait.
+    # Stub all three so no real process/socket; verify call order and the failure messages.
+    # settle_s=0 skips the real port-release sleep; launch returns a fake Popen whose poll()
+    # liveness drives the fast-fail path.
+    class FakeProc:
+        def __init__(self, returncode=None):
+            self.returncode = returncode
+        def poll(self):
+            return self.returncode      # None == still alive, int == already exited
     saved = (comfy_client.stop_server, comfy_client.launch_server,
              comfy_client.wait_until_responsive)
     order = []
@@ -776,21 +829,31 @@ def test_restart_server() -> None:
             order.append("stop")
             raise comfy_client.ComfyError("nothing to stop")   # must be swallowed
         comfy_client.stop_server = stop
-        comfy_client.launch_server = lambda extra=None: order.append("launch")
+        comfy_client.launch_server = lambda extra=None: order.append("launch") or FakeProc()
         comfy_client.wait_until_responsive = lambda *a, **k: True
-        comfy_client.restart_server()
+        comfy_client.restart_server(settle_s=0)
         assert order == ["stop", "launch"], order
 
-        comfy_client.wait_until_responsive = lambda *a, **k: False   # server never answers
+        # server never answers but the process is still alive -> "did not come back up".
+        comfy_client.wait_until_responsive = lambda *a, **k: False
         try:
-            comfy_client.restart_server(ready_timeout_s=5)
+            comfy_client.restart_server(ready_timeout_s=5, settle_s=0)
             assert False, "expected ComfyError when the server doesn't come back"
         except comfy_client.ComfyError as e:
             assert "did not come back up" in str(e)
+
+        # the relaunched process exited at once (e.g. lost the port bind) -> fast-fail message.
+        comfy_client.launch_server = lambda extra=None: FakeProc(returncode=1)
+        try:
+            comfy_client.restart_server(ready_timeout_s=5, settle_s=0)
+            assert False, "expected ComfyError when the relaunched process exits immediately"
+        except comfy_client.ComfyError as e:
+            assert "exited immediately" in str(e)
     finally:
         (comfy_client.stop_server, comfy_client.launch_server,
          comfy_client.wait_until_responsive) = saved
-    print("restart_server OK: stop(tolerant)->launch->wait; raises if unresponsive")
+    print("restart_server OK: stop(tolerant)->settle->launch->wait; "
+          "raises unresponsive/exited-immediately")
 
 
 def test_abandon_local() -> None:
