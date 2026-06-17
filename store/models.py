@@ -56,7 +56,8 @@ class Take:
     starred: bool = False
     deleted: bool = False                   # soft delete -> moved to <assets>/.bin/
     error: Optional[str] = None
-    created: str = ""
+    created: str = ""                       # when queued (added to the project)
+    started: Optional[str] = None           # when it actually began rendering (-> GENERATING)
     completed: Optional[str] = None
     backend_job_id: Optional[str] = None    # comfy prompt id / replicate prediction id;
                                             # recorded at submit so an orphaned (app-restarted)

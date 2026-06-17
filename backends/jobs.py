@@ -57,7 +57,8 @@ class GenerationJob(QRunnable):
             self.project.update_take(tid, status=STATUS_CANCELLED, error="cancelled before start")
             self.signals.status_changed.emit(tid, STATUS_CANCELLED)
             return
-        self.project.update_take(tid, status=STATUS_GENERATING)
+        self.project.update_take(tid, status=STATUS_GENERATING,
+                                 started=datetime.now().isoformat(timespec="seconds"))
         self.signals.status_changed.emit(tid, STATUS_GENERATING)
         job = self.project.add_job(tid, backend=self.backend, state="running")
 
