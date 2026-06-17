@@ -86,7 +86,8 @@ def done_elapsed(take) -> str:
 def select_rows(takes, dismissed: "frozenset[str] | set[str]" = frozenset(),
                 recent_limit: int = _RECENT_LIMIT) -> list:
     """The takes the queue shows: every active (generating/pending) take first, in queue
-    order, then the most-recently finished ones (capped at recent_limit) newest-first.
+    order, then the most-recently *added* finished ones (capped at recent_limit), reversed
+    so the latest is on top (takes arrive in list_takes() creation order, not completion order).
 
     Finished takes whose id is in `dismissed` are filtered out — that's what the Clear
     button does. Active takes are never dismissable, so a still-queued or in-flight take
@@ -94,7 +95,7 @@ def select_rows(takes, dismissed: "frozenset[str] | set[str]" = frozenset(),
     active = [t for t in takes if t.status == STATUS_GENERATING]
     active += [t for t in takes if t.status == STATUS_PENDING]
     finished = [t for t in takes if t.status in _FINISHED and t.id not in dismissed]
-    return active + finished[-recent_limit:][::-1]   # newest finished first
+    return active + finished[-recent_limit:][::-1]   # latest-added finished on top
 
 
 class QueueView(QWidget):

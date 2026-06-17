@@ -1430,9 +1430,10 @@ def test_select_rows() -> None:
     ids = [t.id for t in select_rows(takes + [newdone], dismissed)]
     assert ids == ["g", "p", "d2"], ids
 
-    # An active take is never hidden even if its id is (wrongly) in dismissed.
+    # An active take is never hidden even if its id is (wrongly) in dismissed, and a
+    # non-empty dismissed of only active ids leaves the finished tail untouched.
     ids = [t.id for t in select_rows(takes, {"g", "p"})]
-    assert "g" in ids and "p" in ids, ids
+    assert ids == ["g", "p", "c", "f", "d"], ids
 
     # recent_limit caps the finished tail, newest-first.
     many = [Take(id=f"x{i}", shot_id="s", status=STATUS_DONE) for i in range(20)]
