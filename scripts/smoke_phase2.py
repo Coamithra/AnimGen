@@ -902,6 +902,54 @@ def test_restart_server() -> None:
           "raises unresponsive/exited-immediately")
 
 
+def test_ensure_server() -> None:
+    # ensure_server: cold-start ComfyUI before a render if it's down, no-op if already up.
+    # Stub server_status / launch_server / wait_until_responsive so there's no real
+    # process/socket; verify the no-launch, launch, and two failure paths.
+    class FakeProc:
+        def __init__(self, returncode=None):
+            self.returncode = returncode
+        def poll(self):
+            return self.returncode      # None == still alive, int == already exited
+
+    saved = (comfy_client.server_status, comfy_client.launch_server,
+             comfy_client.wait_until_responsive)
+    launched = []
+    try:
+        # already running -> returns True, never launches.
+        comfy_client.server_status = lambda timeout=2: {"running": True}
+        comfy_client.launch_server = lambda extra=None: launched.append("launch") or FakeProc()
+        comfy_client.wait_until_responsive = lambda *a, **k: True
+        assert comfy_client.ensure_server() is True
+        assert launched == [], launched
+
+        # down -> launches, waits, returns False.
+        comfy_client.server_status = lambda timeout=2: {"running": False}
+        assert comfy_client.ensure_server() is False
+        assert launched == ["launch"], launched
+
+        # launched but never answers while the process stays alive -> "did not become responsive".
+        comfy_client.wait_until_responsive = lambda *a, **k: False
+        try:
+            comfy_client.ensure_server(ready_timeout_s=5)
+            assert False, "expected ComfyError when the launched server never answers"
+        except comfy_client.ComfyError as e:
+            assert "did not become responsive" in str(e)
+
+        # launched process exited at once (e.g. lost the port bind) -> fast-fail message.
+        comfy_client.launch_server = lambda extra=None: FakeProc(returncode=1)
+        try:
+            comfy_client.ensure_server(ready_timeout_s=5)
+            assert False, "expected ComfyError when the launched process exits immediately"
+        except comfy_client.ComfyError as e:
+            assert "exited immediately" in str(e)
+    finally:
+        (comfy_client.server_status, comfy_client.launch_server,
+         comfy_client.wait_until_responsive) = saved
+    print("ensure_server OK: no-op when up; launch+wait when down; "
+          "raises unresponsive/exited-immediately")
+
+
 def test_abandon_local() -> None:
     import threading
     import time
@@ -1103,6 +1151,7 @@ if __name__ == "__main__":
     test_crash_recovery()
     test_wait_until_responsive()
     test_restart_server()
+    test_ensure_server()
     test_abandon_local()
     test_total_price()
     test_cost_summary()

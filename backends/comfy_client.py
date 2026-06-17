@@ -236,6 +236,33 @@ def restart_server(progress_cb: ProgressCb = None, ready_timeout_s: int = 120,
     _log(progress_cb, "ComfyUI restarted - retrying take")
 
 
+def ensure_server(progress_cb: ProgressCb = None, ready_timeout_s: int = 120) -> bool:
+    """Make sure a local ComfyUI is up before a render, launching it if it's down.
+
+    Returns True if it was already running, False if we had to start it. Raises ComfyError
+    if the install isn't found or the launched server never becomes responsive within
+    ready_timeout_s. A server we launch always gets the required safe flags
+    (--disable-dynamic-vram --cache-none via build_launch_command), so a cold-started server
+    is never the misconfigured kind preflight would reject.
+
+    Called once before the crash-recovery loop (ui.main_window._make_runner) so a cold start
+    is an honest "starting ComfyUI" step, not a server-down failure misread as a crash and
+    laundered through the retry path. Distinct from restart_server: there's no live process to
+    stop first, just a launch + wait (it reuses the same launch/wait building blocks).
+    """
+    if server_status()["running"]:
+        return True
+    _log(progress_cb, "ComfyUI is not running - starting it (this can take a minute)...")
+    proc = launch_server()            # detached, with --disable-dynamic-vram --cache-none
+    if not wait_until_responsive(ready_timeout_s, is_alive=lambda: proc.poll() is None):
+        if proc.poll() is not None:   # exited without ever answering (likely a port-bind loss)
+            raise ComfyError(f"ComfyUI exited immediately on launch (exit {proc.returncode}); "
+                             "see data/comfyui_server.log.")
+        raise ComfyError(f"ComfyUI did not become responsive within {ready_timeout_s}s of launch.")
+    _log(progress_cb, "ComfyUI started - beginning render")
+    return False
+
+
 def monitor_snapshot(timeout: int = 2) -> dict:
     """One-shot gather of live ComfyUI state for the monitor window. Non-raising.
 
