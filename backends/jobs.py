@@ -39,7 +39,7 @@ class _JobSignals(QObject):
 
 class GenerationJob(QRunnable):
     def __init__(self, project: Project, take_id: str, backend: str, runner: Runner,
-                 signals: _JobSignals, cancelled: set):
+                 signals: _JobSignals, cancelled: set, stopping: set):
         super().__init__()
         self.project = project
         self.take_id = take_id
@@ -47,6 +47,7 @@ class GenerationJob(QRunnable):
         self.runner = runner
         self.signals = signals
         self.cancelled = cancelled   # shared with JobManager; ids cancelled while queued
+        self.stopping = stopping     # shared; ids whose in-flight render was asked to stop
 
     @Slot()
     def run(self) -> None:
@@ -83,10 +84,21 @@ class GenerationJob(QRunnable):
             self.signals.finished.emit(tid)
         except Exception as e:  # noqa: BLE001 - surface any backend failure on the take
             err = f"{type(e).__name__}: {e}"
-            self.project.update_take(tid, status=STATUS_FAILED, error=err)
-            self.project.update_job(job.id, state="failed", log="\n".join(log_lines + [err]))
-            self.signals.status_changed.emit(tid, STATUS_FAILED)
-            self.signals.failed.emit(tid, err)
+            if tid in self.stopping or tid in self.cancelled:
+                # The backend error is here because we asked it to stop (shot deleted /
+                # cancelled mid-render), not because the render failed - record CANCELLED.
+                self.project.update_take(tid, status=STATUS_CANCELLED,
+                                         error="stopped by user")
+                self.project.update_job(job.id, state="cancelled",
+                                        log="\n".join(log_lines + [err]))
+                self.signals.status_changed.emit(tid, STATUS_CANCELLED)
+            else:
+                self.project.update_take(tid, status=STATUS_FAILED, error=err)
+                self.project.update_job(job.id, state="failed", log="\n".join(log_lines + [err]))
+                self.signals.status_changed.emit(tid, STATUS_FAILED)
+                self.signals.failed.emit(tid, err)
+        finally:
+            self.stopping.discard(tid)
 
 
 class JobManager(QObject):
@@ -111,6 +123,7 @@ class JobManager(QObject):
         self._local_pool = QThreadPool()
         self._local_pool.setMaxThreadCount(1)  # one GPU - serialize local renders
         self._cancelled: set[str] = set()      # take ids cancelled while still queued
+        self._stopping: set[str] = set()       # take ids whose in-flight render we stopped
 
     def set_project(self, project: Project) -> None:
         """Point the queue at a newly opened/created project."""
@@ -118,7 +131,7 @@ class JobManager(QObject):
 
     def enqueue(self, take_id: str, backend: str, runner: Runner) -> None:
         job = GenerationJob(self.project, take_id, backend, runner, self._signals,
-                            self._cancelled)
+                            self._cancelled, self._stopping)
         pool = self._local_pool if backend == "comfyui" else self._hosted_pool
         pool.start(job)
 
@@ -143,6 +156,50 @@ class JobManager(QObject):
         self._cancelled.add(take_id)
         self.project.update_take(take_id, status=STATUS_CANCELLED, error="cancelled by user")
         self._signals.status_changed.emit(take_id, STATUS_CANCELLED)
+        return True
+
+    def cancel_shot_takes(self, shot_id: str) -> int:
+        """Cancel every still-PENDING take of one shot; return how many were cancelled.
+
+        Used when a shot is deleted: its queued takes would otherwise fire the backend
+        after the shot is gone and orphan their .mp4 in .assets/takes/. Only PENDING takes
+        are touched here - a GENERATING one is mid-render and must be stopped via
+        `request_stop`. Other shots' queued takes are left alone.
+        """
+        n = 0
+        for t in self.project.list_takes(shot_id, include_deleted=True):
+            if t.status == STATUS_PENDING:
+                self._cancelled.add(t.id)
+                self.project.update_take(t.id, status=STATUS_CANCELLED,
+                                         error="cancelled by user (shot deleted)")
+                self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
+                n += 1
+        return n
+
+    def request_stop(self, take_id: str) -> bool:
+        """Stop an in-flight (GENERATING) render and return whether we acted.
+
+        Flags the take in `_stopping` (so the worker records CANCELLED, not FAILED, when
+        its poll loop unwinds) and issues the backend-side stop so spend/GPU actually
+        halts: ComfyUI's interrupt for a local prompt, Replicate's cancel for a hosted
+        prediction. The backend call is best-effort - a server that's already down or a
+        prediction that already finished must not raise out of a delete. Imports the
+        backends lazily to keep this module import-light.
+        """
+        t = self.project.get_take(take_id)
+        if not t or t.status != STATUS_GENERATING:
+            return False
+        self._stopping.add(take_id)
+        backend = (t.settings_snapshot or {}).get("backend")
+        try:
+            if backend == "comfyui":
+                from backends import comfy_client
+                comfy_client.stop_work()
+            elif backend == "replicate" and t.backend_job_id:
+                from backends import replicate_client
+                replicate_client.cancel_prediction(t.backend_job_id)
+        except Exception:  # noqa: BLE001 - best-effort; the worker still unwinds to CANCELLED
+            pass
         return True
 
     def cancel_pending(self) -> int:
