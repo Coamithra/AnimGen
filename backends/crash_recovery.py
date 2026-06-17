@@ -23,11 +23,29 @@ from __future__ import annotations
 from typing import Callable
 
 MAX_ATTEMPTS = 3   # total tries per take before the whole local queue is abandoned
+CRASH_PROBES = 3   # times to reconfirm "server down" before treating a failure as a crash
 
 
 class QueueAbandoned(RuntimeError):
     """A take crashed MAX_ATTEMPTS times (or the server couldn't be restarted); the caller
     should pause the local queue rather than keep restarting ComfyUI."""
+
+
+def _looks_crashed(server_running: Callable[[], bool], probes: int) -> bool:
+    """Did the render fail because ComfyUI *crashed* (server down) or because of a genuine
+    *workflow error* (server up)?
+
+    A single post-failure probe can race a transient blip - a momentarily slow `/system_stats`
+    on a still-alive server would be misread as a crash and trigger a spurious restart. So a
+    "down" reading is reconfirmed up to `probes` times before we commit to a restart. The first
+    "up" reading is trusted immediately and returns False, which keeps the common workflow-error
+    path to a single probe (no slowdown). On a genuinely down server each probe already blocks a
+    full socket timeout (SYNs to the closed port are dropped, not refused - see CLAUDE.md), so
+    the reconfirmation is naturally spaced without an explicit sleep."""
+    for _ in range(max(1, probes)):
+        if server_running():
+            return False     # server answered -> genuine workflow error, not a crash
+    return True              # down on every probe -> crashed
 
 
 def format_elapsed(secs: int) -> str:
@@ -53,11 +71,14 @@ def run_with_crash_recovery(
     on_abandon: Callable[[str], None],
     clock: Callable[[], float],
     max_attempts: int = MAX_ATTEMPTS,
+    crash_probes: int = CRASH_PROBES,
 ) -> dict:
     """Run one local render with crash detection + auto-restart + retry.
 
     render          -> the render result dict; raises on any failure.
     server_running  -> True if ComfyUI is up *right now* (the crash signal: down == crashed).
+                       Reconfirmed up to `crash_probes` times on a "down" reading before we
+                       commit to a restart (see _looks_crashed); a single "up" is trusted.
     restart_server  -> stop + relaunch ComfyUI, blocking until responsive; raises if it can't.
     note            -> log a milestone line (surfaced on the take in the queue + the main log).
     on_abandon      -> pause the rest of the local queue with this reason (called once, before
@@ -73,7 +94,7 @@ def run_with_crash_recovery(
         try:
             return render()
         except Exception as exc:  # noqa: BLE001 - any render failure is inspected below
-            if server_running():
+            if not _looks_crashed(server_running, crash_probes):
                 raise                      # server alive -> genuine workflow error, not a crash
             elapsed = format_elapsed(int(clock() - t0))
             if attempt >= max_attempts:

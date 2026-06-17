@@ -178,24 +178,35 @@ def launch_server(extra: Optional[list[str]] = None) -> "subprocess.Popen":
     return proc
 
 
-def wait_until_responsive(timeout_s: int = 120, poll_s: float = 2.0) -> bool:
+def wait_until_responsive(timeout_s: int = 120, poll_s: float = 2.0,
+                          is_alive: Optional[Callable[[], bool]] = None) -> bool:
     """Block until the local ComfyUI answers /system_stats (running) or `timeout_s` elapses.
 
     Returns whether it came up. Used by restart_server after a crash relaunch. Each probe
     eats a full socket timeout while the port is still closed (SYNs to a closed port are
     dropped, not refused, on this machine - see CLAUDE.md), so server_status's own short
     timeout doubles as the inter-poll wait; poll_s is a small extra breather between probes.
+
+    is_alive (optional) is the liveness of the process we're waiting on: when it returns
+    False we bail out immediately rather than polling a dead server for the full timeout
+    (e.g. a relaunch that couldn't bind the port and exited at once).
     """
     deadline = time.time() + timeout_s
     while True:
         if server_status(timeout=2)["running"]:
             return True
+        if is_alive is not None and not is_alive():
+            return False              # the process we were waiting on died; stop polling
         if time.time() >= deadline:
             return False
         time.sleep(poll_s)
 
 
-def restart_server(progress_cb: ProgressCb = None, ready_timeout_s: int = 120) -> None:
+RESTART_SETTLE_S = 2.0   # let the OS release COMFY_PORT after a kill before we rebind it
+
+
+def restart_server(progress_cb: ProgressCb = None, ready_timeout_s: int = 120,
+                   settle_s: float = RESTART_SETTLE_S) -> None:
     """Stop the current ComfyUI (ours, or whatever's on the port) and relaunch a fresh one
     with the required safe flags, blocking until it's responsive.
 
@@ -203,14 +214,24 @@ def restart_server(progress_cb: ProgressCb = None, ready_timeout_s: int = 120) -
     back. launch_server() always re-applies --disable-dynamic-vram (build_launch_command), so
     the relaunched server also fixes the crash's root cause. Raises ComfyError if the install
     can't be found or the server doesn't answer within ready_timeout_s.
+
+    A short settle after the kill gives the OS time to release COMFY_PORT before the relaunch
+    rebinds it - otherwise the new process loses the bind, exits, and we'd otherwise stall the
+    full ready_timeout_s before reporting failure. We also watch the relaunched process so a
+    bind failure (or any immediate exit) fails fast instead of waiting out that timeout.
     """
     _log(progress_cb, "comfy crash detected - restarting ComfyUI")
     try:
         stop_server()                 # kill our proc or whatever holds the port; ok if down
     except ComfyError:
         pass
-    launch_server()                   # detached, with --disable-dynamic-vram --cache-none
-    if not wait_until_responsive(ready_timeout_s):
+    if settle_s > 0:
+        time.sleep(settle_s)          # let the OS release the port before we rebind it
+    proc = launch_server()            # detached, with --disable-dynamic-vram --cache-none
+    if not wait_until_responsive(ready_timeout_s, is_alive=lambda: proc.poll() is None):
+        if proc.poll() is not None:   # exited without ever answering (likely a port-bind loss)
+            raise ComfyError(f"ComfyUI exited immediately on restart (exit {proc.returncode}); "
+                             "see data/comfyui_server.log.")
         raise ComfyError(f"ComfyUI did not come back up within {ready_timeout_s}s of restart.")
     _log(progress_cb, "ComfyUI restarted - retrying take")
 
