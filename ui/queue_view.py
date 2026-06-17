@@ -72,6 +72,16 @@ def _elapsed(created: str, completed: str) -> str:
     return f"{s}s"
 
 
+def done_elapsed(take) -> str:
+    """Render-duration label for a finished take: started -> completed.
+
+    Falls back to created -> completed only for takes generated before `started` was
+    recorded. Using `created` for current takes would be wrong: the serialized local queue
+    stamps every take's `created` at batch launch, so a later take's created -> completed
+    span is its cumulative queue wait, not how long it actually rendered."""
+    return _elapsed(take.started or take.created, take.completed)
+
+
 class QueueView(QWidget):
     def __init__(self, project: Project, jobs, parent=None):
         super().__init__(parent)
@@ -159,7 +169,7 @@ class QueueView(QWidget):
         if take.status == STATUS_FAILED and take.error:
             text = take.error
         elif take.status == STATUS_DONE:
-            elapsed = _elapsed(take.created, take.completed)
+            elapsed = done_elapsed(take)
             text = f"done in {elapsed}" if elapsed else "done"
         else:
             text = ""

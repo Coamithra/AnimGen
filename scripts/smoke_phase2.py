@@ -411,6 +411,7 @@ def test_job_manager() -> None:
 
     got_ok = project.get_take(ok.id)
     assert got_ok.status == STATUS_DONE and got_ok.video_path == "x.mp4" and got_ok.fps == 16.0
+    assert got_ok.started, "run() must stamp `started` at the GENERATING transition"
     got_bad = project.get_take(bad.id)
     assert got_bad.status == STATUS_FAILED and "boom" in (got_bad.error or "")
     assert ok.id in done and any(tid == bad.id for tid, _ in failed)
@@ -1201,6 +1202,39 @@ def test_batch_finalize() -> None:
     print("batch finalize OK: drain->report+power, partial pending no-op, abandon neutralizes")
 
 
+def test_done_elapsed() -> None:
+    from ui.queue_view import done_elapsed
+    from store.models import Take
+
+    # The fix: "done in X" is render duration (started -> completed), NOT queue wait
+    # (created -> completed). The serialized local queue stamps every take's `created` at
+    # batch launch, so a late take's created->completed is its cumulative wait (e.g. 1h34m),
+    # not the ~6m it actually rendered.
+    t = Take(id="t", shot_id="s",
+             created="2026-06-17T19:06:00",        # queued at batch launch
+             started="2026-06-17T20:35:00",        # began rendering ~1.5h later
+             completed="2026-06-17T20:40:50")
+    assert done_elapsed(t) == "5m50s", done_elapsed(t)
+    # Legacy take generated before `started` existed: fall back to created -> completed.
+    legacy = Take(id="t2", shot_id="s",
+                  created="2026-06-17T20:35:00", completed="2026-06-17T20:35:30")
+    assert done_elapsed(legacy) == "30s", done_elapsed(legacy)
+    # No completed yet -> "" so the caller shows a bare "done".
+    assert done_elapsed(Take(id="t3", shot_id="s", created="2026-06-17T20:35:00")) == ""
+
+    # `started` round-trips through takes.json, and a dict lacking it (old file) loads as None.
+    proj = Project.new()
+    sh = proj.add_shot("idle", model_id="seedance-2.0-std")
+    tk = proj.add_take(sh.id, status=STATUS_PENDING)
+    proj.update_take(tk.id, started="2026-06-17T20:35:00")
+    d = proj._take_to_dict(proj.get_take(tk.id))
+    assert d["started"] == "2026-06-17T20:35:00"
+    assert proj._take_from_dict(d).started == "2026-06-17T20:35:00"
+    d.pop("started")
+    assert proj._take_from_dict(d).started is None
+    print("done_elapsed OK: render time from started, created fallback, started persists")
+
+
 if __name__ == "__main__":
     test_build_input()
     test_capability_sync()
@@ -1230,6 +1264,7 @@ if __name__ == "__main__":
     test_progress_fraction()
     test_client_id_in_queue()
     test_progress_pct()
+    test_done_elapsed()
     test_batch()
     test_batch_finalize()
     print("PHASE 2 SMOKE: PASS")
