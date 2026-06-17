@@ -955,6 +955,139 @@ def test_abandon_local() -> None:
     print("abandon_local OK: local pending cancelled, running + hosted untouched, signal fired")
 
 
+def test_batch() -> None:
+    from backends import batch
+
+    class _Shot:
+        def __init__(self, name, model_id, start_frame="a.png", aspect=None, settings=None):
+            self.name = name
+            self.model_id = model_id
+            self.start_frame = start_frame
+            self.crop = {"aspect": aspect} if aspect else {}
+            self.settings = settings or {}
+
+    models = {
+        "good": {"display_name": "Good", "backend": "replicate",
+                 "default_params": {"duration": 4}},
+        "local": {"display_name": "Local", "backend": "comfyui", "default_params": {}},
+    }
+    aspects = {"good": ["1:1", "16:9"], "local": ["1:1"]}
+    model_of = lambda s: models.get(s.model_id)              # noqa: E731
+    aspects_of = lambda mid: aspects.get(mid, [])            # noqa: E731
+    est_of = lambda mid, settings: None if mid == "local" else 0.5   # noqa: E731
+
+    shots = [
+        _Shot("ok1", "good", aspect="1:1"),
+        _Shot("ok2", "local", aspect="1:1"),
+        _Shot("bad_model", "nope"),
+        _Shot("bad_aspect", "good", aspect="9:21"),
+        _Shot("no_frame", "good", start_frame=""),
+    ]
+    plan = batch.plan_batch(shots, takes_per_shot=3, model_of=model_of,
+                            aspects_of=aspects_of, est_of=est_of)
+    assert len(plan.eligible) == 2, plan.eligible
+    assert plan.take_count == 6 and len(plan.items) == 6
+    it = plan.items[0]
+    assert set(it) >= {"name", "model_display", "backend", "est_cost", "params"}
+    assert {n for n, _ in plan.skipped} == {"bad_model", "bad_aspect", "no_frame"}
+    ok1_item = next(i for i in plan.items if i["name"] == "ok1")
+    assert ok1_item["params"].get("duration") == 4   # default_params merged into settings
+
+    # takes_per_shot floors at 1
+    assert batch.plan_batch([shots[0]], takes_per_shot=0, model_of=model_of,
+                            aspects_of=aspects_of, est_of=est_of).take_count == 1
+
+    # BatchRun completion: terminal-only, complete when all takes drained
+    run = batch.BatchRun(take_ids={"a", "b"}, power_action=batch.POWER_NONE, started="t0")
+    assert not run.complete
+    run.mark("a", "generating")          # non-terminal -> ignored
+    assert run.remaining == {"a", "b"}
+    run.mark("a", "done")
+    run.mark("x", "done")                # not in batch -> ignored
+    assert run.remaining == {"b"} and not run.complete
+    run.mark("b", "cancelled")
+    assert run.complete
+
+    rows = [{"name": "ok1", "status": "done", "cost_actual": 0.5},
+            {"name": "ok2", "status": "failed", "cost_actual": None},
+            {"name": "ok3", "status": "cancelled", "cost_actual": None},
+            {"name": "ok4", "status": "generating", "cost_actual": None}]  # non-canonical branch
+    rep = batch.build_batch_report(rows, started="t0", finished="t1",
+                                   power_action=batch.POWER_SLEEP)
+    for token in ("done", "failed", "cancelled", "generating", "$0.50", "sleep", "t0", "t1"):
+        assert token in rep, token
+
+    cmd = batch.sleep_command()
+    assert cmd and isinstance(cmd, list)
+    print("batch OK: plan eligibility/N-per-shot, BatchRun completion, report, sleep cmd")
+
+
+def test_batch_finalize() -> None:
+    import tempfile
+    from pathlib import Path
+
+    from PySide6.QtWidgets import QApplication
+
+    from PySide6.QtWidgets import QMessageBox
+
+    import paths
+    from backends import batch
+    from store.models import STATUS_CANCELLED
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    reports_dir = Path(tempfile.mkdtemp())
+    orig_exports, paths.EXPORTS_DIR = paths.EXPORTS_DIR, reports_dir
+    # _on_queue_abandoned pops a modal warning (correct in the real GUI); stub it so the
+    # headless test doesn't block on .exec() (hard-won rule 4).
+    orig_warn = QMessageBox.warning
+    QMessageBox.warning = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok)
+    try:
+        project = Project.new()
+        shot = project.add_shot("kick", model_id="seedance-2.0-std")
+        t1 = project.add_take(shot.id, status=STATUS_PENDING)
+        t2 = project.add_take(shot.id, status=STATUS_PENDING)
+        win = MainWindow(project)
+
+        fired = []
+        win._perform_power_action = lambda action: fired.append(action)
+        win._batch = batch.BatchRun(take_ids={t1.id, t2.id},
+                                    power_action=batch.POWER_SLEEP, started="t0")
+
+        project.update_take(t1.id, status=STATUS_DONE)
+        win._on_status_changed(t1.id, STATUS_DONE)
+        assert win._batch is not None and not fired   # one still pending -> no finalize yet
+
+        project.update_take(t2.id, status=STATUS_FAILED)
+        win._on_status_changed(t2.id, STATUS_FAILED)
+        assert win._batch is None, "batch should clear once all takes terminal"
+        assert fired == [batch.POWER_SLEEP], fired
+        written = list(reports_dir.glob("overnight_*.txt"))
+        assert len(written) == 1, written
+        body = written[0].read_text(encoding="utf-8")
+        assert "done" in body and "failed" in body and "kick" in body
+
+        # queue_abandoned mid-batch neutralizes the power action but still finalizes/reports.
+        project2 = Project.new()
+        s2 = project2.add_shot("punch", model_id="seedance-2.0-std")
+        a1 = project2.add_take(s2.id, status=STATUS_PENDING)
+        win2 = MainWindow(project2)
+        fired2 = []
+        win2._perform_power_action = lambda action: fired2.append(action)
+        win2._batch = batch.BatchRun(take_ids={a1.id},
+                                     power_action=batch.POWER_SLEEP, started="t0")
+        win2._on_queue_abandoned("crashed; pausing")
+        assert win2._batch is not None and win2._batch.power_action == batch.POWER_NONE
+        project2.update_take(a1.id, status=STATUS_CANCELLED)
+        win2._on_status_changed(a1.id, STATUS_CANCELLED)
+        assert win2._batch is None and fired2 == [], "abandon must neutralize the power action"
+        assert len(list(reports_dir.glob("overnight_*.txt"))) == 2  # report still written
+    finally:
+        paths.EXPORTS_DIR = orig_exports
+        QMessageBox.warning = orig_warn
+    print("batch finalize OK: drain->report+power, partial pending no-op, abandon neutralizes")
+
+
 if __name__ == "__main__":
     test_build_input()
     test_capability_sync()
@@ -982,4 +1115,6 @@ if __name__ == "__main__":
     test_progress_fraction()
     test_client_id_in_queue()
     test_progress_pct()
+    test_batch()
+    test_batch_finalize()
     print("PHASE 2 SMOKE: PASS")
