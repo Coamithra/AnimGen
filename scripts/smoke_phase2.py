@@ -624,6 +624,36 @@ def test_progress_fraction() -> None:
     print("progress_fraction OK: progress/progress_state/executing parsed, prompt_id filtered")
 
 
+def test_sampler_step_plan() -> None:
+    from backends.comfy_client import sampler_step_plan, progress_fraction as pf
+
+    # Wan 2.2 two-expert split: node 12 does steps 0..10, node 13 does 10..20 (steps=20 each).
+    wf = {"12": {"class_type": "KSamplerAdvanced",
+                 "inputs": {"steps": 20, "start_at_step": 0, "end_at_step": 10}},
+          "13": {"class_type": "KSamplerAdvanced",
+                 "inputs": {"steps": 20, "start_at_step": 10, "end_at_step": 10000}},
+          "9": {"class_type": "SaveImage", "inputs": {}}}
+    plan = sampler_step_plan(wf)
+    assert plan == {"12": (0, 20), "13": (10, 20)}, plan
+
+    # stage 1 mid-run -> continuous count, not 0..10
+    assert pf({"type": "progress", "data": {"value": 5, "max": 10, "node": "12", "prompt_id": "p1"}},
+              "p1", plan) == (0.25, "step 5/20")
+    # stage 2 mid-run -> picks up where stage 1 left off (no restart to 0)
+    assert pf({"type": "progress_state",
+               "data": {"prompt_id": "p1",
+                        "nodes": {"12": {"value": 10, "max": 10},        # finished
+                                  "13": {"value": 4, "max": 10}}}},      # running
+              "p1", plan) == (0.7, "step 14/20")
+
+    # single-sampler workflow -> empty plan -> raw per-node behaviour preserved
+    assert sampler_step_plan({"3": {"class_type": "KSampler", "inputs": {"steps": 25}}}) == {}
+    # no plan / node not in plan -> unchanged value/max
+    assert pf({"type": "progress", "data": {"value": 5, "max": 10, "node": "99"}}, "p1", plan) \
+        == (0.5, "step 5/10")
+    print("sampler_step_plan OK: 2-expert chain maps to one continuous 0..total step count")
+
+
 def test_client_id_in_queue() -> None:
     from backends.comfy_client import _client_id_in_queue as cid
 
@@ -1629,6 +1659,7 @@ if __name__ == "__main__":
     test_is_stop_requested()
     test_job_manager()
     test_progress_fraction()
+    test_sampler_step_plan()
     test_client_id_in_queue()
     test_progress_pct()
     test_done_elapsed()
