@@ -13,6 +13,7 @@ discarding); finished takes auto-persist (see store/project.py).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -103,6 +104,8 @@ class MainWindow(QMainWindow):
         self.reload()
         self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
         self._maybe_refresh_schemas_on_startup()
+        self._remote = None
+        self._maybe_start_remote()   # opt-in localhost control server (ANIMGEN_REMOTE)
 
     # ---- construction ---------------------------------------------------
     def _build_controls(self) -> QToolBar:
@@ -112,9 +115,11 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         tb.addWidget(QLabel(" Model: "))
         self.model_filter = QComboBox()
+        self.model_filter.setObjectName("modelFilter")
         self.model_filter.currentIndexChanged.connect(self.reload)
         tb.addWidget(self.model_filter)
         self.starred_filter = QCheckBox("Starred only")
+        self.starred_filter.setObjectName("starredFilter")
         self.starred_filter.stateChanged.connect(self.reload)
         tb.addWidget(self.starred_filter)
         exp_view = QAction("Export view", self)
@@ -192,6 +197,22 @@ class MainWindow(QMainWindow):
         if app_settings.get_bool(app_settings.UPDATE_SCHEMAS_ON_STARTUP):
             self.library_tab.start_schema_fetch()
 
+    def _maybe_start_remote(self) -> None:
+        """Start the opt-in localhost control server (lets an external agent drive the GUI:
+        screenshot / snapshot / click / type). Off unless ANIMGEN_REMOTE is truthy; binds
+        127.0.0.1 only. See remote/server.py."""
+        flag = os.environ.get("ANIMGEN_REMOTE", "").strip().lower()
+        if flag in ("", "0", "false", "no", "off"):
+            return
+        try:
+            from remote.server import RemoteControlServer
+            self._remote = RemoteControlServer(self)
+            port = self._remote.start()
+            self._log(f"Remote control listening on http://127.0.0.1:{port}")
+        except Exception as exc:  # noqa: BLE001 - never block startup on the dev-only server
+            self._log(f"Remote control failed to start: {exc}")
+            self._remote = None
+
     def _build_body(self) -> None:
         self.cards_container = QWidget()
         self.cards_layout = QVBoxLayout(self.cards_container)
@@ -224,6 +245,7 @@ class MainWindow(QMainWindow):
                             (self.comfy_tab, "ComfyUI Status")]
 
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainTabs")
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         for widget, title in self._fixed_tabs:
@@ -619,6 +641,7 @@ class MainWindow(QMainWindow):
             "workflow_template": model.get("workflow_template"),
             "start_frame": shot.start_frame, "end_frame": shot.end_frame,
             "prompt": shot.prompt, "negative_prompt": shot.negative_prompt, "settings": settings,
+            "canvas": [shot.canvas_w, shot.canvas_h], "crop": shot.crop,
         }
         take = self.project.add_take(shot.id, status=STATUS_PENDING,
                                      seed=settings.get("seed"), cost_estimate=est,
@@ -781,10 +804,20 @@ class MainWindow(QMainWindow):
             data_uri = model.get("requires_data_uri", False)
             extra = {k: v for k, v in settings.items() if k not in _EXPLICIT_SETTINGS}
 
-            def on_submit(pid):   # persist the prediction id so a delete-while-rendering
-                self.project.update_take(take_id, backend_job_id=pid)  # can cancel it
-
             def runner(progress):
+                def on_submit(pid):
+                    # Record the prediction id NOW so a delete/stop mid-render can cancel it.
+                    self.project.update_take(take_id, backend_job_id=pid)
+                    # Close the create-POST window: if a stop was requested before the id
+                    # existed, request_stop's cancel was skipped - self-cancel here (best-effort)
+                    # so a prediction that would otherwise succeed and orphan its .mp4 halts spend.
+                    if self.jobs.is_stop_requested(take_id):
+                        progress("stop requested during submit - cancelling prediction")
+                        try:
+                            replicate_client.cancel_prediction(pid)
+                        except Exception:  # noqa: BLE001 - best-effort, mirrors request_stop
+                            pass
+
                 start_kp, end_kp = framing.render_keyposes(shot, tempfile.mkdtemp(prefix="animgen_kp_"))
                 return replicate_client.generate(
                     rid, start=start_kp, end=end_kp, prompt=shot.prompt,
@@ -1038,6 +1071,8 @@ class MainWindow(QMainWindow):
         if not self._maybe_save_changes():
             event.ignore()
             return
+        if self._remote is not None:
+            self._remote.stop()
         self.comfy_tab.stop_monitoring()
         super().closeEvent(event)
 

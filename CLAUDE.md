@@ -23,7 +23,8 @@ references assets for its start/end keyframes.
 
 ## Status (2026-06-16)
 
-Built in 6 phases, **all 6 headless smoke suites pass** (`scripts/smoke_phase1-6.py`).
+Built in 6 phases, **all 7 headless smoke suites pass** (`scripts/smoke_phase1-7.py`;
+phase 7 covers the `remote/` control server).
 Storage is **file-based `.animproj` documents** (Project → Shots → Takes), replacing the
 old single SQLite DB. Shots reference **assets** (keyframe images imported into the
 project's `.assets/`); the 1254² contract keypose is framed **at generation time** from
@@ -39,16 +40,44 @@ and a live local take. The backends are verified offline only.
 .venv/Scripts/python.exe app.py                      # launch the app (Windows)
 
 # headless smoke tests (no spend, no GPU, no real renderer)
-for n in 1 2 3 4 5 6; do QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
+for n in 1 2 3 4 5 6 7; do QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
   .venv/Scripts/python.exe scripts/smoke_phase$n.py; done
 
 # (re)build the starter project from the shipped-move manifest (idempotent;
 # delete data/Fighter.animproj + data/Fighter.assets first for a clean rebuild)
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/seed_configs.py
+
+# live-drive the running GUI without full-PC control (see "Driving the app" below)
+ANIMGEN_REMOTE=1 .venv/Scripts/python.exe app.py        # launch with the control server
+python scripts/remote_cli.py snapshot                  # list drivable widgets
+python scripts/remote_cli.py shot out.png              # screenshot the window
+python scripts/remote_cli.py set --ref mainTabs --value Assets   # switch tab
 ```
 
 Setup if `.venv` is missing: `python -m venv .venv` then
 `.venv/Scripts/python.exe -m pip install -r requirements.txt`.
+
+### Driving the app (agents: use this to live-test, don't ask for PC control)
+
+**If you (an agent) need to interactively test the GUI — click things, switch tabs,
+read on-screen state, take screenshots — use the built-in control server, NOT desktop
+computer-use / full-PC-control.** It's the supported flow and scoped to AnimGen:
+
+1. Launch with the server on: `ANIMGEN_REMOTE=1 .venv/Scripts/python.exe app.py`
+   (background it; it logs `Remote control listening on http://127.0.0.1:<port>`,
+   default 8765 via `ANIMGEN_REMOTE_PORT`).
+2. Drive it with `scripts/remote_cli.py` (or `curl`): `snapshot` (DOM-like widget list),
+   `shot <file>` (PNG screenshot via `QWidget.grab()`), `click`/`type`/`key`/`set`
+   targeting a widget by `--ref` / `--object-name` / `--text`.
+3. Read the PNG back to *see* the result; re-`snapshot` to confirm state.
+4. Stop it by `taskkill //F //PID <pid>` for **that** instance's port (find it with
+   `netstat -ano | grep :<port>` — never blanket-kill `python.exe`, other agents share it).
+
+Still the rules: **a live hosted/local *take* spends money / GPU — explicit go-ahead only.**
+Driving the UI (tabs, framing, dialogs) is free; only the Generate launch costs. The
+cost-confirm gate still appears and must be driven, never bypassed. Headless `smoke_phase*`
+remains the gate for logic; the control server is for *interactive* UI verification.
+Full mechanism + invariants in **Hard-won rule #13**.
 
 ## Architecture map
 
@@ -62,7 +91,7 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 | `backends/comfy_client.py` | local ComfyUI generation (node-role mapping); also server lifecycle/status/preflight: `launch_server` (tracks the Popen in `_server_proc`), `stop_work` (interrupt+clear queue), `stop_server` (terminate ours, else kill by port via `_pid_on_port`/`_kill_pid`), `server_status`, `monitor_snapshot`, `list_models`, `build_launch_command`, `preflight`, `dynamic_vram_enabled`; plus crash-recovery lifecycle: `wait_until_responsive` (poll `server_status` until the server answers) and `restart_server` (stop -> `launch_server` -> wait, used after a mid-render crash). During a render `submit()` opens a **best-effort progress WebSocket** (`/ws`) on a daemon thread and feeds per-step fractions to the UI; `progress_fraction()` (pure, headless-testable) maps `progress`/`progress_state` `value`/`max` → a 0..1 fraction |
 | `backends/batch.py` | overnight **batch render** pure helpers (no Qt; dependency-injected, headless-testable): `plan_batch` (eligibility filter — unknown model / invalid aspect / no start frame skipped — + the `confirm_launch` item list, **N per eligible shot**), `BatchRun` (in-memory tracker; done when every take is terminal — done/failed/cancelled, which also covers 3-strike abandon), `build_batch_report` (morning summary), `sleep_command` (OS suspend argv), `POWER_NONE`/`POWER_STOP_COMFY`/`POWER_SLEEP`. The Qt side (queueing, the single cost gate, drain reaction, power action) lives in `main_window.start_batch`/`_finalize_batch`/`_perform_power_action`; the dialog is `ui/batch_dialog.py` |
 | `backends/crash_recovery.py` | `run_with_crash_recovery` — wraps one local render with crash detection + auto-restart + 3-strike retry (pure / dependency-injected so it's headless-testable): a failure with ComfyUI **down** is a crash (restart the server, retry the same take in place), a failure with it **up** is a genuine workflow error (propagates, fails only that take); after `MAX_ATTEMPTS` crashes raises `QueueAbandoned` so the caller pauses the local queue. `format_elapsed` (pure) for the "failed in XmYs" note |
-| `backends/jobs.py` | `JobManager` on QThreadPool; hosted parallel, local serialized; status signals; `cancel_pending`/`pending_count`; **`cancel_shot_takes(shot_id)`** (cancel just one shot's queued takes) + **`request_stop(take_id)`** (stop an in-flight GENERATING render — comfy `stop_work` / replicate `cancel_prediction`, best-effort; flags the take in `_stopping` so the worker's unwinding backend error records CANCELLED, not FAILED) + **`abandon_local(reason)`** (pause the local queue after repeated crashes — clears the local pool + cancels still-pending *comfyui* takes, hosted untouched, emits **`queue_abandoned`**); `set_project` to switch the active project. Worker threads call `project.update_take` (write-through). Emits **`progress_pct(take_id, fraction, label)`** (ephemeral, UI-only — never persisted) alongside the free-text `progress` signal; the runner callback is widened to `progress(line)` for milestones / `progress(frac=.., label=..)` for the step fraction |
+| `backends/jobs.py` | `JobManager` on QThreadPool; hosted parallel, local serialized; status signals; `cancel_pending`/`pending_count`; **`cancel_shot_takes(shot_id)`** (cancel just one shot's queued takes) + **`request_stop(take_id)`** (stop an in-flight GENERATING render — comfy `stop_work` / replicate `cancel_prediction`, best-effort; flags the take in `_stopping` so the worker's unwinding backend error records CANCELLED, not FAILED; **`is_stop_requested(take_id)`** lets the hosted runner's `on_submit` self-cancel a prediction whose create-POST returned only after the stop was requested — closing the window where `request_stop` skipped the cancel because `backend_job_id` wasn't recorded yet) + **`abandon_local(reason)`** (pause the local queue after repeated crashes — clears the local pool + cancels still-pending *comfyui* takes, hosted untouched, emits **`queue_abandoned`**); `set_project` to switch the active project. Worker threads call `project.update_take` (write-through). Emits **`progress_pct(take_id, fraction, label)`** (ephemeral, UI-only — never persisted) alongside the free-text `progress` signal; the runner callback is widened to `progress(line)` for milestones / `progress(frac=.., label=..)` for the step fraction |
 | `pipeline/framing.py` | `normalize_keypose` (contract framer) + `canvas_size(aspect, local=)` (hosted: longest side 1254; local: ~410k-px budget snapped to /16) + `render_keyposes(shot, dir)` (keys each keyframe sprite and places it `{scale,cx,cy}` on the aspect canvas at **generation time**) |
 | `pipeline/extract.py` | frame extraction + thumbnails (PyAV) |
 | `pipeline/export.py` | `export_takes` → `<name>_<timestamp>/` frames + `settings.txt` |
@@ -80,7 +109,8 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 | `store/schema_cache.py` | persistent cache of Replicate input schemas (`data/schema_cache.json`, keyed by `replicate_model_id`); lock-guarded, atomic writes (reuses `store.project._atomic_write_json`). Populated by the Model Library tab; read by the shot editor for per-param enums/types **and to decide whether a model accepts a negative prompt** |
 | `store/app_settings.py` | app-global user preferences (`data/app_settings.json`; `get_bool`/`set_bool`). Own file (NOT `app_state.json`, which `main_window._remember_last` rewrites wholesale). Same lock + atomic-write discipline as `schema_cache`. First key `update_schemas_on_startup` (default off) — read by `MainWindow` to auto-refresh Replicate schemas at launch, toggled from the **Settings** menu |
 | `store/prompt_library.py` | app-global library of reusable prompt prefabs (`data/prompt_templates.json`; entry = `{name, positive, negative}`, upsert-by-name). Same lock + atomic-write discipline as `schema_cache`; ships seed templates; read/written by the shot tab's Prompt subtab template combo |
-| `scripts/` | `seed_configs.py` (writes `Fighter.animproj`, imports keyframes as assets) + `smoke_phase*.py` + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) |
+| `remote/` | opt-in localhost control server so an external agent (Claude) can drive the live GUI like a web page — `server.py` (`RemoteControlServer`: `ThreadingHTTPServer` on 127.0.0.1, endpoints `/health` `/snapshot` `/screenshot` `/click` `/type` `/key` `/set`), `bridge.py` (`GuiBridge`: marshals each widget touch onto the GUI thread via a posted `QEvent`, so it never races the event loop and still works while a modal is open), `snapshot.py` (pure, headless-testable: `build_snapshot`/`resolve_target` + action primitives `do_click`/`do_type`/`do_key`/`do_set`/`grab_png`). Off unless `ANIMGEN_REMOTE` is truthy; `MainWindow._maybe_start_remote` starts it, `closeEvent` stops it |
+| `scripts/` | `seed_configs.py` (writes `Fighter.animproj`, imports keyframes as assets) + `smoke_phase*.py` + `remote_cli.py` (stdlib client for the `remote/` control server) + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) |
 | `data/` | runtime (gitignored): `*.animproj` project files (default `Fighter.animproj`) + their sidecar `<name>.assets/` (flat keyframe images + `takes/`, `thumbs/`, `.bin/`); plus `exports/`, `_scratch/` (untitled-project assets), `app_state.json` (last opened) |
 | `workflows/` | bundled ComfyUI templates for the local backend |
 
@@ -118,6 +148,9 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 - `ANIMGEN_COMFY_DIR` (default `../comfyui`) — local ComfyUI (input/output dirs).
 - **`REPLICATE_TOKEN`** — read from the environment, then a repo-local `.env`, then
   the source project's `.env`. The token is **never committed** (`.env` is gitignored).
+- `ANIMGEN_REMOTE` (default off) — when truthy, start the localhost control server that
+  lets Claude drive the GUI (see `remote/`). `ANIMGEN_REMOTE_PORT` (default 8765; 0 =
+  ephemeral) sets its port. Localhost-only, no auth — a dev/automation aid, not for prod.
 
 ## Hard-won rules / gotchas
 
@@ -128,8 +161,17 @@ Setup if `.venv` is missing: `python -m venv .venv` then
    only moves files under the project's `.assets/`; a take pointing at an external file
    (e.g. a seeded `../Fighter/out/` gif) is flagged deleted but left in place. Never
    relocate/delete anything outside the project.
-3. **Each take stores an immutable `settings_snapshot`** — frozen at launch. This is
-   the whole point (the source project had no per-take metadata). Don't mutate it.
+3. **Each take stores an immutable `settings_snapshot`** — frozen at launch
+   (`main_window.generate_shot`). This is the whole point (the source project had no
+   per-take metadata). Don't mutate it. It captures model/backend/replicate id/workflow,
+   start+end frames, prompt+negative, the resolved `settings` dict, **and the framing**
+   (`canvas` `[w,h]` + `crop` aspect/placement — added 2026-06-17 so re-framing a shot
+   post-generation can't silently change a take's recorded canvas/aspect). `export.py`
+   writes the snapshot verbatim into `settings.txt`, and the take viewer
+   (`ui/take_player.py`) surfaces it on demand: a **⚙ Settings** button next to the frame
+   timer and a right-click **Show generation settings** on the video both reveal a
+   dockable panel (a floatable `QDockWidget` in an inner `QMainWindow`) rendered by the
+   pure, headless-testable `format_generation_settings(take, shot=None)`.
 4. **Smoke tests run headless** with `QT_QPA_PLATFORM=offscreen`; never call a modal's
    `.exec()` in a test (it blocks). Tests override `paths.SCRATCH_DIR` to a tempdir so
    untitled-project scratch stays out of `data/`. `build_summary` / pure functions are
@@ -202,8 +244,17 @@ Setup if `.venv` is missing: `python -m venv .venv` then
     wrapped in `crash_recovery.run_with_crash_recovery` (`ui/main_window._make_runner`): the
     **crash signal is "the server is down at the moment the render failed"** (`server_status()`)
     — a failure with the server still *up* is a genuine workflow error and propagates, failing
-    only that take. On a crash it `restart_server()`s (which relaunches with the safe flags via
+    only that take. The "down" reading is **reconfirmed up to `CRASH_PROBES` (3) times**
+    (`_looks_crashed`) before committing to a restart so a transient `/system_stats` blip on a
+    still-alive server isn't misread as a crash; the *first* "up" is trusted immediately, so the
+    common workflow-error path still probes exactly once (no slowdown), and on a genuinely down
+    server each probe already eats a full socket timeout so the reconfirmation needs no sleep.
+    On a crash it `restart_server()`s (which relaunches with the safe flags via
     `build_launch_command`, fixing the root cause) and retries the **same** take *in place*.
+    `restart_server` waits `RESTART_SETTLE_S` (2s) after the kill so the OS releases `COMFY_PORT`
+    before the relaunch rebinds it, and watches the relaunched process (`proc.poll()` via
+    `wait_until_responsive(is_alive=...)`) so a bind loss / immediate exit fails fast instead of
+    stalling the full `ready_timeout_s` (120s).
     Because the local pool is serialized, retrying in the blocked worker makes "requeue the
     rest" automatic — the other queued takes just wait behind it; nothing is re-enqueued. After
     `MAX_ATTEMPTS` (3) crashes on one take it raises `QueueAbandoned` -> `jobs.abandon_local()`
@@ -213,7 +264,22 @@ Setup if `.venv` is missing: `python -m venv .venv` then
     normal `progress(line)` path, so they show on the take in the Queue tab and the main log.
     Each retry re-runs `preflight()`, so the dynamic-VRAM gate is never weakened. (Distinct from
     `backends/recovery.py`, which reconciles takes orphaned by an *app* restart on load.)
-13. **Overnight batch render is one cost-confirm for the whole run, then unattended.**
+13. **Claude can drive the GUI over an opt-in localhost control server** (`remote/`), so a
+    desktop-app change can be verified without full-PC-control / pixel-clicking. It's the
+    same model as the Chrome MCP, scoped to AnimGen: `GET /snapshot` returns a DOM-like list
+    of the visible widgets (`ref`/`class`/`name`/`text`/`rect`/`enabled`), `GET /screenshot`
+    returns a PNG of the window via **`QWidget.grab()`** (Qt's own compositor — no OS
+    screen-capture, works even occluded), and `POST /click|/type|/key|/set` drive a widget by
+    `ref` / `objectName` / visible `text`. Two non-obvious invariants: **(a)** the HTTP server
+    runs on a daemon thread but every widget touch is marshalled onto the GUI thread by
+    `GuiBridge.call` (a posted `QEvent`); a modal runs a nested event loop so the calls still
+    land while the **cost-confirm gate** is open — the gate is *driven*, never bypassed.
+    **(b)** It is **off by default** and **127.0.0.1-only, no auth** — enable per-launch with
+    `ANIMGEN_REMOTE=1` (port via `ANIMGEN_REMOTE_PORT`, default 8765). Drive it with
+    `scripts/remote_cli.py` or `curl`; pure helpers + a full round-trip are covered by
+    `smoke_phase7`. Add an `objectName` to a control only when text/`Class:ordinal` targeting
+    is ambiguous (a few exist: `mainTabs`, `modelFilter`, `starredFilter`, `logDock`).
+14. **Overnight batch render is one cost-confirm for the whole run, then unattended.**
     **Generate batch…** (Shots-tab control strip) queues every eligible shot × N takes after a
     **single** `confirm_launch(plan.items)` — this is how the per-launch cost gate (rule 1) is
     honored for an unattended run: the one dialog itemizes all N×shots and the full total, so no

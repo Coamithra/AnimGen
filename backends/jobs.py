@@ -182,6 +182,16 @@ class JobManager(QObject):
                 n += 1
         return n
 
+    def is_stop_requested(self, take_id: str) -> bool:
+        """Whether request_stop has flagged this take's in-flight render to stop.
+
+        Read by the hosted runner's `on_submit` to close the create-POST window: a stop
+        requested before the prediction id was recorded skips request_stop's cancel (no
+        `backend_job_id` yet), so on_submit re-checks this right after recording the id and
+        self-cancels. GIL-atomic membership read, like the other `_stopping` accesses.
+        """
+        return take_id in self._stopping
+
     def request_stop(self, take_id: str) -> bool:
         """Stop an in-flight (GENERATING) render and return whether we acted.
 
@@ -197,12 +207,12 @@ class JobManager(QObject):
             return False
         self._stopping.add(take_id)
         backend = (t.settings_snapshot or {}).get("backend")
-        # Cooperative cancellation has two narrow windows we can't fully close here: a take
-        # whose worker is already past the backend call lands DONE (its file then orphaned
-        # when the shot is deleted - the separate media-binning gap), and a hosted take
-        # whose create-POST hasn't returned has no backend_job_id yet, so no cancel is sent
-        # and a successful prediction keeps spending. Both are rare; the common case (a
-        # take mid-poll) stops cleanly.
+        # A hosted take whose create-POST hasn't returned has no backend_job_id yet, so the
+        # replicate cancel below is skipped - but the runner's on_submit re-checks
+        # is_stop_requested() right after recording the id and self-cancels, closing that
+        # window. One narrow window remains: a take whose worker is already past the backend
+        # call lands DONE (its file then orphaned when the shot is deleted - the separate
+        # media-binning gap). Rare; the common case (a take mid-poll) stops cleanly.
         try:
             if backend == "comfyui":
                 from backends import comfy_client

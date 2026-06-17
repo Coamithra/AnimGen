@@ -20,14 +20,65 @@ from typing import Optional
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget,
+    QDockWidget, QHBoxLayout, QLabel, QMainWindow, QMenu, QPushButton, QSlider,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
+import library
 from store.project import Project
 from ui.placement_widget import pil_to_qimage
 
 _MAX_FRAMES = 1200      # safety cap so a pathologically long clip can't exhaust memory
 _DEFAULT_FPS = 12.0
+
+
+def format_generation_settings(take, shot=None) -> str:
+    """Render a take's immutable settings_snapshot as ordered, human-readable text.
+
+    Pure / Qt-free so it can be unit-tested headless. Degrades gracefully when the snapshot
+    is sparse (older takes recorded fewer fields) or absent. `shot` is accepted for parity
+    with other take views but isn't needed - the snapshot is the authoritative provenance."""
+    snap = (take.settings_snapshot or {}) if take else {}
+    if not snap:
+        return "No generation settings were recorded for this take."
+
+    model_id = snap.get("model_id", "")
+    model = library.get_model(model_id) if model_id else None
+    lines = [f"Model:     {model['display_name'] if model else (model_id or '?')}"]
+    backend = snap.get("backend") or (model.get("backend") if model else "")
+    if backend:
+        lines.append(f"Backend:   {backend}")
+    if snap.get("replicate_model_id"):
+        lines.append(f"Replicate: {snap['replicate_model_id']}")
+    if snap.get("workflow_template"):
+        lines.append(f"Workflow:  {snap['workflow_template']}")
+
+    canvas = snap.get("canvas") or []
+    if len(canvas) >= 2 and any(canvas):
+        lines.append(f"Canvas:    {canvas[0]} x {canvas[1]}")
+    aspect = (snap.get("crop") or {}).get("aspect")
+    if aspect:
+        lines.append(f"Aspect:    {aspect}")
+
+    settings = dict(snap.get("settings") or {})
+    seed = settings.pop("seed", None)
+    if seed is None and take is not None:
+        seed = take.seed
+    if seed is not None:
+        lines.append(f"Seed:      {seed}")
+
+    lines.append("")
+    lines.append("Prompt:")
+    lines.append(snap.get("prompt") or "(none)")
+    neg = snap.get("negative_prompt")
+    if neg:
+        lines += ["", "Negative prompt:", neg]
+
+    if settings:
+        lines.append("")
+        lines.append("Parameters:")
+        lines += [f"  {k}: {settings[k]}" for k in sorted(settings)]
+    return "\n".join(lines)
 
 
 def take_source(take) -> Optional[str]:
@@ -116,6 +167,9 @@ class TakePlayerTab(QWidget):
         self.canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.canvas.setMinimumSize(320, 240)
         self.canvas.setStyleSheet("background:#111; color:#888;")
+        # Right-click the video -> show the take's original generation settings.
+        self.canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.canvas.customContextMenuRequested.connect(self._on_canvas_menu)
 
         self.prev_btn = QPushButton("⏮ Prev")
         self.play_btn = QPushButton("▶ Play")
@@ -134,6 +188,13 @@ class TakePlayerTab(QWidget):
         self.frame_label.setMinimumWidth(96)
         self.frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        # The settings toggle sits to the right of the frame timer; it's always live
+        # (the snapshot is available even before frames finish decoding).
+        self.settings_btn = QPushButton("⚙ Settings")
+        self.settings_btn.setCheckable(True)
+        self.settings_btn.setToolTip("Show the generation settings that produced this take")
+        self.settings_btn.toggled.connect(self._on_settings_toggled)
+
         for b in (self.prev_btn, self.play_btn, self.stop_btn, self.next_btn):
             b.setEnabled(False)
 
@@ -144,10 +205,73 @@ class TakePlayerTab(QWidget):
         controls.addWidget(self.next_btn)
         controls.addWidget(self.slider, 1)
         controls.addWidget(self.frame_label)
+        controls.addWidget(self.settings_btn)
+
+        center = QWidget()
+        center_lay = QVBoxLayout(center)
+        center_lay.setContentsMargins(0, 0, 0, 0)
+        center_lay.addWidget(self.canvas, 1)
+        center_lay.addLayout(controls)
+
+        # An inner QMainWindow hosts the video as its central widget and the settings panel
+        # as a dockable (floatable/redockable) QDockWidget to its right - a true "docked
+        # window" per the card, scoped to this take tab. Hidden until the user asks for it.
+        self._inner = QMainWindow()
+        self._inner.setCentralWidget(center)
+
+        self.settings_panel = QTextEdit()
+        self.settings_panel.setReadOnly(True)
+        self.settings_dock = QDockWidget("Generation settings", self._inner)
+        self.settings_dock.setObjectName("generation_settings_dock")
+        self.settings_dock.setWidget(self.settings_panel)
+        self.settings_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        self._inner.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.settings_dock)
+        self.settings_dock.hide()
+        self.settings_dock.visibilityChanged.connect(self._on_dock_visibility)
+        self._settings_loaded = False
 
         lay = QVBoxLayout(self)
-        lay.addWidget(self.canvas, 1)
-        lay.addLayout(controls)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._inner)
+
+    # ---- settings panel -------------------------------------------------
+    def _ensure_settings_text(self) -> None:
+        if self._settings_loaded:
+            return
+        take = self.project.get_take(self.take_id)
+        self.settings_panel.setPlainText(format_generation_settings(take))
+        self._settings_loaded = True
+
+    def show_settings(self) -> None:
+        """Reveal the docked generation-settings panel (used by the button and the menu)."""
+        self._ensure_settings_text()
+        self.settings_dock.show()
+        self.settings_dock.raise_()
+
+    def _on_settings_toggled(self, checked: bool) -> None:
+        if checked:
+            self.show_settings()
+        else:
+            self.settings_dock.hide()
+
+    def _on_dock_visibility(self, visible: bool) -> None:
+        # Keep the toggle button in sync when the dock is closed via its own [x].
+        if self.settings_btn.isChecked() != visible:
+            self.settings_btn.blockSignals(True)
+            self.settings_btn.setChecked(visible)
+            self.settings_btn.blockSignals(False)
+        if visible:
+            self._ensure_settings_text()
+
+    def _build_context_menu(self) -> QMenu:
+        """The video's right-click menu (split out so it's testable without exec())."""
+        menu = QMenu(self)
+        menu.addAction("Show generation settings").triggered.connect(self.show_settings)
+        return menu
+
+    def _on_canvas_menu(self, pos) -> None:
+        self._build_context_menu().exec(self.canvas.mapToGlobal(pos))
 
     # ---- load -----------------------------------------------------------
     def _load(self) -> None:
