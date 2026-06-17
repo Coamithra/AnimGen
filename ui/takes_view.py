@@ -30,6 +30,22 @@ _BADGE = {"pending": "⏳", "generating": "▶", "done": "", "failed": "✗"}
 _BADGE_COLOR = {"pending": "#b0b0b0", "generating": "#5aa0ff",
                 "done": "#7ade8c", "failed": "#ff6b6b", "cancelled": "#c0a060"}
 
+# Grid cell = icon side + this padding (room for the label/badge under the thumb and a
+# little horizontal breathing room). Shared by the grid-size and preview-height math so
+# they stay in lockstep.
+_GRID_PAD_W = 26
+_GRID_PAD_H = 42
+_VIEW_SPACING = 8     # QListView.setSpacing - margin around each grid cell
+_PREVIEW_ROWS = 2.0   # preview area is locked to this many grid rows tall
+
+
+def preview_height(icon_size: int, rows: float = _PREVIEW_ROWS) -> int:
+    """Fixed pixel height for the takes preview list: `rows` grid rows of `icon_size`
+    icons, plus the list's spacing/frame padding. Pure so it's unit-testable headlessly.
+    The list keeps its own scrollbar, so more takes scroll inside this fixed window."""
+    grid_h = icon_size + _GRID_PAD_H
+    return round(grid_h * rows) + _VIEW_SPACING * 2 + 4
+
 
 class _StripLoader(QObject):
     """Decodes each take's clip into a small frame strip off the GUI thread, emitting one
@@ -108,7 +124,7 @@ class TakesView(QWidget):
         self.view.setMovement(QListView.Movement.Static)
         self.view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.view.setWordWrap(True)
-        self.view.setSpacing(8)
+        self.view.setSpacing(_VIEW_SPACING)
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._context_menu)
         self.view.doubleClicked.connect(self._open_in_viewer)
@@ -236,7 +252,10 @@ class TakesView(QWidget):
     def _apply_icon_size(self) -> None:
         s = self.size_slider.value()
         self.view.setIconSize(QSize(s, s))
-        self.view.setGridSize(QSize(s + 26, s + 42))
+        self.view.setGridSize(QSize(s + _GRID_PAD_W, s + _GRID_PAD_H))
+        # Lock the preview to a fixed height (2 grid rows) so it doesn't grow/shrink with
+        # the window when a shot row is expanded; the list scrolls internally past that.
+        self.view.setFixedHeight(preview_height(s))
 
     # ---- selection / actions -------------------------------------------
     def selected_take_ids(self) -> list:
