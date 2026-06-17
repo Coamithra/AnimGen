@@ -42,14 +42,16 @@ class BatchDialog(QDialog):
         self._power = QComboBox()
         self._power.addItem("Do nothing", batch.POWER_NONE)
         self._power.addItem("Stop ComfyUI when finished", batch.POWER_STOP_COMFY)
-        self._power.addItem("Sleep the PC when finished", batch.POWER_SLEEP)
+        # "Sleep/hibernate": on Windows SetSuspendState hibernates instead if hibernation
+        # is enabled (the documented rundll32 limitation), so the label can't promise sleep.
+        self._power.addItem("Sleep/hibernate the PC when finished", batch.POWER_SLEEP)
         self._power.setToolTip("What to do once the whole batch has drained.")
         form.addRow("When finished:", self._power)
         lay.addLayout(form)
 
         bb = QDialogButtonBox()
         bb.addButton(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
-        bb.addButton("Plan batch...", QDialogButtonBox.ButtonRole.AcceptRole)
+        bb.addButton("Continue...", QDialogButtonBox.ButtonRole.AcceptRole)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)

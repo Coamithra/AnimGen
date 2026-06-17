@@ -608,8 +608,11 @@ class MainWindow(QMainWindow):
         take's snapshot records the seed actually used. Caller handles confirm + save +
         refresh. Returns the new take id.
         """
+        # Copy per take so each take's snapshot owns an independent settings dict (N takes
+        # of one shot share a source dict otherwise) and reroll the random seed per take.
+        settings = dict(settings)
         if settings.get("seed") == library.SEED_RANDOM:
-            settings = {**settings, "seed": library.resolve_seed(library.SEED_RANDOM)}
+            settings["seed"] = library.resolve_seed(library.SEED_RANDOM)
         snapshot = {
             "model_id": shot.model_id, "backend": model["backend"],
             "replicate_model_id": model.get("replicate_model_id"),
@@ -699,10 +702,8 @@ class MainWindow(QMainWindow):
             t = self.project.get_take(tid)
             if t is None:
                 continue
-            name = (t.settings_snapshot or {}).get("name") or ""
-            if not name:
-                s = self.project.get_shot(t.shot_id)
-                name = s.name if s else tid[:8]
+            s = self.project.get_shot(t.shot_id)
+            name = s.name if s else tid[:8]
             rows.append({"name": name, "status": t.status, "cost_actual": t.cost_actual})
         report = batch.build_batch_report(
             rows, started=b.started,
@@ -710,7 +711,7 @@ class MainWindow(QMainWindow):
             power_action=b.power_action)
         try:
             paths.EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # %f: unique per call
             report_path = paths.EXPORTS_DIR / f"overnight_{stamp}.txt"
             report_path.write_text(report, encoding="utf-8")
             self._log(f"batch finished - report: {report_path}")
@@ -721,19 +722,22 @@ class MainWindow(QMainWindow):
 
     def _perform_power_action(self, action: str) -> None:
         """Stop ComfyUI (always) and optionally sleep the PC, on a daemon thread so the GUI
-        isn't blocked (stop_server can take ~10s). Best-effort: every step is guarded."""
+        isn't blocked (stop_server can take ~10s). Best-effort: every step is guarded.
+
+        Runs off the GUI thread, so it must NOT touch Qt (no self._log) - failures go to
+        stdout (the launch log) instead. The GUI-thread announcement is logged below."""
         def work():
             try:
                 comfy_client.stop_server()
-            except Exception:  # noqa: BLE001 - server may already be down
-                pass
+            except Exception as e:  # noqa: BLE001 - server may already be down
+                print(f"batch: stop_server failed: {e}")
             if action == batch.POWER_SLEEP:
                 cmd = batch.sleep_command()
                 if cmd:
                     try:
                         subprocess.Popen(cmd)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as e:  # noqa: BLE001
+                        print(f"batch: sleep command failed: {e}")
         self._log(f"batch power action: {action}")
         threading.Thread(target=work, daemon=True).start()
 
@@ -754,7 +758,15 @@ class MainWindow(QMainWindow):
 
     def _on_queue_abandoned(self, reason: str) -> None:
         """The local (ComfyUI) queue was paused after a take crashed repeatedly. Log it,
-        refresh the Cancel action (its pending takes are now cancelled), and warn the user."""
+        refresh the Cancel action (its pending takes are now cancelled), and warn the user.
+
+        If a batch is running, drop its power action: a broken GPU means the user must
+        intervene, so we must not sleep the PC (and would bury this warning). The batch
+        still finalizes + writes its report when the remaining takes drain. This fires
+        before the crashing take's own terminal signal (abandon_local emits queue_abandoned
+        before crash_recovery re-raises), so the neutralized action is in place in time."""
+        if self._batch is not None:
+            self._batch.power_action = batch.POWER_NONE
         self._log(f"⚠ local queue paused: {reason}")
         self._refresh_cancel_action()
         self.queue_tab.refresh()

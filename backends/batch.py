@@ -12,14 +12,15 @@ import sys
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from store.models import STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED
+
 # "When finished" power actions. STOP_COMFY frees the GPU; SLEEP also suspends the PC.
 POWER_NONE = "none"
 POWER_STOP_COMFY = "stop_comfy"
 POWER_SLEEP = "sleep"
 
 # Statuses that take a take out of the queue for good - used to know when a batch is done.
-# Imported lazily-by-value to avoid a store import here; kept in sync with store.models.
-_TERMINAL = {"done", "failed", "cancelled"}
+_TERMINAL = {STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED}
 
 
 def is_terminal(status: str) -> bool:
