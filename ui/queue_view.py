@@ -23,8 +23,8 @@ from datetime import datetime
 
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHeaderView, QLabel, QProgressBar, QPushButton, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 import library
@@ -37,6 +37,7 @@ _COLUMNS = ["Shot", "Model", "Backend", "Status", "Progress", ""]
 _PROGRESS_COL = _COLUMNS.index("Progress")
 _CANCEL_COL = len(_COLUMNS) - 1
 _RECENT_LIMIT = 15      # how many finished takes to keep visible below the active ones
+_FINISHED = (STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED)
 
 # status value -> (label shown in the Status column, row tint)
 _STATUS_DISPLAY = {
@@ -82,6 +83,20 @@ def done_elapsed(take) -> str:
     return _elapsed(take.started or take.created, take.completed)
 
 
+def select_rows(takes, dismissed: "frozenset[str] | set[str]" = frozenset(),
+                recent_limit: int = _RECENT_LIMIT) -> list:
+    """The takes the queue shows: every active (generating/pending) take first, in queue
+    order, then the most-recently finished ones (capped at recent_limit) newest-first.
+
+    Finished takes whose id is in `dismissed` are filtered out — that's what the Clear
+    button does. Active takes are never dismissable, so a still-queued or in-flight take
+    always shows even if its id somehow lands in `dismissed`."""
+    active = [t for t in takes if t.status == STATUS_GENERATING]
+    active += [t for t in takes if t.status == STATUS_PENDING]
+    finished = [t for t in takes if t.status in _FINISHED and t.id not in dismissed]
+    return active + finished[-recent_limit:][::-1]   # newest finished first
+
+
 class QueueView(QWidget):
     def __init__(self, project: Project, jobs, parent=None):
         super().__init__(parent)
@@ -91,6 +106,7 @@ class QueueView(QWidget):
         self._latest_pct: dict[str, tuple[float, str]] = {}     # take_id -> (fraction, label)
         self._progress_items: dict[str, QTableWidgetItem] = {}  # take_id -> its Progress text cell
         self._progress_bars: dict[str, QProgressBar] = {}       # take_id -> its Progress bar
+        self._dismissed: set[str] = set()              # finished take_ids hidden via Clear
         self._build()
         jobs.progress.connect(self._on_progress)
         jobs.progress_pct.connect(self._on_progress_pct)
@@ -104,12 +120,18 @@ class QueueView(QWidget):
         self.project = project
         self._latest.clear()
         self._latest_pct.clear()
+        self._dismissed.clear()
         self.refresh()
 
     # ---- build ----------------------------------------------------------
     def _build(self) -> None:
         self.summary = QLabel()
         self.summary.setStyleSheet("font-weight: 600; padding: 2px;")
+        self.clear_btn = QPushButton("Clear finished")
+        self.clear_btn.setToolTip(
+            "Remove finished, failed and cancelled takes from this list "
+            "(running and queued takes stay). Does not delete the takes themselves.")
+        self.clear_btn.clicked.connect(self._clear_finished)
         self.table = QTableWidget(0, len(_COLUMNS))
         self.table.setHorizontalHeaderLabels(_COLUMNS)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -122,20 +144,18 @@ class QueueView(QWidget):
                     else QHeaderView.ResizeMode.ResizeToContents)
             hh.setSectionResizeMode(col, mode)
 
+        header = QHBoxLayout()
+        header.addWidget(self.summary)
+        header.addStretch(1)
+        header.addWidget(self.clear_btn)
+
         lay = QVBoxLayout(self)
-        lay.addWidget(self.summary)
+        lay.addLayout(header)
         lay.addWidget(self.table, 1)
 
     # ---- data -----------------------------------------------------------
     def _rows(self) -> list:
-        """The takes to show: every active (generating/pending) take first, in queue order,
-        then the most-recently finished ones (so results stay visible without unbounded growth)."""
-        takes = self.project.list_takes()
-        active = [t for t in takes if t.status == STATUS_GENERATING]
-        active += [t for t in takes if t.status == STATUS_PENDING]
-        finished = [t for t in takes
-                    if t.status in (STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED)]
-        return active + finished[-_RECENT_LIMIT:][::-1]   # newest finished first
+        return select_rows(self.project.list_takes(), self._dismissed)
 
     def _model_backend(self, take) -> tuple[str, str]:
         snap = take.settings_snapshot or {}
@@ -179,16 +199,21 @@ class QueueView(QWidget):
         self._progress_items[take.id] = item
 
     def refresh(self) -> None:
+        takes = self.project.list_takes()
+        finished_ids = {t.id for t in takes if t.status in _FINISHED}
+        self._dismissed &= finished_ids            # drop ids of takes no longer present
         rows = self._rows()
-        n_run = sum(1 for t in self.project.list_takes() if t.status == STATUS_GENERATING)
-        n_queue = sum(1 for t in self.project.list_takes() if t.status == STATUS_PENDING)
-        n_fail = sum(1 for t in self.project.list_takes() if t.status == STATUS_FAILED)
+        n_run = sum(1 for t in takes if t.status == STATUS_GENERATING)
+        n_queue = sum(1 for t in takes if t.status == STATUS_PENDING)
+        n_fail = sum(1 for t in takes if t.status == STATUS_FAILED)
         summary = f"{n_run} running · {n_queue} queued"
         if n_fail:
             summary += f" · {n_fail} failed"
         if not rows:
             summary = "Queue empty - nothing generating or queued."
         self.summary.setText(summary)
+        # enable Clear only when a finished row is actually showing to be cleared
+        self.clear_btn.setEnabled(any(t.status in _FINISHED for t in rows))
 
         self._progress_items.clear()
         self._progress_bars.clear()
@@ -243,4 +268,14 @@ class QueueView(QWidget):
 
     def _cancel(self, take_id: str) -> None:
         self.jobs.cancel_take(take_id)
+        self.refresh()
+
+    def _clear_finished(self) -> None:
+        """Hide every finished/failed/cancelled take from the list, keeping active ones.
+
+        UI-only: the takes themselves are untouched (a done take stays in the project and
+        its triage view) — this just dismisses them from the live queue monitor. Takes that
+        finish *after* this aren't dismissed, so the list keeps reflecting new results."""
+        takes = self.project.list_takes()
+        self._dismissed |= {t.id for t in takes if t.status in _FINISHED}
         self.refresh()
