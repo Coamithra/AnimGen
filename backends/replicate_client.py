@@ -262,13 +262,23 @@ def build_input(props: dict, *, start_url: Optional[str], end_url: Optional[str]
     return inp
 
 
+def cancel_prediction(pred_id: str, token: Optional[str] = None) -> None:
+    """Best-effort cancel of a running prediction (stops spend). Server-side idempotent;
+    a no-op if the prediction already finished. Raises ReplicateError on a transport
+    failure - callers that just want to stop a render should swallow it."""
+    api_request(token or load_token(), f"{API}/predictions/{pred_id}/cancel", method="POST")
+
+
 def run_prediction(token: str, replicate_model_id: str, inp: dict, out_path: Path,
                    progress_cb: ProgressCb = None, poll_s: int = 10,
-                   timeout_s: int = 1800) -> dict:
+                   timeout_s: int = 1800,
+                   on_submit: Optional[Callable[[str], None]] = None) -> dict:
     resp = api_request(token, f"{API}/models/{replicate_model_id}/predictions",
                        payload={"input": inp})
     pred_id = resp["id"]
     get_url = resp.get("urls", {}).get("get") or f"{API}/predictions/{pred_id}"
+    if on_submit:                     # record the prediction id NOW so a take can be
+        on_submit(pred_id)            # cancelled mid-render (or reconciled after a restart)
     _log(progress_cb, f"submitted {pred_id}")
     t0 = time.time()
     status = resp.get("status")
@@ -306,7 +316,8 @@ def generate(replicate_model_id: str, *, start: str, out_path: Path,
              end: Optional[str] = None, prompt: str = "", negative: str = "",
              duration=None, resolution=None, seed=None, extra: Optional[dict] = None,
              data_uri: bool = False, progress_cb: ProgressCb = None,
-             dry_run: bool = False) -> dict:
+             dry_run: bool = False,
+             on_submit: Optional[Callable[[str], None]] = None) -> dict:
     """End-to-end hosted generation. With dry_run=True, resolves the input WITHOUT
     uploading images or creating a prediction (no spend) and returns it under
     {'dry_run': True, 'input': ...}."""
@@ -329,6 +340,7 @@ def generate(replicate_model_id: str, *, start: str, out_path: Path,
     inp = build_input(props, start_url=start_url, end_url=end_url, prompt=prompt,
                       negative=negative, duration=duration, resolution=resolution,
                       seed=seed, extra=extra)
-    meta = run_prediction(token, replicate_model_id, inp, Path(out_path), progress_cb)
+    meta = run_prediction(token, replicate_model_id, inp, Path(out_path), progress_cb,
+                          on_submit=on_submit)
     meta["video_path"] = str(out_path)
     return meta
