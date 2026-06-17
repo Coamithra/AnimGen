@@ -1560,6 +1560,43 @@ def test_done_elapsed() -> None:
     print("done_elapsed OK: render time from started, created fallback, started persists")
 
 
+def test_select_rows() -> None:
+    from ui.queue_view import select_rows
+    from store.models import STATUS_CANCELLED
+
+    gen = Take(id="g", shot_id="s", status=STATUS_GENERATING)
+    pend = Take(id="p", shot_id="s", status=STATUS_PENDING)
+    done = Take(id="d", shot_id="s", status=STATUS_DONE)
+    fail = Take(id="f", shot_id="s", status=STATUS_FAILED)
+    canc = Take(id="c", shot_id="s", status=STATUS_CANCELLED)
+    takes = [done, gen, fail, pend, canc]
+
+    # No dismissals: active first (generating, then pending), finished newest-first after.
+    ids = [t.id for t in select_rows(takes)]
+    assert ids == ["g", "p", "c", "f", "d"], ids
+
+    # Clearing dismisses every finished take but leaves active ones in.
+    dismissed = {t.id for t in takes if t.status in (STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED)}
+    ids = [t.id for t in select_rows(takes, dismissed)]
+    assert ids == ["g", "p"], ids
+
+    # A finished take that appears *after* a clear (not in dismissed) still shows.
+    newdone = Take(id="d2", shot_id="s", status=STATUS_DONE)
+    ids = [t.id for t in select_rows(takes + [newdone], dismissed)]
+    assert ids == ["g", "p", "d2"], ids
+
+    # An active take is never hidden even if its id is (wrongly) in dismissed, and a
+    # non-empty dismissed of only active ids leaves the finished tail untouched.
+    ids = [t.id for t in select_rows(takes, {"g", "p"})]
+    assert ids == ["g", "p", "c", "f", "d"], ids
+
+    # recent_limit caps the finished tail, newest-first.
+    many = [Take(id=f"x{i}", shot_id="s", status=STATUS_DONE) for i in range(20)]
+    ids = [t.id for t in select_rows(many, recent_limit=3)]
+    assert ids == ["x19", "x18", "x17"], ids
+    print("select_rows OK: active-first, clear hides finished, active never hidden, recent cap")
+
+
 if __name__ == "__main__":
     test_build_input()
     test_capability_sync()
@@ -1595,6 +1632,7 @@ if __name__ == "__main__":
     test_client_id_in_queue()
     test_progress_pct()
     test_done_elapsed()
+    test_select_rows()
     test_batch()
     test_batch_finalize()
     print("PHASE 2 SMOKE: PASS")
