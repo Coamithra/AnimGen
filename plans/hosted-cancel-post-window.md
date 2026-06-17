@@ -41,13 +41,14 @@ prompt; needs no backend_job_id), so there's no analogous gap.
 
 ## Tests
 
-Extend `scripts/smoke_phase2.py`:
-- `test_is_stop_requested` — request_stop on a GENERATING hosted take with **no**
-  backend_job_id flags `_stopping`, sends no cancel, and `is_stop_requested` returns True.
-- `test_stop_during_submit_window` — drive a real `GenerationJob` through a fake replicate
-  runner whose `on_submit` mimics production (record id → check `is_stop_requested` →
-  fake-cancel). Pre-flag the take in `_stopping`; assert the fake cancel fired and the take
-  lands CANCELLED, not DONE.
+- `scripts/smoke_phase2.py::test_is_stop_requested` — request_stop on a GENERATING hosted
+  take with **no** backend_job_id flags `_stopping`, sends no cancel, and
+  `is_stop_requested` returns True (the jobs-level API contract).
+- `scripts/smoke_phase5.py::test_runner_self_cancel_during_submit` — exercises the **real**
+  `MainWindow._make_runner` replicate `on_submit` wiring (framing + replicate_client
+  patched). A stop flagged during the create-POST window makes the real on_submit call
+  `cancel_prediction`, and the take lands CANCELLED, not DONE. Placed in phase 5 because
+  that's where the MainWindow-construction tests live.
 
 ## Out of scope
 

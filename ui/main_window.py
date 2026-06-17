@@ -635,8 +635,8 @@ class MainWindow(QMainWindow):
                     # Record the prediction id NOW so a delete/stop mid-render can cancel it.
                     self.project.update_take(take_id, backend_job_id=pid)
                     # Close the create-POST window: if a stop was requested before the id
-                    # existed, request_stop's cancel was skipped - self-cancel here so a
-                    # prediction that would otherwise succeed and orphan its .mp4 halts spend.
+                    # existed, request_stop's cancel was skipped - self-cancel here (best-effort)
+                    # so a prediction that would otherwise succeed and orphan its .mp4 halts spend.
                     if self.jobs.is_stop_requested(take_id):
                         progress("stop requested during submit - cancelling prediction")
                         try:

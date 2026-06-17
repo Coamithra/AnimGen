@@ -191,8 +191,62 @@ def test_close_dirty_tab_guard() -> None:
     print("MainWindow OK: close-dirty-tab guard (clean/Cancel/Discard/Save)")
 
 
+def test_runner_self_cancel_during_submit() -> None:
+    """The replicate runner's on_submit must self-cancel when a stop was requested during
+    the create-POST window (before backend_job_id existed), so the take lands CANCELLED and
+    spend halts. Exercises the real ui.main_window._make_runner wiring with framing +
+    replicate_client patched (hermetic - no keyposes, no network, no spend)."""
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import GenerationJob
+    from ui import main_window
+    from ui.main_window import MainWindow
+    from store.models import STATUS_CANCELLED, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    win = MainWindow(project)
+    take = project.add_take(shot.id, status=STATUS_PENDING,
+                            settings_snapshot={"backend": "replicate"})
+
+    cancels = []
+    saved = (main_window.framing.render_keyposes,
+             main_window.replicate_client.generate,
+             main_window.replicate_client.cancel_prediction)
+    main_window.framing.render_keyposes = lambda s, d: ("start.png", "end.png")
+    main_window.replicate_client.cancel_prediction = lambda pid, token=None: cancels.append(pid)
+
+    def fake_generate(rid, *, on_submit=None, **kw):
+        win.jobs._stopping.add(take.id)   # stop requested while the create-POST is in flight
+        on_submit("pred_post_window")     # create-POST returns -> on_submit records id + self-cancels
+        # the poll loop would then see status "canceled" and raise out of run_prediction:
+        raise main_window.replicate_client.ReplicateError("canceled")
+    main_window.replicate_client.generate = fake_generate
+
+    try:
+        model = {"backend": "replicate", "replicate_model_id": "owner/model"}
+        runner = win._make_runner(model, shot, {}, take.id)
+        job = GenerationJob(project, take.id, "replicate", runner, win.jobs._signals,
+                            win.jobs._cancelled, win.jobs._stopping)
+        job.run()
+        app.processEvents()
+    finally:
+        (main_window.framing.render_keyposes,
+         main_window.replicate_client.generate,
+         main_window.replicate_client.cancel_prediction) = saved
+
+    got = project.get_take(take.id)
+    assert cancels == ["pred_post_window"], cancels    # the real on_submit fired the cancel
+    assert got.backend_job_id == "pred_post_window"    # id recorded before the self-cancel
+    assert got.status == STATUS_CANCELLED, got.status  # not DONE - spend halted
+    assert take.id not in win.jobs._stopping           # cleared in GenerationJob's finally
+    print("runner self-cancel OK: real on_submit cancels during create-POST window")
+
+
 if __name__ == "__main__":
     test_export()
     test_window_builds()
     test_close_dirty_tab_guard()
+    test_runner_self_cancel_during_submit()
     print("PHASE 5 SMOKE: PASS")
