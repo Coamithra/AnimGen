@@ -530,6 +530,21 @@ def test_progress_fraction() -> None:
     print("progress_fraction OK: progress/progress_state/executing parsed, prompt_id filtered")
 
 
+def test_client_id_in_queue() -> None:
+    from backends.comfy_client import _client_id_in_queue as cid
+
+    # entry shape: [number, prompt_id, prompt, extra_data{client_id}, outputs]
+    q = {"queue_running": [[2, "p1", {"...": "wf"}, {"client_id": "abc", "create_time": 1}, ["16"]]],
+         "queue_pending": [[3, "p2", {"...": "wf"}, {"client_id": "def"}, ["16"]]]}
+    assert cid(q, "p1") == "abc"                         # found in running bucket
+    assert cid(q, "p2") == "def"                         # found in pending bucket
+    assert cid(q, "p3") is None                          # absent prompt
+    assert cid({}, "p1") is None                         # empty payload
+    assert cid({"queue_running": [[2, "p1", {"x": 1}, ["16"]]]}, "p1") is None  # no extra_data dict
+    assert cid({"queue_running": [[2, "p1", {"x": 1}, {"create_time": 1}, []]]}, "p1") is None  # no client_id key
+    print("client_id_in_queue OK: running/pending lookup, missing extra_data/client_id tolerated")
+
+
 def test_progress_pct() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -665,5 +680,6 @@ if __name__ == "__main__":
     test_request_stop_calls_backend()
     test_job_manager()
     test_progress_fraction()
+    test_client_id_in_queue()
     test_progress_pct()
     print("PHASE 2 SMOKE: PASS")
