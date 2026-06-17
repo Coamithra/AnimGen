@@ -126,8 +126,17 @@ Setup if `.venv` is missing: `python -m venv .venv` then
    only moves files under the project's `.assets/`; a take pointing at an external file
    (e.g. a seeded `../Fighter/out/` gif) is flagged deleted but left in place. Never
    relocate/delete anything outside the project.
-3. **Each take stores an immutable `settings_snapshot`** — frozen at launch. This is
-   the whole point (the source project had no per-take metadata). Don't mutate it.
+3. **Each take stores an immutable `settings_snapshot`** — frozen at launch
+   (`main_window.generate_shot`). This is the whole point (the source project had no
+   per-take metadata). Don't mutate it. It captures model/backend/replicate id/workflow,
+   start+end frames, prompt+negative, the resolved `settings` dict, **and the framing**
+   (`canvas` `[w,h]` + `crop` aspect/placement — added 2026-06-17 so re-framing a shot
+   post-generation can't silently change a take's recorded canvas/aspect). `export.py`
+   writes the snapshot verbatim into `settings.txt`, and the take viewer
+   (`ui/take_player.py`) surfaces it on demand: a **⚙ Settings** button next to the frame
+   timer and a right-click **Show generation settings** on the video both reveal a
+   dockable panel (a floatable `QDockWidget` in an inner `QMainWindow`) rendered by the
+   pure, headless-testable `format_generation_settings(take, shot=None)`.
 4. **Smoke tests run headless** with `QT_QPA_PLATFORM=offscreen`; never call a modal's
    `.exec()` in a test (it blocks). Tests override `paths.SCRATCH_DIR` to a tempdir so
    untitled-project scratch stays out of `data/`. `build_summary` / pure functions are
