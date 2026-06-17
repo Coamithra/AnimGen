@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from PySide6.QtGui import QIcon  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+import applog  # noqa: E402
 import paths  # noqa: E402
 from store.project import Project  # noqa: E402
 from ui.main_window import MainWindow  # noqa: E402
@@ -59,14 +60,25 @@ def _resolve_project() -> Project:
 
 def main() -> int:
     paths.ensure_dirs()
+    log = applog.setup()
     _set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("AnimGen")
     app.setApplicationDisplayName("Animation Generator")
     app.setWindowIcon(_app_icon())
-    win = MainWindow(_resolve_project())
+    applog.install_qt_message_handler()
+    applog.install_session_logging(app)
+    app.aboutToQuit.connect(lambda: log.info("aboutToQuit: event loop ending"))
+    project = _resolve_project()
+    log.info("opening project: %s", project.path or "<untitled>")
+    win = MainWindow(project)
+    applog.start_watchdog()
+    applog.start_heartbeat(win, context_fn=getattr(win, "_monitor_context", None))
     win.show()
-    return app.exec()
+    log.info("entering event loop")
+    code = app.exec()
+    log.info("=== SHUTDOWN  event loop exited  code=%s ===", code)
+    return code
 
 
 if __name__ == "__main__":

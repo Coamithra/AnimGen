@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
+import applog
 import library
 import paths
 from backends import batch, comfy_client, crash_recovery, recovery, replicate_client
@@ -1092,10 +1093,35 @@ class MainWindow(QMainWindow):
         if take:
             self._refresh_shot(take.shot_id)
 
+    def _monitor_context(self) -> str:
+        """Short app-state string for the heartbeat log (project + queue snapshot)."""
+        proj = (self.project.name or "untitled") + ("*" if self.project.dirty else "")
+        try:
+            pending = self.jobs.pending_count()
+        except Exception:  # noqa: BLE001
+            pending = "?"
+        generating = sum(1 for t in self.project.list_takes() if t.status == STATUS_GENERATING)
+        return (f"project={proj} jobs_pending={pending} generating={generating} "
+                f"shot_tabs={len(self.shot_tabs)} visible={self.isVisible()} "
+                f"minimized={self.isMinimized()}")
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # A "vanish" can be a hide/minimize (process still alive) rather than a close/crash.
+        # Logged so heartbeats continuing after this line tell you it was only hidden.
+        applog.logger.info("window hidden (spontaneous=%s, minimized=%s) - process still running",
+                           event.spontaneous(), self.isMinimized())
+        super().hideEvent(event)
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # spontaneous() = the window system initiated it (you clicked X / the OS asked it
+        # to close) vs a programmatic close. Logged so a vanished window is explainable.
+        spontaneous = event.spontaneous()
         if not self._maybe_save_changes():
+            applog.logger.info("close aborted at unsaved-changes prompt (spontaneous=%s)", spontaneous)
             event.ignore()
             return
+        applog.logger.info("window closing (spontaneous=%s) - %s", spontaneous,
+                           "user/OS closed the window" if spontaneous else "programmatic close")
         if self._remote is not None:
             self._remote.stop()
         self.comfy_tab.stop_monitoring()
