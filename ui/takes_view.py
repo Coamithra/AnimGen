@@ -4,6 +4,10 @@ A QListView in IconMode (Windows-folder style) with an icon-size slider, a
 favorite/all filter, live status badges, per-take star + delete-to-bin, and
 shift/ctrl multi-select. Thumbnails are the first video frame, generated lazily and
 cached. Emits `changed` (so the card header can refresh counts) and `export_requested`.
+
+The preview height auto-fits the rows its takes actually occupy (1.._MAX_PREVIEW_ROWS),
+so a single row doesn't reserve an empty second row; a thin handle below the grid lets the
+user drag an explicit height (double-click it to return to auto-fit).
 """
 from __future__ import annotations
 
@@ -15,7 +19,7 @@ from PySide6.QtGui import (
     QColor, QIcon, QPainter, QPixmap, QStandardItem, QStandardItemModel,
 )
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QListView, QMenu, QPushButton, QSlider,
+    QComboBox, QFrame, QHBoxLayout, QLabel, QListView, QMenu, QPushButton, QSlider,
     QVBoxLayout, QWidget,
 )
 
@@ -34,21 +38,45 @@ _BADGE_COLOR = {"pending": "#b0b0b0", "generating": "#5aa0ff",
 # little horizontal breathing room). Shared by the grid-size and preview-height math so
 # they stay in lockstep.
 _GRID_PAD_W = 26
-_GRID_PAD_H = 42
+_GRID_PAD_H = 26      # one short label line under the thumb - was 42, which left a wide
+                      # whitespace band below each row; 26 packs the rows tighter.
 _VIEW_SPACING = 8     # QListView.setSpacing - margin around each grid cell
 _VIEW_FRAME_PAD = 4   # QListView frame border (top + bottom), so rows aren't clipped by it
-_PREVIEW_ROWS = 2.0   # preview area is locked to this many grid rows tall
+_MAX_PREVIEW_ROWS = 2   # auto-fit cap: the preview shrinks to fit its takes but never grows
+                        # past this on its own (more takes scroll inside); manual drag can exceed.
+_DRAG_MAX_ROWS = 8      # ceiling for a manual drag-resize, so the panel can't be dragged absurdly tall
 
 
-def preview_height(icon_size: int, rows: float = _PREVIEW_ROWS) -> int:
-    """Fixed pixel height for the takes preview list: `rows` grid rows of `icon_size`
-    icons, plus the list's spacing/frame padding. Pure so it's unit-testable headlessly.
-    The list keeps its own scrollbar, so more takes scroll inside this fixed window.
+def preview_height(icon_size: int, rows: float = _MAX_PREVIEW_ROWS) -> int:
+    """Pixel height for the takes preview list: `rows` grid rows of `icon_size` icons, plus
+    the list's spacing/frame padding. Pure so it's unit-testable headlessly. The list keeps
+    its own scrollbar, so takes beyond `rows` scroll inside this window.
 
     Spacing falls between rows as well as above/below them, so N rows need (N+1) gaps;
     erring slightly tall keeps whole rows from being clipped before the scrollbar kicks in."""
     grid_h = icon_size + _GRID_PAD_H
     return round(grid_h * rows) + round(_VIEW_SPACING * (rows + 1)) + _VIEW_FRAME_PAD
+
+
+def columns_for(viewport_width: int, icon_size: int) -> int:
+    """How many grid cells fit across a viewport `viewport_width` px wide. Returns 0 when the
+    width isn't known yet (view not laid out / headless), signalling 'can't tell'. Pure."""
+    if viewport_width <= 0:
+        return 0
+    step = (icon_size + _GRID_PAD_W) + _VIEW_SPACING
+    return max(1, (viewport_width - _VIEW_SPACING) // step)
+
+
+def rows_for(n_items: int, viewport_width: int, icon_size: int,
+             max_rows: int = _MAX_PREVIEW_ROWS) -> int:
+    """Number of grid rows the preview should be tall to fit `n_items` without wasting space,
+    clamped to [1, max_rows]. With the width unknown we fall back to the full cap so nothing is
+    clipped before layout settles. Pure so it's unit-testable headlessly."""
+    cols = columns_for(viewport_width, icon_size)
+    if cols == 0:
+        return max_rows
+    needed = -(-max(n_items, 1) // cols)   # ceil division
+    return max(1, min(needed, max_rows))
 
 
 class _StripLoader(QObject):
@@ -76,6 +104,48 @@ class _StripLoader(QObject):
                 self.ready.emit(take_id, frames, self._gen)
 
 
+class _ResizeHandle(QFrame):
+    """A thin grab bar under the preview grid. Drag it to set an explicit panel height
+    (overriding auto-fit); double-click to return to auto-fit. It only talks to its owner
+    TakesView through `current_view_height`/`set_manual_height`/`clear_manual_height`, so
+    the height policy stays in one place."""
+    def __init__(self, owner: "TakesView"):
+        super().__init__()
+        self._owner = owner
+        self.setFixedHeight(7)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setObjectName("takesResizeHandle")
+        self.setStyleSheet(
+            "#takesResizeHandle { background:#3a3f4b; border-radius:3px; }"
+            "#takesResizeHandle:hover { background:#4a5160; }")
+        self.setToolTip("Drag to resize · double-click to auto-fit")
+        self._press_y: float | None = None
+        self._base_h = 0
+
+    def mousePressEvent(self, event):  # noqa: N802 - Qt override
+        self._press_y = event.globalPosition().y()
+        self._base_h = self._owner.current_view_height()
+        event.accept()
+
+    def mouseMoveEvent(self, event):  # noqa: N802 - Qt override
+        if self._press_y is None:
+            return
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._press_y = None    # release was missed (off-widget / focus stolen) - drop the drag
+            return
+        delta = int(event.globalPosition().y() - self._press_y)
+        self._owner.set_manual_height(self._base_h + delta)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt override
+        self._press_y = None
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802 - Qt override
+        self._owner.clear_manual_height()
+        event.accept()
+
+
 class TakesView(QWidget):
     changed = Signal()
     export_requested = Signal(list)   # list[take_id]
@@ -91,6 +161,7 @@ class TakesView(QWidget):
         self._animating = True
         self._anim_gen = 0                            # bumped on each (re)load to drop stale strips
         self._loader: _StripLoader | None = None
+        self._user_height: int | None = None          # set by a manual drag-resize; overrides auto-fit
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(_ANIM_INTERVAL_MS)
         self._anim_timer.timeout.connect(self._tick)
@@ -134,10 +205,13 @@ class TakesView(QWidget):
         self.view.doubleClicked.connect(self._open_in_viewer)
         self._apply_icon_size()
 
+        self.resize_handle = _ResizeHandle(self)
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 0, 6, 6)
         lay.addLayout(head)
         lay.addWidget(self.view)
+        lay.addWidget(self.resize_handle)
 
     # ---- population -----------------------------------------------------
     def load(self) -> None:
@@ -153,6 +227,7 @@ class TakesView(QWidget):
             self.model.appendRow(item)
             self._items[t.id] = item
         self.count_label.setText(f"{len(takes)} shown")
+        self._apply_height()
         if self._animating:
             self._start_strip_load(takes)
 
@@ -222,6 +297,13 @@ class TakesView(QWidget):
     def showEvent(self, event):  # noqa: N802 - Qt override
         self.set_animating(True)
         super().showEvent(event)
+        self._apply_height()   # viewport width is known once shown -> recompute columns/rows
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt override: width change -> different column count
+        super().resizeEvent(event)
+        # _apply_height pins the view's height, which can feed back here; it settles in one
+        # pass because rows_for is idempotent for a given width (same width -> same height).
+        self._apply_height()
 
     def _label(self, t) -> str:
         badge = _BADGE.get(t.status, "")
@@ -257,9 +339,34 @@ class TakesView(QWidget):
         s = self.size_slider.value()
         self.view.setIconSize(QSize(s, s))
         self.view.setGridSize(QSize(s + _GRID_PAD_W, s + _GRID_PAD_H))
-        # Lock the preview to a fixed height (2 grid rows) so it doesn't grow/shrink with
-        # the window when a shot row is expanded; the list scrolls internally past that.
-        self.view.setFixedHeight(preview_height(s))
+        self._apply_height()
+
+    # ---- preview height: auto-fit to content, with a manual drag override ----
+    def _apply_height(self) -> None:
+        """Pin the preview height. A manual drag wins; otherwise auto-fit to the rows the
+        current takes actually occupy (1.._MAX_PREVIEW_ROWS), so a single row of takes
+        doesn't reserve an empty second row."""
+        s = self.size_slider.value()
+        if self._user_height is not None:
+            self.view.setFixedHeight(self._user_height)
+            return
+        rows = rows_for(self.model.rowCount(), self.view.viewport().width(), s)
+        self.view.setFixedHeight(preview_height(s, rows))
+
+    def current_view_height(self) -> int:
+        return self.view.height()
+
+    def set_manual_height(self, height: int) -> None:
+        """Pin an explicit height from a drag-resize, clamped to [1, _DRAG_MAX_ROWS] rows."""
+        s = self.size_slider.value()
+        lo, hi = preview_height(s, 1), preview_height(s, _DRAG_MAX_ROWS)
+        self._user_height = max(lo, min(height, hi))
+        self.view.setFixedHeight(self._user_height)
+
+    def clear_manual_height(self) -> None:
+        """Drop the manual override and return to auto-fit."""
+        self._user_height = None
+        self._apply_height()
 
     # ---- selection / actions -------------------------------------------
     def selected_take_ids(self) -> list:
