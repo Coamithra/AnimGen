@@ -1155,6 +1155,11 @@ def test_pause_resume_local() -> None:
     app.processEvents()
     assert project.get_take(q1.id).status == STATUS_DONE
     assert project.get_take(q2.id).status == STATUS_DONE
+
+    # resume_local skips ids that are no longer PENDING (already done) or unknown (runner
+    # dropped) - a no-op that still clears the flag and re-enqueues nothing.
+    assert jm.resume_local([q1.id, q2.id, "nonexistent-id"]) == 0
+    assert jm.is_local_paused() is False
     print("pause_resume_local OK: held PENDING, active finished, resume re-ran the held takes")
 
 

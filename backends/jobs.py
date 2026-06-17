@@ -96,7 +96,9 @@ class GenerationJob(QRunnable):
                 # The render was deliberately halted to be put back on the queue (Pause batch ->
                 # "halt current & re-add"): reset to PENDING so a resume re-runs it, rather than
                 # recording it terminally. The runner is kept (see _on_job_done) for the re-enqueue.
-                self.project.update_take(tid, status=STATUS_PENDING, error=None)
+                # Clear `started` so the held take looks like any other PENDING one; the re-run
+                # re-stamps it (so "done in X" reflects the attempt that actually completed).
+                self.project.update_take(tid, status=STATUS_PENDING, error=None, started=None)
                 self.project.update_job(job.id, state="cancelled",
                                         log="\n".join(log_lines + [err, "re-queued by pause"]))
                 self.signals.status_changed.emit(tid, STATUS_PENDING)
@@ -297,9 +299,11 @@ class JobManager(QObject):
         Flags the take in `_requeue` (so the worker resets it to PENDING, not terminal, when
         its poll loop unwinds) and interrupts the comfy prompt - `stop_work` leaves the server
         UP, so the render error is a clean workflow-style unwind, never misread as a crash.
-        Local/comfyui only; the runner is kept for the re-enqueue. Best-effort backend call."""
+        Local/comfyui only; the runner is kept for the re-enqueue. Best-effort backend call.
+        Refuses a take already being stopped via request_stop (a deliberate cancel / shot-delete
+        wins - we must not turn it back into a re-run)."""
         t = self.project.get_take(take_id)
-        if (not t or t.status != STATUS_GENERATING
+        if (not t or t.status != STATUS_GENERATING or take_id in self._stopping
                 or (t.settings_snapshot or {}).get("backend") != "comfyui"):
             return False
         self._requeue.add(take_id)
@@ -337,7 +341,12 @@ class JobManager(QObject):
         retained original runner, and clear the paused flag. Returns how many were re-enqueued.
 
         A held id no longer PENDING (cancelled meanwhile) or whose runner was dropped is
-        skipped. Clears the flag first so re-enqueued takes run under normal crash recovery."""
+        skipped. Clears the flag first so re-enqueued takes run under normal crash recovery.
+
+        A halt-and-requeued take whose worker is still unwinding to PENDING is safe to re-start:
+        the local pool is serialized (one thread), so a re-enqueued job queues behind the
+        still-finishing original and can't render concurrently with it (and the original is
+        already past all its take-status writes - only _on_job_done runs in its finally)."""
         self._local_paused = False
         n = 0
         for tid in take_ids:
