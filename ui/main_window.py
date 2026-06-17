@@ -494,19 +494,18 @@ class MainWindow(QMainWindow):
         # mid-render take (so spend/GPU halts). Both read take state from the project, so
         # they must run before delete_shot drops the takes.
         cancelled = self.jobs.cancel_shot_takes(shot_id)
-        for t in inflight:
-            self.jobs.request_stop(t.id)
+        stopped = sum(1 for t in inflight if self.jobs.request_stop(t.id))
         self.project.delete_shot(shot_id)
         self.reload()
         self._refresh_cancel_action()
         self.queue_tab.refresh()
         note = ""
-        if cancelled or inflight:
+        if cancelled or stopped:
             bits = []
             if cancelled:
                 bits.append(f"cancelled {cancelled} queued")
-            if inflight:
-                bits.append(f"stopped {len(inflight)} rendering")
+            if stopped:
+                bits.append(f"stopped {stopped} rendering")
             note = " (" + ", ".join(bits) + ")"
         self._log(f"deleted shot '{shot.name}'{note}")
 

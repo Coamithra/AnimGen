@@ -122,6 +122,9 @@ class JobManager(QObject):
         self._hosted_pool.setMaxThreadCount(hosted_concurrency)
         self._local_pool = QThreadPool()
         self._local_pool.setMaxThreadCount(1)  # one GPU - serialize local renders
+        # Both sets are shared with worker threads (read in GenerationJob.run, discarded in
+        # its finally). They hold only take ids and are mutated with bare set add/discard/in,
+        # which CPython's GIL makes atomic - no RLock needed (unlike project JSON state).
         self._cancelled: set[str] = set()      # take ids cancelled while still queued
         self._stopping: set[str] = set()       # take ids whose in-flight render we stopped
 
@@ -191,6 +194,12 @@ class JobManager(QObject):
             return False
         self._stopping.add(take_id)
         backend = (t.settings_snapshot or {}).get("backend")
+        # Cooperative cancellation has two narrow windows we can't fully close here: a take
+        # whose worker is already past the backend call lands DONE (its file then orphaned
+        # when the shot is deleted - the separate media-binning gap), and a hosted take
+        # whose create-POST hasn't returned has no backend_job_id yet, so no cancel is sent
+        # and a successful prediction keeps spending. Both are rare; the common case (a
+        # take mid-poll) stops cleanly.
         try:
             if backend == "comfyui":
                 from backends import comfy_client
