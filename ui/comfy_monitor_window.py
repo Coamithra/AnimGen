@@ -201,11 +201,13 @@ class ComfyMonitorWindow(QWidget):
 
         self._set_buttons(running=True)
         dv = snap.get("dynamic_vram")
+        ao = snap.get("async_offload")
         ver = snap.get("version") or "?"
-        if dv:  # amber: up but misconfigured - local jobs will be refused by preflight
-            self._set_status(f"RUNNING  -  ComfyUI {ver}  -  dynamic VRAM ENABLED", "#b07000")
+        if dv or ao:  # amber: up but misconfigured - local jobs will be refused by preflight
+            on = " + ".join(p for p, f in (("dynamic VRAM", dv), ("async offload", ao)) if f)
+            self._set_status(f"RUNNING  -  ComfyUI {ver}  -  {on} ENABLED (TDR risk)", "#b07000")
         else:
-            self._set_status(f"RUNNING  -  ComfyUI {ver}  -  dynamic VRAM off", "#2e7d32")
+            self._set_status(f"RUNNING  -  ComfyUI {ver}  -  weight streaming off", "#2e7d32")
 
         self.versions_lbl.setText(
             f"Python {snap.get('python_version') or '?'}   |   "
