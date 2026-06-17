@@ -73,6 +73,7 @@ class ShotCard(QFrame):
     open_requested = Signal(str)            # open the shot in its own tab (= Edit)
     duplicate_requested = Signal(str)       # copy the shot into a new one
     delete_requested = Signal(str)          # remove the shot (+ its takes)
+    star_toggled = Signal(str)              # toggle the shot's own star
     export_takes_requested = Signal(list)   # take ids (row obeys its view filter)
     open_take_requested = Signal(str)       # take id -> open in the frame-by-frame viewer
     changed = Signal()
@@ -104,6 +105,8 @@ class ShotCard(QFrame):
         menu.addAction("Edit").triggered.connect(lambda: self.open_requested.emit(sid))
         menu.addAction("Generate").triggered.connect(lambda: self.generate_requested.emit(sid))
         menu.addAction("Duplicate").triggered.connect(lambda: self.duplicate_requested.emit(sid))
+        star_label = "Unstar shot" if self.shot.starred else "Star shot"
+        menu.addAction(star_label).triggered.connect(lambda: self.star_toggled.emit(sid))
         menu.addSeparator()
         menu.addAction("Delete").triggered.connect(lambda: self.delete_requested.emit(sid))
         return menu
@@ -139,6 +142,12 @@ class ShotCard(QFrame):
         info.addWidget(QLabel(f"<span style='color:#bbb'>{prompt or '(no prompt)'}</span>"))
 
         self.counts = QLabel("")
+        self.star_btn = QToolButton()
+        self.star_btn.setCheckable(True)
+        self.star_btn.setAutoRaise(True)
+        self.star_btn.setToolTip("Star this shot")
+        self._refresh_star_btn()
+        self.star_btn.clicked.connect(lambda: self.star_toggled.emit(self.shot.id))
         gen_btn = QPushButton("Generate"); gen_btn.clicked.connect(
             lambda: self.generate_requested.emit(self.shot.id))
         exp_btn = QPushButton("Export row"); exp_btn.clicked.connect(
@@ -146,6 +155,7 @@ class ShotCard(QFrame):
 
         header = QHBoxLayout()
         header.addWidget(self.expand_btn)
+        header.addWidget(self.star_btn)
         header.addWidget(self.start_thumb)
         header.addWidget(self.end_thumb)
         header.addLayout(info, 1)
@@ -162,6 +172,11 @@ class ShotCard(QFrame):
         lay.addWidget(hw)
         lay.addWidget(self.body)
         self.refresh_counts()
+
+    def _refresh_star_btn(self) -> None:
+        on = bool(self.shot.starred)
+        self.star_btn.setChecked(on)
+        self.star_btn.setText("★" if on else "☆")
 
     # ---- expand / takes -------------------------------------------------
     def _on_toggle(self, on: bool) -> None:
