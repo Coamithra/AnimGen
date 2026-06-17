@@ -57,6 +57,9 @@ class Take:
     error: Optional[str] = None
     created: str = ""
     completed: Optional[str] = None
+    backend_job_id: Optional[str] = None    # comfy prompt id / replicate prediction id;
+                                            # recorded at submit so an orphaned (app-restarted)
+                                            # take can be reconciled against the backend later
 
 
 @dataclass

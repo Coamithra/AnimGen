@@ -13,10 +13,14 @@ discarding); finished takes auto-persist (see store/project.py).
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
+import threading
+from collections import Counter
+from datetime import datetime
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDockWidget, QFileDialog, QLabel, QMainWindow,
@@ -26,12 +30,14 @@ from PySide6.QtWidgets import (
 
 import library
 import paths
-from backends import comfy_client, replicate_client
+from backends import comfy_client, recovery, replicate_client
 from backends.jobs import JobManager
 from pipeline import export, framing
 from store import app_settings
 from store.project import Project
-from store.models import STATUS_PENDING
+from store.models import (
+    STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
+)
 from ui.assets_view import AssetsView
 from ui.shot_card import ShotCard
 from ui.comfy_monitor_window import ComfyMonitorWindow
@@ -44,6 +50,26 @@ from ui.take_player import TakePlayerTab
 # settings keys passed to the hosted client explicitly (everything else -> extra/--set)
 _EXPLICIT_SETTINGS = ("duration", "resolution", "seed", "length")
 _PROJECT_FILTER = "AnimGen project (*.animproj)"
+
+
+class _OrphanReconciler(QObject):
+    """Off-thread fetch of ComfyUI /history + /queue for orphan-take recovery.
+
+    Probing a down localhost port costs a full socket timeout on this machine, so the
+    fetch runs on a daemon thread and results are applied on the GUI thread. Emits
+    (history, queue); both are None if ComfyUI is unreachable."""
+    ready = Signal(object, object)
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            hist = comfy_client.history_view(timeout=4)
+            queue = comfy_client.queue_view(timeout=4)
+        except Exception:  # noqa: BLE001 - unreachable/down server -> recover what we can offline
+            hist = queue = None
+        self.ready.emit(hist, queue)
 
 
 class MainWindow(QMainWindow):
@@ -65,6 +91,7 @@ class MainWindow(QMainWindow):
         self._build_body()
         self._build_menu()
         self.reload()
+        self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
         self._maybe_refresh_schemas_on_startup()
 
     # ---- construction ---------------------------------------------------
@@ -253,6 +280,7 @@ class MainWindow(QMainWindow):
         self.assets_tab.set_project(project)
         self.queue_tab.set_project(project)
         self.reload()
+        self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
 
     def _maybe_save_changes(self) -> bool:
         """Prompt before discarding unsaved authoring edits. Return False to abort. Covers
@@ -593,13 +621,101 @@ class MainWindow(QMainWindow):
         if size_node and length:
             size_sets[f"{size_node}.length"] = int(length)
 
+        def on_submit(pid):   # persist the comfy prompt id so an app restart mid-render
+            self.project.update_take(take_id, backend_job_id=pid)  # can reconcile this take
+
         def runner(progress):
             start_kp, end_kp = framing.render_keyposes(shot, tempfile.mkdtemp(prefix="animgen_kp_"))
             return comfy_client.generate(
                 tpl, out_path, start=start_kp, end=end_kp,
                 prompt=shot.prompt or None, negative=shot.negative_prompt or None,
-                seed=settings.get("seed"), node_roles=roles, sets=size_sets, progress_cb=progress)
+                seed=settings.get("seed"), node_roles=roles, sets=size_sets,
+                progress_cb=progress, on_submit=on_submit,
+                text_encoder_cpu=True)   # keep the ~6GB encoder off the 12GB card (see comfy_client)
         return runner
+
+    def _make_monitor_runner(self, take_id: str, prompt_id: str):
+        """A runner that re-attaches to an in-flight ComfyUI prompt (orphan recovery)."""
+        out_path = self.project.takes_dir / f"{take_id}.mp4"
+
+        def runner(progress):
+            return comfy_client.monitor(prompt_id, out_path, progress_cb=progress)
+        return runner
+
+    # ---- orphan recovery -----------------------------------------------
+    def _recover_orphans(self) -> None:
+        """Reconcile takes a prior session left mid-render on the local backend.
+
+        On load there are no live workers, so any comfyui take still at generating/pending
+        is orphaned. Fetch ComfyUI state off-thread (the server outlives the app), then
+        reclaim finished renders, re-attach running ones, and clear the dead ones."""
+        if not recovery.comfy_orphans(self.project):
+            return
+        proj = self.project                       # guard against a project switch mid-fetch
+        self._reconciler = _OrphanReconciler()    # kept on self so it isn't GC'd
+        self._reconciler.ready.connect(lambda h, q: self._apply_recovery(proj, h, q))
+        self._reconciler.start()
+
+    def _apply_recovery(self, proj, history, queue) -> None:
+        if proj is not self.project:              # user switched projects before the fetch returned
+            return
+        orphans = recovery.comfy_orphans(proj)
+        if not orphans:
+            return
+        if history is None:                       # ComfyUI unreachable - can't tell finished
+            cancelled = 0                         # from lost; only clear never-submitted takes
+            for t in orphans:
+                if t.status == STATUS_PENDING:
+                    proj.update_take(t.id, status=STATUS_CANCELLED,
+                                     error="not submitted before restart; re-Generate to run it")
+                    self._refresh_shot(t.shot_id)
+                    cancelled += 1
+            left = len(orphans) - cancelled
+            parts = []
+            if cancelled:
+                parts.append(f"cancelled {cancelled} un-submitted")
+            if left:
+                parts.append(f"left {left} unfinished (ComfyUI unreachable)")
+            if parts:
+                self._log("orphan recovery: " + "; ".join(parts))
+            self._refresh_cancel_action()
+            return
+        self._execute_plans(recovery.plan_comfy_recovery(orphans, history, queue))
+
+    def _execute_plans(self, plans) -> None:
+        counts: Counter = Counter()
+        for p in plans:
+            if p.action == recovery.RECLAIM:
+                try:
+                    dst = self.project.takes_dir / f"{p.take_id}.mp4"
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p.output_path, dst)
+                    self.project.update_take(
+                        p.take_id, status=STATUS_DONE, video_path=str(dst),
+                        backend_job_id=p.prompt_id,
+                        completed=datetime.now().isoformat(timespec="seconds"))
+                except Exception as e:  # noqa: BLE001 - a failed copy must not abort the rest
+                    self.project.update_take(p.take_id, status=STATUS_FAILED,
+                                             error=f"recovery copy failed: {e}")
+                    self._log(f"orphan {p.take_id[:8]}: reclaim FAILED: {e}")
+                    counts["fail"] += 1
+                    self._refresh_shot(p.shot_id)
+                    continue
+            elif p.action == recovery.REATTACH:
+                self.project.update_take(p.take_id, status=STATUS_GENERATING,
+                                         backend_job_id=p.prompt_id)
+                self.jobs.enqueue(p.take_id, "comfyui",
+                                  self._make_monitor_runner(p.take_id, p.prompt_id))
+            elif p.action == recovery.FAIL:
+                self.project.update_take(p.take_id, status=STATUS_FAILED, error=p.reason)
+            elif p.action == recovery.CANCEL:
+                self.project.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason)
+            counts[p.action] += 1
+            self._log(f"orphan {p.take_id[:8]}: {p.reason}")
+            self._refresh_shot(p.shot_id)
+        if counts:
+            self._log("orphan recovery: " + ", ".join(f"{n} {a}" for a, n in counts.items()))
+        self._refresh_cancel_action()
 
     # ---- export ---------------------------------------------------------
     def export_takes(self, take_ids: list, label: Optional[str] = None) -> None:

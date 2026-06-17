@@ -23,7 +23,9 @@ import paths  # noqa: E402
 from backends import comfy_client, replicate_client  # noqa: E402
 from paths import WORKFLOWS_DIR  # noqa: E402
 from store.project import Project  # noqa: E402
-from store.models import STATUS_DONE, STATUS_FAILED, STATUS_PENDING  # noqa: E402
+from store.models import (  # noqa: E402
+    STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING, Take,
+)
 
 paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
 
@@ -216,7 +218,18 @@ def test_comfy_prepare() -> None:
     assert not any(isinstance(v, list) and v and str(v[0]) == "10"
                    for n in wf3.values() for v in n.get("inputs", {}).values()), \
         "end-image node should have no consumers when no end frame is given"
-    print("comfy prepare_workflow OK: node-role map + heuristic fallback + --set + open-ended sever")
+
+    # text_encoder_cpu pins CLIP-loader nodes to the CPU (frees ~6GB VRAM on the 12GB card);
+    # default leaves the template's device untouched. Node 3 is the CLIPLoader.
+    assert wf["3"]["inputs"]["device"] == "default", "default run must not force CPU"
+    wf_cpu = comfy_client.prepare_workflow(
+        template, start_img=str(a), end_img=str(b), prompt="P", negative="N",
+        seed=1, node_roles=roles, text_encoder_cpu=True)
+    assert wf_cpu["3"]["inputs"]["device"] == "cpu", "text_encoder_cpu must pin CLIPLoader to cpu"
+    # _force_text_encoder_cpu only touches CLIP-loader class types, nothing else.
+    assert comfy_client._force_text_encoder_cpu({"x": {"class_type": "KSamplerAdvanced",
+                                                       "inputs": {}}}) == 0
+    print("comfy prepare_workflow OK: node-role map + heuristic fallback + --set + open-ended sever + cpu-text-enc")
 
 
 def test_dynamic_vram_gate() -> None:
@@ -233,10 +246,11 @@ def test_comfy_launch_helpers() -> None:
     cmd = comfy_client.build_launch_command()
     assert cmd[1].endswith("main.py")
     assert "--disable-dynamic-vram" in cmd and "--port" in cmd
+    assert "--cache-none" in cmd      # no cross-run model caching -> no VRAM left pinned for spill
     # overriding a default flag drops its value too (no orphaned 8188), keeps the flag
     over = comfy_client.build_launch_command(["--port", "8189"])
     assert "8188" not in over and over[-2:] == ["--port", "8189"]
-    assert "--disable-dynamic-vram" in over
+    assert "--disable-dynamic-vram" in over and "--cache-none" in over
     # status probe is non-raising and well-shaped whether or not a server is up
     st = comfy_client.server_status(timeout=1)
     assert set(st) == {"running", "version", "dynamic_vram", "argv"}
@@ -389,6 +403,90 @@ def test_cancel_pending() -> None:
     print("cancel_pending OK: queued cancelled, in-progress job left running")
 
 
+def test_comfy_views() -> None:
+    # history_view / queue_view normalize ComfyUI's /history + /queue into the shape the
+    # recovery planner consumes (prompt_id + baked seeds + outputs). Stub _api so no server.
+    saved = comfy_client._api
+    hist = {
+        "P1": {"status": {"status_str": "success", "completed": True},
+               "outputs": {"39": {"gifs": [{"filename": "FLF_00006_.mp4", "subfolder": ""}]}},
+               "prompt": [5, "P1", {"3": {"class_type": "KSampler",
+                                          "inputs": {"noise_seed": 1032416659}}}]},
+        "P2": {"status": {"status_str": "error"},
+               "outputs": {}, "prompt": [6, "P2", {"3": {"inputs": {"seed": 77}}}]},
+    }
+    queue = {"queue_running": [[9, "P3", {"3": {"inputs": {"noise_seed": 200}}}]],
+             "queue_pending": [[10, "P4", {"3": {"inputs": {"seed": 400}}}]]}
+
+    def fake_api(path, data=None, timeout=30):
+        return hist if path == "/history" else queue
+
+    comfy_client._api = fake_api
+    try:
+        hv = comfy_client.history_view()
+        h1 = next(h for h in hv if h["prompt_id"] == "P1")
+        assert h1["seeds"] == {1032416659} and h1["ok"] is True
+        assert h1["outputs"][-1].name == "FLF_00006_.mp4"
+        h2 = next(h for h in hv if h["prompt_id"] == "P2")
+        assert h2["ok"] is False and h2["outputs"] == []        # error entry flagged not-ok
+        qv = comfy_client.queue_view()
+        assert {q["prompt_id"]: q["state"] for q in qv} == {"P3": "running", "P4": "pending"}
+        assert next(q for q in qv if q["prompt_id"] == "P3")["seeds"] == {200}
+    finally:
+        comfy_client._api = saved
+    print("comfy history_view/queue_view OK: seeds, outputs, ok-flag, running/pending split")
+
+
+def test_orphan_recovery() -> None:
+    from backends import recovery
+
+    # comfy_orphans selects only mid-flight comfyui takes (generating before pending),
+    # ignoring done takes and hosted ones.
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    snap_local = {"backend": "comfyui"}
+    pend = project.add_take(shot.id, status=STATUS_PENDING, seed=400,
+                            settings_snapshot=snap_local)
+    gen = project.add_take(shot.id, status=STATUS_GENERATING, seed=200,
+                           settings_snapshot=snap_local)
+    project.add_take(shot.id, status=STATUS_DONE, settings_snapshot=snap_local)      # excluded
+    project.add_take(shot.id, status=STATUS_GENERATING, seed=1,                      # excluded:
+                     settings_snapshot={"backend": "replicate"})                     # hosted
+    orphans = recovery.comfy_orphans(project)
+    assert [o.id for o in orphans] == [gen.id, pend.id], "generating-first, hosted/done excluded"
+
+    # plan_comfy_recovery: the four actions + prompt-id match + seed match + claim dedup.
+    def t(tid, status, seed=None, job=None):
+        return Take(id=tid, shot_id="s", status=status, seed=seed, backend_job_id=job)
+
+    history = [
+        {"prompt_id": "Pdone", "seeds": {100}, "outputs": [Path("out/A_00006_.mp4")], "ok": True},
+        {"prompt_id": "Pid",   "seeds": {999}, "outputs": [Path("out/B.mp4")], "ok": True},
+        {"prompt_id": "Pone",  "seeds": {500}, "outputs": [Path("out/C.mp4")], "ok": True},
+    ]
+    queue = [{"prompt_id": "Prun", "seeds": {200}, "state": "running"}]
+    orphan_list = [
+        t("reclaim",  STATUS_GENERATING, seed=100),               # seed -> history -> RECLAIM
+        t("reattach", STATUS_GENERATING, seed=200),               # seed -> queue   -> REATTACH
+        t("byid",     STATUS_GENERATING, seed=999, job="Pid"),    # prompt-id match -> RECLAIM
+        t("dead",     STATUS_GENERATING, seed=300),               # no match (gen)  -> FAIL
+        t("nope",     STATUS_PENDING,    seed=400),               # no match (pend) -> CANCEL
+        t("dup1",     STATUS_GENERATING, seed=500),               # claims Pone     -> RECLAIM
+        t("dup2",     STATUS_GENERATING, seed=500),               # Pone taken      -> FAIL
+    ]
+    plans = {p.take_id: p for p in recovery.plan_comfy_recovery(orphan_list, history, queue)}
+    assert plans["reclaim"].action == recovery.RECLAIM
+    assert plans["reclaim"].output_path.endswith("A_00006_.mp4")
+    assert plans["reclaim"].prompt_id == "Pdone"
+    assert plans["reattach"].action == recovery.REATTACH and plans["reattach"].prompt_id == "Prun"
+    assert plans["byid"].action == recovery.RECLAIM and plans["byid"].prompt_id == "Pid"
+    assert plans["dead"].action == recovery.FAIL
+    assert plans["nope"].action == recovery.CANCEL
+    assert plans["dup1"].action == recovery.RECLAIM and plans["dup2"].action == recovery.FAIL, \
+        "a finished render must be claimed by exactly one take"
+    print("orphan recovery OK: select + reclaim/reattach/fail/cancel + prompt-id + seed dedup")
+
+
 if __name__ == "__main__":
     test_build_input()
     test_capability_sync()
@@ -399,6 +497,8 @@ if __name__ == "__main__":
     test_dynamic_vram_gate()
     test_comfy_launch_helpers()
     test_comfy_stop_helpers()
+    test_comfy_views()
+    test_orphan_recovery()
     test_total_price()
     test_cost_summary()
     test_cancel_pending()
