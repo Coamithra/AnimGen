@@ -15,9 +15,11 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -27,7 +29,9 @@ COMFY_PORT = 8188
 COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
 COMFY_OUTPUT_DIR = COMFY_DIR / "output"
 
-ProgressCb = Optional[Callable[[str], None]]
+# A progress callback takes either progress(line) for a milestone log line, or
+# progress(frac=.., label=..) for a 0..1 completion fraction (the WS step progress below).
+ProgressCb = Optional[Callable[..., None]]
 
 
 class ComfyError(RuntimeError):
@@ -439,6 +443,93 @@ def prepare_workflow(template: dict, *, start_img: Optional[str] = None,
     return wf
 
 
+def progress_fraction(msg: dict, prompt_id: str) -> tuple[Optional[float], str]:
+    """(fraction 0..1, label) from a ComfyUI WS message, or (None, '') if it carries no
+    usable progress for our prompt.
+
+    Handles both the flat 'progress' message (value/max) and the newer per-node
+    'progress_state', plus 'executing' with a null node (sampling done). Filters by
+    prompt_id when the message carries one - local renders are serialized (one prompt at a
+    time), so a legacy 'progress' with no prompt_id is still unambiguously ours. Pure (no
+    I/O) so it's unit-testable headless.
+    """
+    data = msg.get("data") or {}
+    mpid = data.get("prompt_id")
+    if mpid is not None and prompt_id and mpid != prompt_id:
+        return None, ""              # progress for some other prompt
+
+    def _frac(value, mx) -> tuple[Optional[float], str]:
+        if isinstance(value, (int, float)) and isinstance(mx, (int, float)) and mx > 0:
+            return max(0.0, min(1.0, value / mx)), f"step {int(value)}/{int(mx)}"
+        return None, ""
+
+    mtype = msg.get("type")
+    if mtype == "progress":
+        return _frac(data.get("value"), data.get("max"))
+    if mtype == "progress_state":
+        # Report only the furthest-along actively-running node. Deliberately DON'T infer
+        # 100% from "all listed nodes finished": progress_state lists only nodes seen so far,
+        # so between two samplers (sampler 1 done, sampler 2 not yet listed) that would flash
+        # a premature 100%. The terminal 1.0 comes from the 'executing' null message below.
+        running = [n for n in (data.get("nodes") or {}).values()
+                   if isinstance(n, dict) and 0 < (n.get("value") or 0) < (n.get("max") or 0)]
+        if running:
+            pick = max(running, key=lambda n: (n.get("value") or 0) / (n.get("max") or 1))
+            return _frac(pick.get("value"), pick.get("max"))
+        return None, ""
+    if mtype == "executing" and data.get("node") is None:
+        return 1.0, ""               # our prompt finished sampling
+    return None, ""
+
+
+def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressCb,
+                          stop: "threading.Event") -> None:
+    """Best-effort: stream ComfyUI's WebSocket progress into progress_cb(frac=.., label=..).
+
+    Any failure (no websocket-client, server without /ws, dropped socket) is swallowed - the
+    /history poll in submit() still drives the render to completion, just without a live bar.
+    """
+    if progress_cb is None:
+        return
+    try:
+        import websocket  # websocket-client; optional dependency, best-effort
+    except Exception:
+        return
+    ws_url = (COMFY_URL.replace("https://", "wss://").replace("http://", "ws://")
+              + f"/ws?clientId={client_id}")
+    ws = None
+    try:
+        ws = websocket.create_connection(ws_url, timeout=5)
+        ws.settimeout(1.0)
+        while not stop.is_set():
+            try:
+                raw = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue             # tick so we can re-check stop
+            except Exception:
+                break
+            if not isinstance(raw, str) or not raw:
+                continue             # skip binary frames (preview images in practice)
+            try:
+                msg = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            frac, label = progress_fraction(msg, prompt_id)
+            if frac is not None:
+                try:
+                    progress_cb(frac=frac, label=label)
+                except Exception:
+                    pass
+    except Exception:
+        return
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
 def _entry_outputs(entry: dict) -> list[Path]:
     """Absolute paths of every media file a /history entry produced."""
     produced = []
@@ -491,12 +582,24 @@ def submit(wf: dict, out_path: Path, progress_cb: ProgressCb = None,
            timeout_s: int = 3600, poll_s: int = 5,
            on_submit: Optional[Callable[[str], None]] = None) -> dict:
     preflight(progress_cb)
-    res = _api("/prompt", {"prompt": wf})
+    client_id = uuid.uuid4().hex
+    res = _api("/prompt", {"prompt": wf, "client_id": client_id})
     pid = res["prompt_id"]
     _log(progress_cb, f"queued {pid}")
     if on_submit:                     # record the prompt id NOW so a take orphaned mid-render
         on_submit(pid)                # (app restart) can be reconciled against the backend
-    return _poll_until_done(pid, out_path, progress_cb, timeout_s, poll_s)
+    stop = threading.Event()
+    ws_thread: Optional[threading.Thread] = None
+    if progress_cb is not None:       # live step progress over the WS (best-effort)
+        ws_thread = threading.Thread(target=_ws_progress_listener,
+                                     args=(client_id, pid, progress_cb, stop), daemon=True)
+        ws_thread.start()
+    try:
+        return _poll_until_done(pid, out_path, progress_cb, timeout_s, poll_s)
+    finally:
+        stop.set()
+        if ws_thread is not None:
+            ws_thread.join(timeout=2)
 
 
 def monitor(prompt_id: str, out_path: Path, progress_cb: ProgressCb = None,
