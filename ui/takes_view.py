@@ -122,25 +122,28 @@ class _ResizeHandle(QFrame):
         self._press_y: float | None = None
         self._base_h = 0
 
-    def mousePressEvent(self, e):  # noqa: N802 - Qt override
-        self._press_y = e.globalPosition().y()
+    def mousePressEvent(self, event):  # noqa: N802 - Qt override
+        self._press_y = event.globalPosition().y()
         self._base_h = self._owner.current_view_height()
-        e.accept()
+        event.accept()
 
-    def mouseMoveEvent(self, e):  # noqa: N802 - Qt override
+    def mouseMoveEvent(self, event):  # noqa: N802 - Qt override
         if self._press_y is None:
             return
-        delta = int(e.globalPosition().y() - self._press_y)
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._press_y = None    # release was missed (off-widget / focus stolen) - drop the drag
+            return
+        delta = int(event.globalPosition().y() - self._press_y)
         self._owner.set_manual_height(self._base_h + delta)
-        e.accept()
+        event.accept()
 
-    def mouseReleaseEvent(self, e):  # noqa: N802 - Qt override
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt override
         self._press_y = None
-        e.accept()
+        event.accept()
 
-    def mouseDoubleClickEvent(self, e):  # noqa: N802 - Qt override
+    def mouseDoubleClickEvent(self, event):  # noqa: N802 - Qt override
         self._owner.clear_manual_height()
-        e.accept()
+        event.accept()
 
 
 class TakesView(QWidget):
@@ -298,6 +301,8 @@ class TakesView(QWidget):
 
     def resizeEvent(self, event):  # noqa: N802 - Qt override: width change -> different column count
         super().resizeEvent(event)
+        # _apply_height pins the view's height, which can feed back here; it settles in one
+        # pass because rows_for is idempotent for a given width (same width -> same height).
         self._apply_height()
 
     def _label(self, t) -> str:

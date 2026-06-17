@@ -115,7 +115,13 @@ def test_takes_view() -> None:
     assert tv.view.minimumHeight() == tv.view.maximumHeight()
     tv.set_manual_height(0)                                     # below min -> clamped to one row
     assert tv.view.maximumHeight() == preview_height(s, 1)
-    tv.clear_manual_height()
+    tv.set_manual_height(preview_height(s, 3))                  # in-range -> honored verbatim
+    assert tv.view.maximumHeight() == preview_height(s, 3)
+    tv.load()                                                   # the manual pin must survive a reload
+    assert tv.view.maximumHeight() == preview_height(s, 3)
+    tv._apply_icon_size()                                       # ...and an icon-size re-layout
+    assert tv.view.maximumHeight() == preview_height(s, 3)
+    tv.clear_manual_height()                                    # double-click handle -> back to auto-fit
     assert tv._user_height is None
     print("TakesView OK: filter, star toggle, delete-to-bin, counts, auto-fit + drag-resize height")
 
