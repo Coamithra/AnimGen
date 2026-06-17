@@ -23,7 +23,8 @@ references assets for its start/end keyframes.
 
 ## Status (2026-06-16)
 
-Built in 6 phases, **all 6 headless smoke suites pass** (`scripts/smoke_phase1-6.py`).
+Built in 6 phases, **all 7 headless smoke suites pass** (`scripts/smoke_phase1-7.py`;
+phase 7 covers the `remote/` control server).
 Storage is **file-based `.animproj` documents** (Project → Shots → Takes), replacing the
 old single SQLite DB. Shots reference **assets** (keyframe images imported into the
 project's `.assets/`); the 1254² contract keypose is framed **at generation time** from
@@ -39,7 +40,7 @@ and a live local take. The backends are verified offline only.
 .venv/Scripts/python.exe app.py                      # launch the app (Windows)
 
 # headless smoke tests (no spend, no GPU, no real renderer)
-for n in 1 2 3 4 5 6; do QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
+for n in 1 2 3 4 5 6 7; do QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
   .venv/Scripts/python.exe scripts/smoke_phase$n.py; done
 
 # (re)build the starter project from the shipped-move manifest (idempotent;
@@ -78,7 +79,8 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 | `store/schema_cache.py` | persistent cache of Replicate input schemas (`data/schema_cache.json`, keyed by `replicate_model_id`); lock-guarded, atomic writes (reuses `store.project._atomic_write_json`). Populated by the Model Library tab; read by the shot editor for per-param enums/types **and to decide whether a model accepts a negative prompt** |
 | `store/app_settings.py` | app-global user preferences (`data/app_settings.json`; `get_bool`/`set_bool`). Own file (NOT `app_state.json`, which `main_window._remember_last` rewrites wholesale). Same lock + atomic-write discipline as `schema_cache`. First key `update_schemas_on_startup` (default off) — read by `MainWindow` to auto-refresh Replicate schemas at launch, toggled from the **Settings** menu |
 | `store/prompt_library.py` | app-global library of reusable prompt prefabs (`data/prompt_templates.json`; entry = `{name, positive, negative}`, upsert-by-name). Same lock + atomic-write discipline as `schema_cache`; ships seed templates; read/written by the shot tab's Prompt subtab template combo |
-| `scripts/` | `seed_configs.py` (writes `Fighter.animproj`, imports keyframes as assets) + `smoke_phase*.py` + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) |
+| `remote/` | opt-in localhost control server so an external agent (Claude) can drive the live GUI like a web page — `server.py` (`RemoteControlServer`: `ThreadingHTTPServer` on 127.0.0.1, endpoints `/health` `/snapshot` `/screenshot` `/click` `/type` `/key` `/set`), `bridge.py` (`GuiBridge`: marshals each widget touch onto the GUI thread via a posted `QEvent`, so it never races the event loop and still works while a modal is open), `snapshot.py` (pure, headless-testable: `build_snapshot`/`resolve_target` + action primitives `do_click`/`do_type`/`do_key`/`do_set`/`grab_png`). Off unless `ANIMGEN_REMOTE` is truthy; `MainWindow._maybe_start_remote` starts it, `closeEvent` stops it |
+| `scripts/` | `seed_configs.py` (writes `Fighter.animproj`, imports keyframes as assets) + `smoke_phase*.py` + `remote_cli.py` (stdlib client for the `remote/` control server) + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) |
 | `data/` | runtime (gitignored): `*.animproj` project files (default `Fighter.animproj`) + their sidecar `<name>.assets/` (flat keyframe images + `takes/`, `thumbs/`, `.bin/`); plus `exports/`, `_scratch/` (untitled-project assets), `app_state.json` (last opened) |
 | `workflows/` | bundled ComfyUI templates for the local backend |
 
@@ -116,6 +118,9 @@ Setup if `.venv` is missing: `python -m venv .venv` then
 - `ANIMGEN_COMFY_DIR` (default `../comfyui`) — local ComfyUI (input/output dirs).
 - **`REPLICATE_TOKEN`** — read from the environment, then a repo-local `.env`, then
   the source project's `.env`. The token is **never committed** (`.env` is gitignored).
+- `ANIMGEN_REMOTE` (default off) — when truthy, start the localhost control server that
+  lets Claude drive the GUI (see `remote/`). `ANIMGEN_REMOTE_PORT` (default 8765; 0 =
+  ephemeral) sets its port. Localhost-only, no auth — a dev/automation aid, not for prod.
 
 ## Hard-won rules / gotchas
 
@@ -229,3 +234,18 @@ Setup if `.venv` is missing: `python -m venv .venv` then
     normal `progress(line)` path, so they show on the take in the Queue tab and the main log.
     Each retry re-runs `preflight()`, so the dynamic-VRAM gate is never weakened. (Distinct from
     `backends/recovery.py`, which reconciles takes orphaned by an *app* restart on load.)
+13. **Claude can drive the GUI over an opt-in localhost control server** (`remote/`), so a
+    desktop-app change can be verified without full-PC-control / pixel-clicking. It's the
+    same model as the Chrome MCP, scoped to AnimGen: `GET /snapshot` returns a DOM-like list
+    of the visible widgets (`ref`/`class`/`name`/`text`/`rect`/`enabled`), `GET /screenshot`
+    returns a PNG of the window via **`QWidget.grab()`** (Qt's own compositor — no OS
+    screen-capture, works even occluded), and `POST /click|/type|/key|/set` drive a widget by
+    `ref` / `objectName` / visible `text`. Two non-obvious invariants: **(a)** the HTTP server
+    runs on a daemon thread but every widget touch is marshalled onto the GUI thread by
+    `GuiBridge.call` (a posted `QEvent`); a modal runs a nested event loop so the calls still
+    land while the **cost-confirm gate** is open — the gate is *driven*, never bypassed.
+    **(b)** It is **off by default** and **127.0.0.1-only, no auth** — enable per-launch with
+    `ANIMGEN_REMOTE=1` (port via `ANIMGEN_REMOTE_PORT`, default 8765). Drive it with
+    `scripts/remote_cli.py` or `curl`; pure helpers + a full round-trip are covered by
+    `smoke_phase7`. Add an `objectName` to a control only when text/`Class:ordinal` targeting
+    is ambiguous (a few exist: `mainTabs`, `modelFilter`, `starredFilter`, `logDock`).

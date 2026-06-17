@@ -2,7 +2,7 @@
 
 Step-by-step workflow for picking up and completing any card from the [Animation Generator Tool Trello board](https://trello.com/b/7SycR6UZ) (board id `6a2d752eee5f9d7478ad3250`). Lists are **To Do → In Progress → Done** (plus a **Notes / Decisions** list).
 
-AnimGen is a native **PySide6 desktop app** (Python 3.12) — there is no build step, no dev server, and no browser preview. The gate before shipping is the **headless smoke suite** (`scripts/smoke_phase1-6.py`), not a typecheck/`npm test`.
+AnimGen is a native **PySide6 desktop app** (Python 3.12) — there is no build step, no dev server, and no browser preview. The gate before shipping is the **headless smoke suite** (`scripts/smoke_phase1-7.py`), not a typecheck/`npm test`. (You can also drive the live GUI without full-PC control via the opt-in localhost control server — launch with `ANIMGEN_REMOTE=1` and use `scripts/remote_cli.py`; see `remote/` in `CLAUDE.md`.)
 
 ---
 
@@ -149,11 +149,12 @@ Dig into the problem before proposing solutions. Use `/research` for topics that
 
 There is no typecheck/build gate (Pyright flags `from store…/from ui…` as unresolved — false positives; the repo root is on `sys.path` at runtime). The smoke suite is the gate.
 
-16. **Run the headless smoke suite** — all six phases must pass:
+16. **Run the headless smoke suite** — all seven phases must pass:
     ```
-    for n in 1 2 3 4 5 6; do QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
+    for n in 1 2 3 4 5 6 7; do QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
       .venv/Scripts/python.exe scripts/smoke_phase$n.py; done
     ```
+    (From a worktree, phase 6 needs the real Fighter root — prefix `ANIMGEN_FIGHTER_ROOT=C:/Programming/Fighter`, since the default `../Fighter` resolves under `.trees/` instead.)
     Add or extend a smoke phase for the behaviour you changed. Smoke tests must stay headless — never call a modal's `.exec()`, and override `paths.SCRATCH_DIR` to a tempdir so untitled-project scratch stays out of `data/`
 17. **Manual smoke for UI / pipeline changes** — smoke tests don't cover everything:
     - UI changes: launch `.venv/Scripts/python.exe app.py`, exercise the affected tab/dialog by hand
@@ -178,7 +179,7 @@ There is no typecheck/build gate (Pyright flags `from store…/from ui…` as un
 22.4. **If the merge is messy, restart from main.** When conflicts are widespread or hard to reason about, it's safer to take main wholesale and reimplement your changes on top. A clean re-apply is better than a botched merge
 22.5. **Re-read the final result.** After resolving, read through every conflicted file in full. Make sure the merged code actually makes sense — don't just trust the conflict markers
 
-23. **Re-run the smoke suite** — make sure the merge didn't break anything: run all six phases again (Phase 5, step 16)
+23. **Re-run the smoke suite** — make sure the merge didn't break anything: run all seven phases again (Phase 5, step 16)
 24. **Return to the root checkout** — `cd` back to the project root (where `main` is checked out). Remaining steps run from here
 25. **Open a PR and self-merge** — `gh pr create --fill` then `gh pr merge --merge` (real merge commit, not `--squash`, so the branch's commits stay reachable and step 26's `git branch -d` still works), then `git pull origin main` to fast-forward the root checkout. **No approval needed** — `main` is unprotected on this solo repo, so GitHub disabling "Approve" on your own PR is irrelevant; a required review only applies under a branch-protection rule, of which there is none. The PR is a record/URL with no extra ceremony — don't wait on a human to approve. (Direct `git merge <branch> && git push` is the fallback if `gh` is unavailable.)
 26. **Clean up the worktree and branch** — kill any app instance or ComfyUI server still running from the worktree FIRST (it holds the worktree directory lock)
