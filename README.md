@@ -24,19 +24,20 @@ python -m venv .venv
 
 Hosted generation reads `REPLICATE_TOKEN` from a `.env` in the repo root (gitignored)
 or the environment. Local generation needs ComfyUI on `127.0.0.1:8188`, started with
-**`--disable-dynamic-vram`**. Easiest is the **Launch ComfyUI** button in the app's
-**ComfyUI Status** tab (starts it detached with the flag, logs to
+**`--disable-dynamic-vram --disable-async-offload`**. Easiest is the **Launch ComfyUI**
+button in the app's **ComfyUI Status** tab (starts it detached with the flags, logs to
 `data/comfyui_server.log`, and reports when it's ready). Equivalent from a terminal:
 
 ```bash
 .venv/Scripts/python.exe scripts/launch_comfyui.py    # or: scripts\launch_comfyui.bat
 ```
 
-Why the flag: ComfyUI's default dynamic-VRAM (aimdo) engine streams weights mid-render
-and, on the 12GB card, stalls a 14B render past Windows' 2s GPU watchdog (TDR), which
-resets the driver and kills the server mid-job. AnimGen refuses to launch a local job
-against a server that has dynamic VRAM enabled (checked via `/system_stats`); bypass
-with `ANIMGEN_ALLOW_DYNAMIC_VRAM=1`. Background:
+Why the flags: ComfyUI has two independent engines that stream weights over PCIe
+mid-render — dynamic VRAM (aimdo) and async weight offloading (default-on on Nvidia/AMD,
+*not* covered by `--disable-dynamic-vram`). On the 12GB card either can stall a 14B render
+past Windows' 2s GPU watchdog (TDR), which resets the driver and kills the server mid-job.
+AnimGen refuses to launch a local job against a server still using either path (checked via
+`/system_stats`); bypass with `ANIMGEN_ALLOW_DYNAMIC_VRAM=1`. Background:
 `../Fighter/research/comfyui-gpu-watchdog-crash-and-aimdo.md`.
 
 External locations default to siblings of the repo and can be overridden:

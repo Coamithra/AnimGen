@@ -6,12 +6,14 @@ Run from the project root with the animgen venv, e.g.:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
 # animgen/ is the import root for `paths`, `library`, `store`, `ui`, `backends`...
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QIcon  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -27,6 +29,19 @@ def _app_icon() -> QIcon:
     if paths.APP_ICON_ICO.exists():
         return QIcon(str(paths.APP_ICON_ICO))
     return QIcon(str(paths.APP_ICON_SVG))
+
+
+def _force_software_rendering() -> None:
+    """Run Qt's own rendering on software (no GPU device context) so a GPU driver reset
+    (TDR) can't tear AnimGen down alongside ComfyUI - then the rule-#12 crash recovery
+    actually gets to run. AnimGen is pure QtWidgets + CPU (PyAV) video decode, so this only
+    changes how its *own* window paints; the WAN render runs in ComfyUI/CUDA and is wholly
+    unaffected (zero quality impact). Must run before QApplication is constructed. Windows-only;
+    escape hatch ANIMGEN_ALLOW_GPU_UI=1 keeps hardware GL (e.g. to debug rendering)."""
+    if sys.platform != "win32" or os.environ.get("ANIMGEN_ALLOW_GPU_UI"):
+        return
+    os.environ.setdefault("QT_OPENGL", "software")
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
 
 
 def _set_windows_app_id() -> None:
@@ -61,6 +76,7 @@ def _resolve_project() -> Project:
 def main() -> int:
     paths.ensure_dirs()
     log = applog.setup()
+    _force_software_rendering()       # before QApplication: survive a GPU TDR (see rule #15)
     _set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("AnimGen")

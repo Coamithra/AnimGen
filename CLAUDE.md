@@ -83,12 +83,12 @@ Full mechanism + invariants in **Hard-won rule #13**.
 
 | Path | Role |
 |---|---|
-| `app.py` | entry point (adds repo root to `sys.path`; opens the last/seeded/new Project, shows MainWindow) |
+| `app.py` | entry point (adds repo root to `sys.path`; opens the last/seeded/new Project, shows MainWindow). Wires up `applog` diagnostics + `_force_software_rendering()` (Windows software-GL so a GPU TDR can't kill the UI — rule #15) before `QApplication` |
 | `paths.py` | all paths + external-location config (see below); `DEFAULT_PROJECT`, `SCRATCH_DIR`, `APP_STATE` |
 | `library.py` / `model_library.json` | model-roster loader (+ `aspect_ratios(model_id)`, `sync_model_capabilities` — writes the two refresh-derived capability flags back into the roster, atomic+lock-guarded) + the roster (authored IDs/costs/notes/`aspect_ratios`/`supports_end_frame`, plus auto-synced `supports_negative_prompt`/`supports_camera_fixed`; local `comfy_nodes.size_node`) |
 | `store/project.py` `store/models.py` | file-based **Project** document (shots / takes / jobs) + dataclasses (`Shot`/`Take`/`Job`). Hybrid persistence: shot edits buffer (`dirty`, saved on `save()`); takes write through to `<assets>/takes.json`. Keyframe **assets** (`list_assets`/`import_asset`/`remove_asset` — image files flat in `.assets/`) + a load-time migration that flattens old `keyposes/<hash>/` baked files. Shots carry a `starred` flag (`set_shot_starred`, buffered like other shot edits — unlike a take's write-through star). RLock-guarded; atomic JSON writes |
 | `backends/replicate_client.py` | hosted generation (refactor of Fighter's `run_replicate.py`). `get_input_schema` **inlines enum `$ref`s** (`_resolve_enums`/`_follow_enum`/`_deref`): Replicate stores a property's allowed values as a `$ref`/`allOf`/`anyOf`/`oneOf` into `components.schemas`, not inline, so the resolver pulls each referenced `enum` (+ `type`) onto the property before returning — without this the editor never sees live options and silently falls back to the authored lists. `run_prediction`/`generate` take an `on_submit(pred_id)` callback (mirrors comfy's) that fires right after the create POST so the take records `backend_job_id` mid-render and becomes cancellable; `cancel_prediction(pred_id)` POSTs `/predictions/{id}/cancel` (best-effort, stops spend) |
-| `backends/comfy_client.py` | local ComfyUI generation (node-role mapping); also server lifecycle/status/preflight: `launch_server` (tracks the Popen in `_server_proc`), `stop_work` (interrupt+clear queue), `stop_server` (terminate ours, else kill by port via `_pid_on_port`/`_kill_pid`), `server_status`, `monitor_snapshot`, `list_models`, `build_launch_command`, `preflight`, `dynamic_vram_enabled`; plus crash-recovery lifecycle: `wait_until_responsive` (poll `server_status` until the server answers), `restart_server` (stop -> `launch_server` -> wait, used after a mid-render crash), and `ensure_server` (launch + wait if the server is *down*, no-op if up — the cold-start path called once before a local render, distinct from the mid-render `restart_server`). During a render `submit()` opens a **best-effort progress WebSocket** (`/ws`) on a daemon thread and feeds per-step fractions to the UI; `progress_fraction()` (pure, headless-testable) maps `progress`/`progress_state` `value`/`max` → a 0..1 fraction |
+| `backends/comfy_client.py` | local ComfyUI generation (node-role mapping); also server lifecycle/status/preflight: `launch_server` (tracks the Popen in `_server_proc`), `stop_work` (interrupt+clear queue), `stop_server` (terminate ours, else kill by port via `_pid_on_port`/`_kill_pid`), `server_status`, `monitor_snapshot`, `list_models`, `build_launch_command`, `preflight`, `dynamic_vram_enabled`/`async_offload_enabled` (preflight refuses a server using *either* PCIe weight-streaming path — see rule #10); plus crash-recovery lifecycle: `wait_until_responsive` (poll `server_status` until the server answers), `restart_server` (stop -> `launch_server` -> wait, used after a mid-render crash), and `ensure_server` (launch + wait if the server is *down*, no-op if up — the cold-start path called once before a local render, distinct from the mid-render `restart_server`). During a render `submit()` opens a **best-effort progress WebSocket** (`/ws`) on a daemon thread and feeds per-step fractions to the UI; `progress_fraction()` (pure, headless-testable) maps `progress`/`progress_state` `value`/`max` → a 0..1 fraction |
 | `backends/batch.py` | overnight **batch render** pure helpers (no Qt; dependency-injected, headless-testable): `plan_batch` (eligibility filter — unknown model / invalid aspect / no start frame skipped — + the `confirm_launch` item list, **N per eligible shot**), `BatchRun` (in-memory tracker; done when every take is terminal — done/failed/cancelled, which also covers 3-strike abandon), `build_batch_report` (morning summary), `sleep_command` (OS suspend argv), `POWER_NONE`/`POWER_STOP_COMFY`/`POWER_SLEEP`. The Qt side (queueing, the single cost gate, drain reaction, power action) lives in `main_window.start_batch`/`_finalize_batch`/`_perform_power_action`; the dialog is `ui/batch_dialog.py` |
 | `backends/crash_recovery.py` | `run_with_crash_recovery` — wraps one local render with crash detection + auto-restart + 3-strike retry (pure / dependency-injected so it's headless-testable): a failure with ComfyUI **down** is a crash (restart the server, retry the same take in place), a failure with it **up** is a genuine workflow error (propagates, fails only that take); after `MAX_ATTEMPTS` crashes raises `QueueAbandoned` so the caller pauses the local queue. `format_elapsed` (pure) for the "failed in XmYs" note |
 | `backends/jobs.py` | `JobManager` on QThreadPool; hosted parallel, local serialized; status signals; `cancel_pending`/`pending_count`; **`cancel_shot_takes(shot_id)`** (cancel just one shot's queued takes) + **`request_stop(take_id)`** (stop an in-flight GENERATING render — comfy `stop_work` / replicate `cancel_prediction`, best-effort; flags the take in `_stopping` so the worker's unwinding backend error records CANCELLED, not FAILED; **`is_stop_requested(take_id)`** lets the hosted runner's `on_submit` self-cancel a prediction whose create-POST returned only after the stop was requested — closing the window where `request_stop` skipped the cancel because `backend_job_id` wasn't recorded yet) + **`abandon_local(reason)`** (pause the local queue after repeated crashes — clears the local pool + cancels still-pending *comfyui* takes, hosted untouched, emits **`queue_abandoned`**); `set_project` to switch the active project. Worker threads call `project.update_take` (write-through). Emits **`progress_pct(take_id, fraction, label)`** (ephemeral, UI-only — never persisted) alongside the free-text `progress` signal; the runner callback is widened to `progress(line)` for milestones / `progress(frac=.., label=..)` for the step fraction |
@@ -219,16 +219,27 @@ Full mechanism + invariants in **Hard-won rule #13**.
    `store.project._atomic_write_json`). Two takes finishing at once will otherwise race
    `os.replace` on Windows (`WinError 32`); the atomic-write helper holds the lock across
    build+write and retries briefly for AV/indexer locks.
-10. **Local backend MUST run with `--disable-dynamic-vram`.** ComfyUI's default
-    dynamic-VRAM (aimdo) engine stalls a 14B render past Windows' 2s GPU watchdog (TDR)
-    on the 12GB card → driver reset → server dies mid-job, no traceback (Fighter, a night
-    of crashes 2026-06-14; see `../Fighter/research/comfyui-gpu-watchdog-crash-and-aimdo.md`).
-    AnimGen doesn't start ComfyUI, so it can't pass the flag — instead `comfy_client.preflight()`
-    reads the server's launch `argv` from `/system_stats` and **refuses to submit a local
-    job** if dynamic VRAM is enabled (mirrors ComfyUI's own `enables_dynamic_vram()` gate).
-    Start ComfyUI with the flag baked in via the **Launch ComfyUI** button in the **ComfyUI Status** tab (detached,
-    logs to `data/comfyui_server.log`) or `scripts/launch_comfyui.py`/`.bat` — all three share
-    `comfy_client.build_launch_command()`. Escape hatch: `ANIMGEN_ALLOW_DYNAMIC_VRAM=1`.
+10. **Local backend MUST disable BOTH PCIe weight-streaming paths
+    (`--disable-dynamic-vram --disable-async-offload`).** ComfyUI streams 14B weights
+    RAM↔VRAM mid-kernel over PCIe, and on the 12GB card a single op can stall past Windows'
+    2s GPU watchdog (TDR) → driver reset → server dies mid-job, no traceback (Fighter, a
+    night of crashes 2026-06-14; AnimGen overnight-batch kill 2026-06-17; see
+    `../Fighter/research/comfyui-gpu-watchdog-crash-and-aimdo.md`). There are **two
+    independent** streaming engines and disabling one is not enough: **dynamic VRAM**
+    (the `comfy-aimdo` engine, gated by `enables_dynamic_vram()`, off via
+    `--disable-dynamic-vram`/`--highvram`/`--gpu-only`/`--novram`/`--cpu`) **and async
+    weight offloading** (`--async-offload`, a *separate* path **default-on on Nvidia/AMD**,
+    `NUM_STREAMS=2`, NOT covered by `--disable-dynamic-vram` — off only via
+    `--disable-async-offload`/`--cpu`/`--async-offload 0`). The 2026-06-17 kill happened with
+    aimdo correctly off but async offload still on ("Using async weight offloading with 2
+    streams"). AnimGen doesn't start ComfyUI, so `comfy_client.preflight()` reads the launch
+    `argv` (+ device type) from `/system_stats` and **refuses to submit a local job** if
+    *either* path is active (`dynamic_vram_enabled()` / `async_offload_enabled()`; `/system_stats`
+    exposes no direct aimdo field, so detection stays argv-derived). Start ComfyUI with both
+    flags via the **Launch ComfyUI** button in the **ComfyUI Status** tab (detached, logs to
+    `data/comfyui_server.log`) or `scripts/launch_comfyui.py`/`.bat` — `build_launch_command()`
+    is the source of truth (`REQUIRED_FLAGS`); the `.bat` hardcodes the same flags to match.
+    Escape hatch: `ANIMGEN_ALLOW_DYNAMIC_VRAM=1` (bypasses the whole guard).
     Note: probing a *down* localhost port costs a full socket timeout on this machine (SYNs
     to closed ports are dropped, not refused), so the **ComfyUI Status** tab polls on a
     daemon thread (`_MonitorPoller`, started only while that tab is visible) and never
@@ -309,3 +320,16 @@ Full mechanism + invariants in **Hard-won rule #13**.
     (`batch.sleep_command()`), both best-effort on a daemon thread. Pure logic (`plan_batch`,
     `BatchRun`, `build_batch_report`, `sleep_command`) is in `backends/batch.py`, smoke-tested in
     `smoke_phase2.test_batch`.
+15. **AnimGen runs its own UI on software rendering so a GPU TDR can't kill it.** A driver
+    reset (rule #10) is a kernel-level event that invalidates **every** GPU device context on
+    the machine at once — it killed ComfyUI *and* AnimGen together (2026-06-17), so the rule-#12
+    crash recovery never got to run (the orchestrator died too). `app._force_software_rendering()`
+    runs **before `QApplication`** (Windows-only) and forces Qt to software OpenGL
+    (`QT_OPENGL=software` + `AA_UseSoftwareOpenGL`) so the UI process holds **no GPU device
+    context**. AnimGen is pure QtWidgets + **CPU (PyAV) video decode** (`ui/take_player.py`
+    decodes to QImages/QPixmaps — no QtMultimedia/QtQuick/QOpenGL anywhere), so this changes
+    only how its *own* window paints; the WAN render runs in ComfyUI/CUDA and is **bit-for-bit
+    unaffected (zero quality impact)**. A TDR now kills only ComfyUI; AnimGen survives, sees the
+    dropped render, and rule-#12 restarts+retries — overnight batches become resilient. Escape
+    hatch `ANIMGEN_ALLOW_GPU_UI=1` keeps hardware GL. (Complementary to rule #10: #10 *prevents*
+    the TDR, #15 *survives* it — both quality-neutral.)

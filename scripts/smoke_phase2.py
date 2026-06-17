@@ -239,21 +239,84 @@ def test_dynamic_vram_gate() -> None:
     assert comfy_client.dynamic_vram_enabled(base + ["--disable-dynamic-vram"]) is False
     for disabler in ("--highvram", "--gpu-only", "--novram", "--cpu"):
         assert comfy_client.dynamic_vram_enabled(base + [disabler]) is False, disabler
-    print("comfy dynamic-VRAM gate OK: default-on, off on each disabling flag")
+
+    # Async weight offloading is a SECOND streaming path: default-ON on a GPU (device.type
+    # 'cuda'), independent of dynamic VRAM, off only via --disable-async-offload / --cpu / 0.
+    ao = comfy_client.async_offload_enabled
+    assert ao(base, "cuda") is True                      # default-on on a GPU
+    assert ao(base, "cpu") is False                      # never on a CPU device
+    assert ao(base, None) is True                        # unknown device -> conservative refuse
+    assert ao(base + ["--disable-async-offload"], "cuda") is False
+    assert ao(base + ["--cpu"], "cuda") is False
+    assert ao(base + ["--async-offload", "0"], "cuda") is False  # explicit 0 -> off
+    assert ao(base + ["--async-offload", "4"], "cpu") is True     # explicit count -> on
+    # mirrors ComfyUI's own `if NUM_STREAMS > 0` gate: a non-positive count never streams
+    assert ao(base + ["--async-offload", "-1"], "cuda") is False
+    assert ao(base + ["--async-offload"], "cuda") is True         # bare flag -> const 2
+    assert ao(base + ["--async-offload=0"], "cuda") is False
+    # --disable-dynamic-vram alone does NOT turn async offload off (the actual TDR bug).
+    assert ao(base + ["--disable-dynamic-vram"], "cuda") is True
+    print("comfy weight-streaming gate OK: dynamic-VRAM + async-offload, each disabling flag")
+
+
+def test_preflight_gate() -> None:
+    # preflight() must refuse if EITHER streaming path is active; pass only when both are off.
+    # Stub _api so no real server is needed; restore it afterward.
+    saved_api = comfy_client._api
+    base = ["main.py", "--listen", "127.0.0.1", "--port", "8188"]
+
+    def fake_stats(argv, device_type="cuda"):
+        return lambda path, *a, **k: {"system": {"argv": argv},
+                                      "devices": [{"type": device_type}]}
+    try:
+        # aimdo off but async offload still on (the 2026-06-17 bug) -> still refused
+        comfy_client._api = fake_stats(base + ["--disable-dynamic-vram"])
+        try:
+            comfy_client.preflight()
+            assert False, "preflight should refuse a server still doing async offload"
+        except comfy_client.ComfyError as e:
+            assert "async weight offloading" in str(e)
+        # both streaming paths off -> passes
+        comfy_client._api = fake_stats(base + ["--disable-dynamic-vram", "--disable-async-offload"])
+        comfy_client.preflight()
+        # unknown device type (None) is the safety-critical reading: async offload assumed on
+        comfy_client._api = fake_stats(base + ["--disable-dynamic-vram"], device_type=None)
+        try:
+            comfy_client.preflight()
+            assert False, "preflight should refuse when the device type is unknown (assume GPU)"
+        except comfy_client.ComfyError as e:
+            assert "async weight offloading" in str(e)
+        # dynamic VRAM on -> refused
+        comfy_client._api = fake_stats(base + ["--disable-async-offload"])
+        try:
+            comfy_client.preflight()
+            assert False, "preflight should refuse a server with dynamic VRAM on"
+        except comfy_client.ComfyError as e:
+            assert "dynamic VRAM" in str(e)
+        # bypass env neutralizes the guard even with everything on
+        os.environ["ANIMGEN_ALLOW_DYNAMIC_VRAM"] = "1"
+        comfy_client._api = fake_stats(base)              # both on
+        comfy_client.preflight()
+    finally:
+        os.environ.pop("ANIMGEN_ALLOW_DYNAMIC_VRAM", None)
+        comfy_client._api = saved_api
+    print("comfy preflight gate OK: refuses dynamic-VRAM OR async-offload, bypass honored")
 
 
 def test_comfy_launch_helpers() -> None:
     cmd = comfy_client.build_launch_command()
     assert cmd[1].endswith("main.py")
     assert "--disable-dynamic-vram" in cmd and "--port" in cmd
+    assert "--disable-async-offload" in cmd  # the second PCIe weight-streaming path, also off
     assert "--cache-none" in cmd      # no cross-run model caching -> no VRAM left pinned for spill
     # overriding a default flag drops its value too (no orphaned 8188), keeps the flag
     over = comfy_client.build_launch_command(["--port", "8189"])
     assert "8188" not in over and over[-2:] == ["--port", "8189"]
-    assert "--disable-dynamic-vram" in over and "--cache-none" in over
+    assert "--disable-dynamic-vram" in over and "--disable-async-offload" in over
+    assert "--cache-none" in over
     # status probe is non-raising and well-shaped whether or not a server is up
     st = comfy_client.server_status(timeout=1)
-    assert set(st) == {"running", "version", "dynamic_vram", "argv"}
+    assert set(st) == {"running", "version", "dynamic_vram", "async_offload", "argv"}
     assert isinstance(st["running"], bool)
     # monitor snapshot + models list are non-raising too (the monitor window relies on it)
     snap = comfy_client.monitor_snapshot(timeout=1)
@@ -1146,6 +1209,7 @@ if __name__ == "__main__":
     test_roster_integrity()
     test_comfy_prepare()
     test_dynamic_vram_gate()
+    test_preflight_gate()
     test_comfy_launch_helpers()
     test_comfy_stop_helpers()
     test_comfy_views()

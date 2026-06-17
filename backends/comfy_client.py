@@ -80,28 +80,89 @@ def dynamic_vram_enabled(argv: list[str]) -> bool:
     return not (_DYNAMIC_VRAM_DISABLERS & set(argv))
 
 
-def preflight(progress_cb: ProgressCb = None) -> None:
-    """Abort before launching a local job if the running ComfyUI has dynamic VRAM on.
+# Async weight offloading is a SECOND, independent mid-kernel PCIe weight-streaming path.
+# It is NOT the aimdo dynamic-VRAM engine and is NOT gated by enables_dynamic_vram(), so
+# --disable-dynamic-vram does NOT turn it off. ComfyUI enables it by default on Nvidia/AMD
+# (comfy/model_management.py: NUM_STREAMS=2) unless --disable-async-offload (or --cpu, or an
+# explicit --async-offload 0) is given. It streams weights RAM<->VRAM the same way aimdo
+# does, so it can stall a 14B op past Windows' 2s TDR watchdog just as well - it was the
+# actual trigger of the 2026-06-17 overnight-batch kill (banner: "Using async weight
+# offloading with 2 streams"). The guard must refuse it too, not just dynamic VRAM.
 
-    Queries /system_stats (which echoes the server's launch argv) and raises ComfyError
-    with the fix if dynamic VRAM is enabled. No-op when ANIMGEN_ALLOW_DYNAMIC_VRAM is set.
-    Doubles as a reachability check (clear error if the server is down).
+
+def _async_offload_value(argv: list[str]) -> Optional[int]:
+    """The explicit --async-offload stream count in `argv`, or None if the flag is absent.
+
+    Mirrors ComfyUI's argparse (nargs='?', const=2): bare `--async-offload` -> 2,
+    `--async-offload N` / `--async-offload=N` -> N, a non-int/missing value -> 2.
+    """
+    for i, tok in enumerate(argv):
+        if tok == "--async-offload":
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            if nxt is None:
+                return 2          # bare trailing flag -> const 2
+            try:
+                return int(nxt)   # explicit count (incl. 0 / negative, like argparse)
+            except ValueError:
+                return 2          # next token isn't a count (e.g. another flag) -> const 2
+        if tok.startswith("--async-offload="):
+            try:
+                return int(tok.split("=", 1)[1])
+            except ValueError:
+                return 2
+    return None
+
+
+def async_offload_enabled(argv: list[str], device_type: Optional[str] = None) -> bool:
+    """True if a ComfyUI launched with `argv` streams weights via async offload.
+
+    Mirror of ComfyUI's NUM_STREAMS computation: an explicit --async-offload sets the count;
+    --disable-async-offload (or --cpu) forces it off; otherwise it defaults ON (2 streams) on
+    a GPU device, which Nvidia *and* AMD report to torch as device.type 'cuda'. `device_type`
+    is /system_stats devices[0].type. When it's unknown (None) we assume a GPU - the
+    conservative, refuse-by-default reading, since the silent default-on case is what bit us.
+    """
+    if "--cpu" in argv:
+        return False
+    if "--disable-async-offload" in argv:
+        return False
+    val = _async_offload_value(argv)
+    if val is not None:
+        return val > 0
+    return device_type in (None, "cuda")
+
+
+def preflight(progress_cb: ProgressCb = None) -> None:
+    """Abort before launching a local job if the running ComfyUI streams weights over PCIe.
+
+    Queries /system_stats (which echoes the server's launch argv + device type) and raises
+    ComfyError if EITHER mid-kernel PCIe weight-streaming path is active - dynamic VRAM
+    (aimdo) or async weight offloading - since both can stall a 14B op past the 2s TDR
+    watchdog. No-op when ANIMGEN_ALLOW_DYNAMIC_VRAM is set. Doubles as a reachability check
+    (clear error if the server is down).
     """
     if os.environ.get("ANIMGEN_ALLOW_DYNAMIC_VRAM"):
-        _log(progress_cb, "preflight: dynamic-VRAM guard bypassed (ANIMGEN_ALLOW_DYNAMIC_VRAM)")
+        _log(progress_cb, "preflight: TDR weight-streaming guard bypassed (ANIMGEN_ALLOW_DYNAMIC_VRAM)")
         return
     stats = _api("/system_stats")
     argv = stats.get("system", {}).get("argv", [])
+    device_type = (stats.get("devices") or [{}])[0].get("type")
+    active = []
     if dynamic_vram_enabled(argv):
+        active.append("dynamic VRAM (aimdo)")
+    if async_offload_enabled(argv, device_type):
+        active.append("async weight offloading")
+    if active:
         raise ComfyError(
-            "ComfyUI is running with DYNAMIC VRAM ENABLED. On the 12GB card this trips "
-            "Windows' 2s GPU watchdog (TDR) on 14B renders and kills the server mid-job. "
-            "Restart ComfyUI with --disable-dynamic-vram - e.g. run "
-            "scripts/launch_comfyui.py (or .bat), or add the flag to your own launch "
-            "command. Set ANIMGEN_ALLOW_DYNAMIC_VRAM=1 to bypass this guard. Details: "
+            f"ComfyUI is streaming model weights over PCIe ({' + '.join(active)}). On the "
+            "12GB card this trips Windows' 2s GPU watchdog (TDR) on 14B renders and kills "
+            "the server mid-job - and a driver reset can take AnimGen down with it. Restart "
+            "ComfyUI with --disable-dynamic-vram --disable-async-offload - e.g. use the "
+            "Launch ComfyUI button or run scripts/launch_comfyui.py (or .bat), which apply "
+            "both. Set ANIMGEN_ALLOW_DYNAMIC_VRAM=1 to bypass this guard. Details: "
             "../Fighter/research/comfyui-gpu-watchdog-crash-and-aimdo.md."
         )
-    _log(progress_cb, "preflight: dynamic VRAM disabled - OK")
+    _log(progress_cb, "preflight: weight streaming disabled (dynamic VRAM + async offload) - OK")
 
 
 # --- Server process management ----------------------------------------------
@@ -109,14 +170,17 @@ def preflight(progress_cb: ProgressCb = None) -> None:
 # scripts/launch_comfyui.py CLI) so --disable-dynamic-vram is always applied.
 # build_launch_command() is the single source of truth for HOW to start it.
 
-# --disable-dynamic-vram: avoids the TDR-watchdog crash (see above).
+# --disable-dynamic-vram + --disable-async-offload: turn OFF both mid-kernel PCIe
+#   weight-streaming paths (aimdo dynamic VRAM, and async weight offloading - the second,
+#   default-on-Nvidia/AMD path that --disable-dynamic-vram does NOT cover). Either can stall
+#   a 14B op past the 2s GPU watchdog -> TDR -> server (and possibly AnimGen) dies (see above).
 # --cache-none: re-execute every node each run instead of caching model results in VRAM.
 #   On the 12GB card the dual-14B Wan workflow (~24GB of weights through 12GB) can't keep
 #   the prior run's models resident, so caching just leaves ~4-5GB pinned that the next
 #   render then spills to system RAM over PCIe (the 8 -> 36 s/it slowdown). Dropping the
 #   cache fully unloads each model before the next loads, so each 9GB expert gets the whole
 #   card. Costs a few seconds of reload per run; saves the per-step PCIe streaming.
-REQUIRED_FLAGS = ["--disable-dynamic-vram", "--cache-none"]
+REQUIRED_FLAGS = ["--disable-dynamic-vram", "--disable-async-offload", "--cache-none"]
 _DEFAULT_FLAGS = [("--listen", "127.0.0.1"), ("--port", str(COMFY_PORT))]  # (flag, value)
 _server_proc: "Optional[subprocess.Popen]" = None  # the ComfyUI we launched, if any
 
@@ -143,16 +207,21 @@ def build_launch_command(extra: Optional[list[str]] = None) -> list[str]:
 def server_status(timeout: int = 2) -> dict:
     """Non-raising probe of the local ComfyUI server.
 
-    Returns {running, version, dynamic_vram, argv}. dynamic_vram is None when the server
-    is down, else True/False derived from its launch argv (the gate preflight enforces).
+    Returns {running, version, dynamic_vram, async_offload, argv}. dynamic_vram and
+    async_offload are None when the server is down, else True/False derived from its launch
+    argv (+ device type); the two together are the PCIe-weight-streaming gate preflight enforces.
     """
     try:
-        system = _api("/system_stats", timeout=timeout).get("system", {})
+        stats = _api("/system_stats", timeout=timeout)
     except Exception:  # noqa: BLE001 - a status probe must never raise
-        return {"running": False, "version": None, "dynamic_vram": None, "argv": []}
+        return {"running": False, "version": None, "dynamic_vram": None,
+                "async_offload": None, "argv": []}
+    system = stats.get("system", {})
     argv = system.get("argv", [])
+    device_type = (stats.get("devices") or [{}])[0].get("type")
     return {"running": True, "version": system.get("comfyui_version"),
-            "dynamic_vram": dynamic_vram_enabled(argv), "argv": argv}
+            "dynamic_vram": dynamic_vram_enabled(argv),
+            "async_offload": async_offload_enabled(argv, device_type), "argv": argv}
 
 
 def launch_server(extra: Optional[list[str]] = None) -> "subprocess.Popen":
@@ -283,6 +352,7 @@ def monitor_snapshot(timeout: int = 2) -> dict:
         "running": True, "version": system.get("comfyui_version"),
         "python_version": py, "pytorch_version": system.get("pytorch_version"),
         "os": system.get("os"), "argv": argv, "dynamic_vram": dynamic_vram_enabled(argv),
+        "async_offload": async_offload_enabled(argv, dev.get("type")),
         "ram_total": system.get("ram_total"), "ram_free": system.get("ram_free"),
         "device_name": dev.get("name"), "vram_total": dev.get("vram_total"),
         "vram_free": dev.get("vram_free"),
