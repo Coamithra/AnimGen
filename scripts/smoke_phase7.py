@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import threading
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -70,6 +71,30 @@ def test_snapshot_and_resolve() -> None:
     assert snap.resolve_target(w, ref=chk_desc["ref"]) is chk  # Class:ordinal path
     assert snap.resolve_target(w, text="no such widget") is None
     print("snapshot/resolve OK")
+
+
+def test_tab_widget() -> None:
+    """A named QTabWidget (like the app's `mainTabs`) reports its tab titles and switches
+    via /set value=<title> — the inner unnamed QTabBar is not the only tab handle."""
+    from PySide6.QtWidgets import QTabWidget
+
+    app = _app()
+    root = QWidget()
+    lay = QVBoxLayout(root)
+    tw = QTabWidget()
+    tw.setObjectName("mainTabs")
+    tw.addTab(QWidget(), "Shots")
+    tw.addTab(QWidget(), "Assets")
+    lay.addWidget(tw)
+    root.show()
+    app.processEvents()
+
+    desc = next(d for d in snap.build_snapshot(root) if d["ref"] == "mainTabs")
+    assert desc["tabs"] == ["Shots", "Assets"], desc
+    assert desc["current"] == 0, desc
+    res = snap.do_set(snap.resolve_target(root, object_name="mainTabs"), value="Assets")
+    assert res == {"current": 1} and tw.currentIndex() == 1, res
+    print("tab widget OK")
 
 
 def test_actions() -> None:
@@ -129,12 +154,26 @@ def test_server_roundtrip() -> None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.read()
 
+    def post_status(path: str, raw_body: bytes) -> int:
+        req = urllib.request.Request(
+            base + path, data=raw_body, method="POST",
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
     def worker() -> None:
         try:
             results["health"] = json.loads(get("/health"))
             results["snapshot"] = json.loads(get("/snapshot"))
             results["click"] = json.loads(post("/click", {"text": "Generate"}))
             results["png"] = get("/screenshot")
+            # negative paths: missing target -> 404, bad JSON -> 400, non-checkable -> 400
+            results["miss"] = post_status("/click", b'{"ref": "no-such-widget"}')
+            results["badjson"] = post_status("/click", b"{not json")
+            results["noncheck"] = post_status("/set", b'{"ref": "genBtn", "checked": true}')
         except Exception as exc:  # noqa: BLE001 - surfaced as an assertion below
             results["error"] = repr(exc)
         finally:
@@ -149,6 +188,7 @@ def test_server_roundtrip() -> None:
     app.exec()
 
     server.stop()
+    assert results.get("done"), "round-trip never finished (timed out / deadlocked)"
     assert results.get("error") is None, results.get("error")
     assert results["health"]["ok"] is True, results["health"]  # type: ignore[index]
     refs = {d["ref"] for d in results["snapshot"]["widgets"]}  # type: ignore[index]
@@ -156,11 +196,15 @@ def test_server_roundtrip() -> None:
     assert results["click"]["ok"] is True, results["click"]  # type: ignore[index]
     assert clicks == [1], "the click must have fired on the GUI thread via the bridge"
     assert results["png"][:8] == _PNG_MAGIC, "screenshot must be PNG"  # type: ignore[index]
-    print("server round-trip OK")
+    assert results["miss"] == 404, results.get("miss")
+    assert results["badjson"] == 400, results.get("badjson")
+    assert results["noncheck"] == 400, results.get("noncheck")  # genBtn isn't checkable
+    print("server round-trip OK (+ 404/400 negative paths)")
 
 
 if __name__ == "__main__":
     test_snapshot_and_resolve()
+    test_tab_widget()
     test_actions()
     test_server_roundtrip()
     print("PHASE 7 SMOKE: PASS")

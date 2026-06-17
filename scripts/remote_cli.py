@@ -42,6 +42,13 @@ def _request(base: str, method: str, path: str, body: dict | None = None) -> tup
         return exc.read(), exc.headers.get("Content-Type", "")
 
 
+def _print_response(raw: bytes) -> None:
+    try:
+        print(json.dumps(json.loads(raw), indent=2))
+    except ValueError:  # server died / returned a non-JSON body
+        print(raw.decode("utf-8", "replace"))
+
+
 def _selector_body(args) -> dict:
     body: dict = {}
     for key in ("ref", "object_name", "text"):
@@ -75,11 +82,13 @@ def main(argv: list[str]) -> int:
             p.add_argument("--checked", choices=("true", "false"))
 
     args = ap.parse_args(argv)
+    if args.cmd == "type" and not args.text:
+        ap.error("type requires --text")
     base = _base(args.port)
 
     if args.cmd in ("health", "snapshot"):
         raw, _ = _request(base, "GET", "/" + args.cmd)
-        print(json.dumps(json.loads(raw), indent=2))
+        _print_response(raw)
         return 0
 
     if args.cmd == "shot":
@@ -105,7 +114,7 @@ def main(argv: list[str]) -> int:
         if args.checked is not None:
             body["checked"] = args.checked == "true"
     raw, _ = _request(base, "POST", "/" + args.cmd, body)
-    print(json.dumps(json.loads(raw), indent=2))
+    _print_response(raw)
     return 0
 
 

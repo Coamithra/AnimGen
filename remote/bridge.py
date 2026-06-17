@@ -37,8 +37,11 @@ class GuiBridge(QObject):
 
         holder: dict[str, Any] = {}
         done = threading.Event()
+        cancelled = False
 
         def run() -> None:
+            if cancelled:  # caller already timed out and gave up; skip the late side effect
+                return
             try:
                 holder["result"] = fn()
             except BaseException as exc:  # noqa: BLE001 - relayed to the caller thread
@@ -48,6 +51,7 @@ class GuiBridge(QObject):
 
         QApplication.postEvent(self, _CallEvent(run))
         if not done.wait(timeout):
+            cancelled = True
             raise TimeoutError(f"GUI call did not complete within {timeout:.1f}s")
         if "error" in holder:
             raise holder["error"]

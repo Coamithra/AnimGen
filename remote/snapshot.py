@@ -5,8 +5,10 @@ build a small offscreen widget tree, snapshot it, resolve a target, drive it. Th
 layer (remote/server.py) only marshals these onto the GUI thread via the bridge.
 
 A widget's ``ref`` is its ``objectName`` when set, else a deterministic ``Class:ordinal``
-(ordinal = its index among same-class descendants in findChildren order), so a ref handed
-back in a snapshot still resolves on a re-walk a moment later.
+(ordinal = its index among same-class descendants in findChildren order). A ref resolves
+on a re-walk as long as the tree is unchanged; ``objectName`` / visible ``text`` are the
+stable selectors, while ``Class:ordinal`` is best-effort (any added/removed/shown sibling
+shifts later ordinals).
 """
 from __future__ import annotations
 
@@ -16,11 +18,16 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QAbstractButton, QCheckBox, QComboBox, QGroupBox, QLabel, QLineEdit,
-    QPlainTextEdit, QTabBar, QTextEdit, QWidget,
+    QPlainTextEdit, QTabBar, QTabWidget, QTextEdit, QWidget,
 )
 
+# QTabBar and QTabWidget share the count()/tabText()/currentIndex()/setCurrentIndex() API,
+# so they're handled together for snapshot detail + tab-switching.
+_TABS = (QTabBar, QTabWidget)
+
 # Widgets always worth surfacing, even when they carry no text.
-_INTERACTIVE = (QAbstractButton, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QTabBar)
+_INTERACTIVE = (
+    QAbstractButton, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QTabBar, QTabWidget)
 
 # Single-line text accessors, tried in order.
 _TEXT_GETTERS = ("text", "currentText", "title")
@@ -90,7 +97,7 @@ def _describe(window: QWidget, w: QWidget, ordinal: int) -> dict[str, Any]:
         "rect": _window_rect(window, w),
         "enabled": w.isEnabled(),
     }
-    if isinstance(w, QTabBar):
+    if isinstance(w, _TABS):
         d["tabs"] = [w.tabText(i) for i in range(w.count())]
         d["current"] = w.currentIndex()
     if isinstance(w, QComboBox):
@@ -141,6 +148,8 @@ def resolve_target(
                 return None
     if text:
         want = text.strip()
+        if not want:  # whitespace-only would otherwise substring-match every widget
+            return None
         relevant = [w for w in window.findChildren(QWidget) if _is_relevant(w)]
         for w in relevant:
             if _widget_text(w).strip() == want:
@@ -172,6 +181,10 @@ def do_click(widget: QWidget) -> None:
 
 
 def do_type(widget: QWidget, text: str) -> None:
+    """Synthesize keystrokes (exercises the widget's own key handling). Reliable only for
+    simple single-line ASCII: newlines/tabs and many unicode codepoints don't map to key
+    events and are silently dropped — use do_set (the /set route) for multi-line or
+    unicode text."""
     QTest.keyClicks(widget, text)
 
 
@@ -189,14 +202,18 @@ def do_set(
 ) -> dict[str, Any]:
     """Set a value directly (more reliable than synthesizing keystrokes): check state,
     combo current text, tab by title, or line/plain-text edit text."""
-    if checked is not None and hasattr(widget, "setChecked"):
+    if checked is not None:
+        if not hasattr(widget, "setChecked"):
+            raise ValueError(f"{type(widget).__name__} cannot hold a checked state")
+        if hasattr(widget, "isCheckable") and not widget.isCheckable():
+            raise ValueError(f"{type(widget).__name__} is not checkable")
         widget.setChecked(bool(checked))
         return {"checked": widget.isChecked()}
     if value is not None:
         if isinstance(widget, QComboBox):
             widget.setCurrentText(str(value))
             return {"currentText": widget.currentText()}
-        if isinstance(widget, QTabBar):
+        if isinstance(widget, _TABS):
             for i in range(widget.count()):
                 if widget.tabText(i) == str(value):
                     widget.setCurrentIndex(i)

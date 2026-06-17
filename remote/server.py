@@ -29,15 +29,25 @@ from remote import snapshot as snap
 from remote.bridge import GuiBridge
 
 
+_MAX_BODY_BYTES = 1 << 20  # 1 MiB; a sanity cap on a localhost client's Content-Length
+
+
 class TargetNotFound(Exception):
     """No widget matched a click/type/key/set selector."""
 
 
 def _require(window: QWidget, body: dict[str, Any]) -> QWidget:
+    """Resolve a selector to a widget that can actually be driven. A snapshot only lists
+    visible widgets, so a hidden (e.g. on an inactive tab) or disabled match means the
+    action couldn't take effect — reject it rather than return a misleading 'ok'."""
     w = snap.resolve_target(
         window, body.get("ref"), body.get("object_name"), body.get("text"))
     if w is None:
         raise TargetNotFound(body)
+    if not w.isVisible():
+        raise ValueError(f"target is not visible (hidden or on an inactive tab): {body}")
+    if not w.isEnabled():
+        raise ValueError(f"target is disabled: {body}")
     return w
 
 
@@ -78,6 +88,8 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
             return {}
+        if length > _MAX_BODY_BYTES:
+            raise ValueError(f"request body too large ({length} bytes)")
         raw = self.rfile.read(length)
         try:
             data = json.loads(raw.decode("utf-8"))
@@ -224,7 +236,11 @@ class RemoteControlServer:
         return self.port
 
     def stop(self) -> None:
+        # shutdown() stops the accept loop (one ~0.5s poll); with daemon_threads it does
+        # not join in-flight handler threads, so this never blocks the GUI thread on a call.
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
             self._httpd = None
+        self._thread = None
+        self.port = None
