@@ -137,6 +137,12 @@ class MainWindow(QMainWindow):
                              "with optional power-down when it finishes")
         batch_act.triggered.connect(self.start_batch)
         tb.addAction(batch_act)
+        self.pause_act = QAction("Pause batch", self)
+        self.pause_act.setToolTip("Pause the running batch: hold its queued local takes "
+                                  "(and optionally halt the current one), then Resume later")
+        self.pause_act.triggered.connect(self.toggle_pause_batch)
+        self.pause_act.setEnabled(False)
+        tb.addAction(self.pause_act)
         self.cancel_act = QAction("Cancel pending", self)
         self.cancel_act.setToolTip("Cancel all queued generations that haven't started yet")
         self.cancel_act.triggered.connect(self.cancel_pending)
@@ -242,6 +248,7 @@ class MainWindow(QMainWindow):
         self.assets_tab = AssetsView(self.project)
         self.library_tab = ModelLibraryWindow(self)
         self.comfy_tab = ComfyMonitorWindow(self)
+        self.comfy_tab.stop_intent.connect(self._pause_batch_if_running)
 
         self.shots_tab = shots_tab
         # Fixed tabs are closable (the x) and reopen from the View menu; shot tabs are
@@ -731,12 +738,14 @@ class MainWindow(QMainWindow):
         self._log(f"batch started: {len(take_ids)} take(s), when-done={power}")
         self.reload()
         self._refresh_cancel_action()
+        self._refresh_pause_action()
         self.queue_tab.refresh()
 
     def _finalize_batch(self) -> None:
         """Every take in the batch has reached a terminal status: write the report, then run
         the chosen power action. Called from _on_status_changed once BatchRun.complete."""
         b, self._batch = self._batch, None
+        self._refresh_pause_action()
         if b is None:
             return
         rows = []
@@ -794,9 +803,89 @@ class MainWindow(QMainWindow):
         self._log(f"cancelled {n} pending generation(s)" if n
                   else "no pending generations to cancel")
         self._refresh_cancel_action()
+        self._refresh_pause_action()
 
     def _refresh_cancel_action(self) -> None:
         self.cancel_act.setEnabled(self.jobs.pending_count() > 0)
+
+    def _refresh_pause_action(self) -> None:
+        """Pause/Resume is only meaningful while a batch is in flight. Reset its label to
+        'Pause batch' whenever no batch is active (so a finished/aborted batch doesn't leave
+        a stale 'Resume batch')."""
+        b = self._batch
+        self.pause_act.setEnabled(b is not None)
+        self.pause_act.setText("Resume batch" if (b is not None and b.paused) else "Pause batch")
+
+    def toggle_pause_batch(self) -> None:
+        b = self._batch
+        if b is None:
+            return
+        self._resume_batch() if b.paused else self._pause_batch()
+
+    def _pause_batch(self) -> None:
+        """Ask whether to let the current take finish or halt+re-queue it, then hold the rest
+        of the batch's local queue. Held takes stay PENDING (the batch can't finalize while
+        paused), so its when-done power action won't fire until the user resumes and it drains."""
+        b = self._batch
+        if b is None or b.paused:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Pause batch")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("Pause the batch — what about the take currently rendering?")
+        box.setInformativeText(
+            "Pause after current: let it finish, then hold the rest.\n"
+            "Halt current & re-add: stop it now and put it back on the queue to re-run on resume.")
+        after_btn = box.addButton("Pause after current", QMessageBox.ButtonRole.AcceptRole)
+        halt_btn = box.addButton("Halt current && re-add", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(after_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (after_btn, halt_btn):
+            return
+        requeue = clicked is halt_btn
+        held = self.jobs.pause_local(requeue_current=requeue)
+        b.paused = True
+        b.held = held
+        tail = "current halted & re-queued" if requeue else "current take will finish"
+        self._log(f"batch paused — holding {len(held)} local take(s); {tail}. Resume batch to continue.")
+        self._refresh_pause_action()
+        self.reload()
+        self._refresh_cancel_action()
+        self.queue_tab.refresh()
+
+    def _resume_batch(self) -> None:
+        b = self._batch
+        if b is None or not b.paused:
+            return
+        n = self.jobs.resume_local(b.held)
+        b.paused = False
+        b.held = []
+        self._log(f"batch resumed — re-enqueued {n} local take(s)")
+        self._refresh_pause_action()
+        self.reload()
+        self._refresh_cancel_action()
+        self.queue_tab.refresh()
+
+    def _pause_batch_if_running(self) -> None:
+        """A deliberate ComfyUI stop (Stop working / Shut down) was requested from the ComfyUI
+        Status tab. If a batch is running and not already paused, pause it first so the stop
+        sticks instead of being undone by crash-recovery's auto-restart. The in-flight take is
+        lost/interrupted by the stop itself (those buttons already warn of that); the queued
+        local takes are held for resume."""
+        b = self._batch
+        if b is None or b.paused:
+            return
+        held = self.jobs.pause_local()
+        b.paused = True
+        b.held = held
+        self._log(f"batch paused (ComfyUI stopped by user) — holding {len(held)} local "
+                  "take(s). Resume batch to continue.")
+        self._refresh_pause_action()
+        self.reload()
+        self._refresh_cancel_action()
+        self.queue_tab.refresh()
 
     def _on_queue_abandoned(self, reason: str) -> None:
         """The local (ComfyUI) queue was paused after a take crashed repeatedly. Log it,
@@ -889,6 +978,7 @@ class MainWindow(QMainWindow):
                 restart_server=lambda: comfy_client.restart_server(progress_cb=progress),
                 note=progress,
                 on_abandon=self.jobs.abandon_local,
+                should_abort=self.jobs.is_local_paused,
                 clock=time.time)
         return runner
 

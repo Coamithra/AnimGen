@@ -323,7 +323,8 @@ def test_runner_self_cancel_during_submit() -> None:
         model = {"backend": "replicate", "replicate_model_id": "owner/model"}
         runner = win._make_runner(model, shot, {}, take.id)
         job = GenerationJob(project, take.id, "replicate", runner, win.jobs._signals,
-                            win.jobs._cancelled, win.jobs._stopping)
+                            win.jobs._cancelled, win.jobs._stopping, win.jobs._requeue,
+                            win.jobs._on_job_done)
         job.run()
         app.processEvents()
     finally:

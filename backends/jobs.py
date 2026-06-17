@@ -40,7 +40,8 @@ class _JobSignals(QObject):
 
 class GenerationJob(QRunnable):
     def __init__(self, project: Project, take_id: str, backend: str, runner: Runner,
-                 signals: _JobSignals, cancelled: set, stopping: set):
+                 signals: _JobSignals, cancelled: set, stopping: set, requeue: set,
+                 done_cb: Callable[[str, str], None]):
         super().__init__()
         self.project = project
         self.take_id = take_id
@@ -49,6 +50,8 @@ class GenerationJob(QRunnable):
         self.signals = signals
         self.cancelled = cancelled   # shared with JobManager; ids cancelled while queued
         self.stopping = stopping     # shared; ids whose in-flight render was asked to stop
+        self.requeue = requeue       # shared; ids whose in-flight render was halted to re-run
+        self.done_cb = done_cb       # JobManager._on_job_done(take_id, final_status)
 
     @Slot()
     def run(self) -> None:
@@ -56,6 +59,7 @@ class GenerationJob(QRunnable):
         if tid in self.cancelled:    # cancelled while queued - never invoke the backend
             self.project.update_take(tid, status=STATUS_CANCELLED, error="cancelled before start")
             self.signals.status_changed.emit(tid, STATUS_CANCELLED)
+            self.done_cb(tid, STATUS_CANCELLED)
             return
         self.project.update_take(tid, status=STATUS_GENERATING,
                                  started=datetime.now().isoformat(timespec="seconds"))
@@ -63,6 +67,7 @@ class GenerationJob(QRunnable):
         job = self.project.add_job(tid, backend=self.backend, state="running")
 
         log_lines: list[str] = []
+        final = STATUS_FAILED
 
         def progress(line: str | None = None, *, frac: float | None = None,
                      label: str = "") -> None:
@@ -84,9 +89,19 @@ class GenerationJob(QRunnable):
             self.project.update_job(job.id, state="done", ext_id=result.get("prediction_id"))
             self.signals.status_changed.emit(tid, STATUS_DONE)
             self.signals.finished.emit(tid)
+            final = STATUS_DONE
         except Exception as e:  # noqa: BLE001 - surface any backend failure on the take
             err = f"{type(e).__name__}: {e}"
-            if tid in self.stopping or tid in self.cancelled:
+            if tid in self.requeue:
+                # The render was deliberately halted to be put back on the queue (Pause batch ->
+                # "halt current & re-add"): reset to PENDING so a resume re-runs it, rather than
+                # recording it terminally. The runner is kept (see _on_job_done) for the re-enqueue.
+                self.project.update_take(tid, status=STATUS_PENDING, error=None)
+                self.project.update_job(job.id, state="cancelled",
+                                        log="\n".join(log_lines + [err, "re-queued by pause"]))
+                self.signals.status_changed.emit(tid, STATUS_PENDING)
+                final = STATUS_PENDING
+            elif tid in self.stopping or tid in self.cancelled:
                 # The backend error is here because we asked it to stop (shot deleted /
                 # cancelled mid-render), not because the render failed - record CANCELLED.
                 self.project.update_take(tid, status=STATUS_CANCELLED,
@@ -94,13 +109,17 @@ class GenerationJob(QRunnable):
                 self.project.update_job(job.id, state="cancelled",
                                         log="\n".join(log_lines + [err]))
                 self.signals.status_changed.emit(tid, STATUS_CANCELLED)
+                final = STATUS_CANCELLED
             else:
                 self.project.update_take(tid, status=STATUS_FAILED, error=err)
                 self.project.update_job(job.id, state="failed", log="\n".join(log_lines + [err]))
                 self.signals.status_changed.emit(tid, STATUS_FAILED)
                 self.signals.failed.emit(tid, err)
+                final = STATUS_FAILED
         finally:
             self.stopping.discard(tid)
+            self.requeue.discard(tid)
+            self.done_cb(tid, final)
 
 
 class JobManager(QObject):
@@ -126,21 +145,38 @@ class JobManager(QObject):
         self._hosted_pool.setMaxThreadCount(hosted_concurrency)
         self._local_pool = QThreadPool()
         self._local_pool.setMaxThreadCount(1)  # one GPU - serialize local renders
-        # Both sets are shared with worker threads (read in GenerationJob.run, discarded in
-        # its finally). They hold only take ids and are mutated with bare set add/discard/in,
-        # which CPython's GIL makes atomic - no RLock needed (unlike project JSON state).
+        # The sets/flag below are shared with worker threads (read in GenerationJob.run,
+        # discarded in its finally) or read by crash recovery. They hold only take ids /
+        # a bool and are mutated with bare set add/discard/in (GIL-atomic) - no RLock needed
+        # (unlike project JSON state).
         self._cancelled: set[str] = set()      # take ids cancelled while still queued
         self._stopping: set[str] = set()       # take ids whose in-flight render we stopped
+        self._requeue: set[str] = set()        # take ids halted mid-render to re-run on resume
+        # Original runner per enqueued-but-unfinished take, so a paused take can be re-enqueued
+        # with its exact closure (no settings_snapshot drift). Dropped once the take is terminal.
+        self._runners: dict[str, tuple[str, Runner]] = {}
+        self._local_paused = False             # user paused the local queue (read by crash recovery)
 
     def set_project(self, project: Project) -> None:
         """Point the queue at a newly opened/created project."""
         self.project = project
 
     def enqueue(self, take_id: str, backend: str, runner: Runner) -> None:
+        self._runners[take_id] = (backend, runner)
+        self._start(take_id, backend, runner)
+
+    def _start(self, take_id: str, backend: str, runner: Runner) -> None:
         job = GenerationJob(self.project, take_id, backend, runner, self._signals,
-                            self._cancelled, self._stopping)
+                            self._cancelled, self._stopping, self._requeue, self._on_job_done)
         pool = self._local_pool if backend == "comfyui" else self._hosted_pool
         pool.start(job)
+
+    def _on_job_done(self, take_id: str, final_status: str) -> None:
+        """Worker-thread callback fired when a job leaves run(). Drop the retained runner once
+        the take is terminal; keep it when the take was reset to PENDING (halt-and-requeue) so
+        resume_local can re-enqueue the same closure. GIL-atomic dict op, like the sets above."""
+        if final_status != STATUS_PENDING:
+            self._runners.pop(take_id, None)
 
     def active_count(self) -> int:
         return self._hosted_pool.activeThreadCount() + self._local_pool.activeThreadCount()
@@ -161,6 +197,7 @@ class JobManager(QObject):
         if not t or t.status != STATUS_PENDING:
             return False
         self._cancelled.add(take_id)
+        self._runners.pop(take_id, None)
         self.project.update_take(take_id, status=STATUS_CANCELLED, error="cancelled by user")
         self._signals.status_changed.emit(take_id, STATUS_CANCELLED)
         return True
@@ -177,6 +214,7 @@ class JobManager(QObject):
         for t in self.project.list_takes(shot_id, include_deleted=True):
             if t.status == STATUS_PENDING:
                 self._cancelled.add(t.id)
+                self._runners.pop(t.id, None)
                 self.project.update_take(t.id, status=STATUS_CANCELLED,
                                          error="cancelled by user (shot deleted)")
                 self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
@@ -234,15 +272,83 @@ class JobManager(QObject):
         left running - cancel that one with the backend's Stop control. The shared
         `_cancelled` set is a safety net for a runnable already dequeued when we cleared.
         """
+        self._local_paused = False   # cancelling the whole queue clears any user pause
         self._hosted_pool.clear()
         self._local_pool.clear()
         pending = [t for t in self.project.list_takes(include_deleted=False)
                    if t.status == STATUS_PENDING]
         for t in pending:
             self._cancelled.add(t.id)
+            self._runners.pop(t.id, None)
             self.project.update_take(t.id, status=STATUS_CANCELLED, error="cancelled by user")
             self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
         return len(pending)
+
+    def is_local_paused(self) -> bool:
+        """Whether the user paused the local (ComfyUI) queue. Read by crash recovery's
+        should_abort: while paused, a render failure is a deliberate stop, not a crash to
+        restart. GIL-atomic bool read."""
+        return self._local_paused
+
+    def stop_and_requeue(self, take_id: str) -> bool:
+        """Halt an in-flight (GENERATING) local render and reset it to PENDING so a resume
+        re-runs it (Pause batch -> "halt current & re-add"). Returns whether we acted.
+
+        Flags the take in `_requeue` (so the worker resets it to PENDING, not terminal, when
+        its poll loop unwinds) and interrupts the comfy prompt - `stop_work` leaves the server
+        UP, so the render error is a clean workflow-style unwind, never misread as a crash.
+        Local/comfyui only; the runner is kept for the re-enqueue. Best-effort backend call."""
+        t = self.project.get_take(take_id)
+        if (not t or t.status != STATUS_GENERATING
+                or (t.settings_snapshot or {}).get("backend") != "comfyui"):
+            return False
+        self._requeue.add(take_id)
+        try:
+            from backends import comfy_client
+            comfy_client.stop_work()
+        except Exception:  # noqa: BLE001 - best-effort; the worker still unwinds to PENDING
+            pass
+        return True
+
+    def pause_local(self, requeue_current: bool = False) -> list[str]:
+        """Pause the local (ComfyUI) queue and return the take ids being held for resume.
+
+        Sets the paused flag (so crash recovery won't fight a deliberate ComfyUI stop) and
+        drops the not-yet-started local runnables from the pool, leaving their takes PENDING
+        (NOT cancelled) so resume_local can re-enqueue them. The currently-GENERATING take is
+        left to finish normally - unless `requeue_current`, in which case it's halted via
+        stop_and_requeue and included in the held list (resume re-runs it from scratch).
+        Hosted takes are untouched (separate pool, no crash/restart issue)."""
+        self._local_paused = True
+        self._local_pool.clear()
+        held = [t.id for t in self.project.list_takes(include_deleted=False)
+                if t.status == STATUS_PENDING
+                and (t.settings_snapshot or {}).get("backend") == "comfyui"]
+        if requeue_current:
+            gen = next((t for t in self.project.list_takes(include_deleted=False)
+                        if t.status == STATUS_GENERATING
+                        and (t.settings_snapshot or {}).get("backend") == "comfyui"), None)
+            if gen and self.stop_and_requeue(gen.id):
+                held.append(gen.id)
+        return held
+
+    def resume_local(self, take_ids: list[str]) -> int:
+        """Resume a paused local queue: re-enqueue each held take still PENDING, using its
+        retained original runner, and clear the paused flag. Returns how many were re-enqueued.
+
+        A held id no longer PENDING (cancelled meanwhile) or whose runner was dropped is
+        skipped. Clears the flag first so re-enqueued takes run under normal crash recovery."""
+        self._local_paused = False
+        n = 0
+        for tid in take_ids:
+            t = self.project.get_take(tid)
+            entry = self._runners.get(tid)
+            if not t or t.status != STATUS_PENDING or entry is None:
+                continue
+            self._cancelled.discard(tid)
+            self._start(tid, *entry)
+            n += 1
+        return n
 
     def abandon_local(self, reason: str) -> int:
         """Pause the local (ComfyUI) queue after repeated crashes; return how many were cancelled.
@@ -261,6 +367,7 @@ class JobManager(QObject):
                    and (t.settings_snapshot or {}).get("backend") == "comfyui"]
         for t in pending:
             self._cancelled.add(t.id)
+            self._runners.pop(t.id, None)
             self.project.update_take(t.id, status=STATUS_CANCELLED, error=reason)
             self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
         self._signals.queue_abandoned.emit(reason)
