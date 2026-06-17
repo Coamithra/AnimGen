@@ -930,11 +930,13 @@ def test_ensure_server() -> None:
 
         # launched but never answers while the process stays alive -> "did not become responsive".
         comfy_client.wait_until_responsive = lambda *a, **k: False
+        launched.clear()
         try:
             comfy_client.ensure_server(ready_timeout_s=5)
             assert False, "expected ComfyError when the launched server never answers"
         except comfy_client.ComfyError as e:
             assert "did not become responsive" in str(e)
+        assert launched == ["launch"], launched   # it did attempt a launch first
 
         # launched process exited at once (e.g. lost the port bind) -> fast-fail message.
         comfy_client.launch_server = lambda extra=None: FakeProc(returncode=1)

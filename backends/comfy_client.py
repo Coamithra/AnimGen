@@ -242,8 +242,9 @@ def ensure_server(progress_cb: ProgressCb = None, ready_timeout_s: int = 120) ->
     Returns True if it was already running, False if we had to start it. Raises ComfyError
     if the install isn't found or the launched server never becomes responsive within
     ready_timeout_s. A server we launch always gets the required safe flags
-    (--disable-dynamic-vram --cache-none via build_launch_command), so a cold-started server
-    is never the misconfigured kind preflight would reject.
+    (--disable-dynamic-vram --cache-none via build_launch_command), so a server we cold-start
+    is never the misconfigured kind. An *already-running* server is left as-is here; the
+    dynamic-VRAM gate for that case stays with submit()'s preflight(), the right place for it.
 
     Called once before the crash-recovery loop (ui.main_window._make_runner) so a cold start
     is an honest "starting ComfyUI" step, not a server-down failure misread as a crash and
