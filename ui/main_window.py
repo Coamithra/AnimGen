@@ -593,6 +593,7 @@ class MainWindow(QMainWindow):
             "workflow_template": model.get("workflow_template"),
             "start_frame": shot.start_frame, "end_frame": shot.end_frame,
             "prompt": shot.prompt, "negative_prompt": shot.negative_prompt, "settings": settings,
+            "canvas": [shot.canvas_w, shot.canvas_h], "crop": shot.crop,
         }
         take = self.project.add_take(shot.id, status=STATUS_PENDING,
                                      seed=settings.get("seed"), cost_estimate=est,

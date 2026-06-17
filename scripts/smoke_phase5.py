@@ -191,6 +191,101 @@ def test_close_dirty_tab_guard() -> None:
     print("MainWindow OK: close-dirty-tab guard (clean/Cancel/Discard/Save)")
 
 
+def test_format_generation_settings() -> None:
+    """The take-viewer settings formatter renders a full snapshot and degrades cleanly."""
+    from store.models import Take
+    from ui.take_player import format_generation_settings
+
+    t = Take(id="abc123", shot_id="s1", seed=7, settings_snapshot={
+        "model_id": "seedance-2.0-std", "backend": "replicate", "prompt": "fierce kick",
+        "negative_prompt": "blurry", "canvas": [1254, 704], "crop": {"aspect": "16:9"},
+        "settings": {"seed": 7, "duration": 4, "mode": "std"}})
+    txt = format_generation_settings(t)
+    assert "Seedance 2.0 (Std)" in txt          # model_id resolved to display name
+    assert "1254 x 704" in txt and "16:9" in txt  # framing now travels in the snapshot
+    assert "Seed:      7" in txt                  # seed lifted out of the params dump
+    assert "fierce kick" in txt and "blurry" in txt
+    assert "duration: 4" in txt and "mode: std" in txt
+    assert "seed: 7" not in txt                   # not duplicated inside Parameters
+
+    # An unframed shot snapshots canvas [None, None] -> the Canvas line is suppressed,
+    # not rendered as "None x None" (and a malformed 1-element canvas can't IndexError).
+    sparse = format_generation_settings(Take(id="y", shot_id="s", settings_snapshot={
+        "model_id": "seedance-2.0-std", "canvas": [None, None], "prompt": "p"}))
+    assert "Canvas:" not in sparse and "None x None" not in sparse
+
+    empty = format_generation_settings(Take(id="x", shot_id="s"))
+    assert "No generation settings" in empty
+    print("take_player OK: format_generation_settings (full + sparse + empty)")
+
+
+def test_snapshot_includes_framing() -> None:
+    """generate_shot freezes canvas + crop into the take's immutable snapshot, so framing
+    is preserved per take even after the shot is re-framed (the export/panel read it)."""
+    from PySide6.QtWidgets import QApplication
+
+    import library
+    from ui import main_window
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p",
+                            settings={"seed": 5})
+    aspects = library.aspect_ratios(shot.model_id)
+    crop = {"aspect": aspects[0] if aspects else None,
+            "start": {"scale": 1.0, "cx": 0.5, "cy": 0.5}}
+    project.update_shot(shot.id, canvas_w=1254, canvas_h=704, crop=crop,
+                        start_frame="x.png")
+    project.save_as(Path(tempfile.mkdtemp()) / "p.animproj")
+    win = MainWindow(project)
+
+    orig_confirm = main_window.confirm_launch
+    orig_enqueue = win.jobs.enqueue
+    main_window.confirm_launch = lambda *a, **k: True   # auto-confirm the launch gate
+    win.jobs.enqueue = lambda *a, **k: None             # don't actually render
+    try:
+        win.generate_shot(shot.id)
+    finally:
+        main_window.confirm_launch = orig_confirm
+        win.jobs.enqueue = orig_enqueue
+
+    snap = project.list_takes(shot.id)[-1].settings_snapshot
+    assert snap["canvas"] == [1254, 704], snap.get("canvas")
+    assert snap["crop"] == crop, snap.get("crop")
+    print("MainWindow OK: snapshot carries canvas + crop framing")
+
+
+def test_take_player_settings_panel() -> None:
+    """The viewer's ⚙ button and right-click 'Show generation settings' both reveal the
+    docked panel; it's hidden by default and toggles off again. No modal .exec()."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.take_player import TakePlayerTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="fierce")
+    take = project.add_take(shot.id, status=STATUS_DONE, seed=7, settings_snapshot={
+        "model_id": "seedance-2.0-std", "prompt": "fierce", "settings": {"seed": 7}})
+    tab = TakePlayerTab(project, take.id)          # no video -> no decode thread spawned
+
+    assert tab.settings_dock.isHidden(), "panel hidden by default"
+    tab.show_settings()                            # the shared reveal path (button + menu)
+    assert not tab.settings_dock.isHidden()
+    assert "fierce" in tab.settings_panel.toPlainText()
+    tab._on_settings_toggled(False)                # unchecking the button hides it
+    assert tab.settings_dock.isHidden()
+
+    menu = tab._build_context_menu()               # built without exec()
+    acts = [a for a in menu.actions() if "generation settings" in a.text().lower()]
+    assert len(acts) == 1, [a.text() for a in menu.actions()]
+    acts[0].trigger()
+    assert not tab.settings_dock.isHidden(), "context menu reveals the panel"
+    tab.close_player()
+    print("TakePlayerTab OK: settings dock toggles via button + context menu")
+
+
 def test_runner_self_cancel_during_submit() -> None:
     """The replicate runner's on_submit must self-cancel when a stop was requested during
     the create-POST window (before backend_job_id existed), so the take lands CANCELLED and
@@ -248,5 +343,8 @@ if __name__ == "__main__":
     test_export()
     test_window_builds()
     test_close_dirty_tab_guard()
+    test_format_generation_settings()
+    test_snapshot_includes_framing()
+    test_take_player_settings_panel()
     test_runner_self_cancel_during_submit()
     print("PHASE 5 SMOKE: PASS")
