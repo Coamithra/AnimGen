@@ -19,6 +19,8 @@ no native percentage. Failed takes show their error as text instead.
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QHeaderView, QLabel, QProgressBar, QPushButton, QTableWidget,
@@ -44,6 +46,30 @@ _STATUS_DISPLAY = {
     STATUS_FAILED:     ("failed",  QColor("#cf222e")),
     STATUS_CANCELLED:  ("cancelled", QColor("#57606a")),
 }
+
+
+def _elapsed(created: str, completed: str) -> str:
+    """Human elapsed time between two second-precision ISO timestamps, e.g. "3m15s".
+
+    Both stamps come from store.project._now() / jobs.GenerationJob (no timezone), so a
+    plain fromisoformat diff is safe. Returns "" if either is missing/unparseable or the
+    span is negative (clock skew), so the caller falls back to a bare "done"."""
+    if not created or not completed:
+        return ""
+    try:
+        secs = int((datetime.fromisoformat(completed)
+                    - datetime.fromisoformat(created)).total_seconds())
+    except ValueError:
+        return ""
+    if secs < 0:
+        return ""
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m}m{s}s"
+    if m:
+        return f"{m}m{s}s"
+    return f"{s}s"
 
 
 class QueueView(QWidget):
@@ -130,7 +156,13 @@ class QueueView(QWidget):
             self._progress_bars[take.id] = bar
             return
         self.table.removeCellWidget(row, _PROGRESS_COL)                  # finished/failed: text
-        text = take.error if (take.status == STATUS_FAILED and take.error) else ""
+        if take.status == STATUS_FAILED and take.error:
+            text = take.error
+        elif take.status == STATUS_DONE:
+            elapsed = _elapsed(take.created, take.completed)
+            text = f"done in {elapsed}" if elapsed else "done"
+        else:
+            text = ""
         item = QTableWidgetItem(text)
         item.setToolTip(text)
         self.table.setItem(row, _PROGRESS_COL, item)

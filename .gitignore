@@ -1,6 +1,9 @@
 # virtual environment
 .venv/
 
+# temporary git worktrees (e.g. .trees/<name>) - never commit a worktree
+.trees/
+
 # runtime data (db, generated results, bin, exports, thumbnails, baked keyposes)
 data/
 

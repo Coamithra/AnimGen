@@ -109,7 +109,14 @@ def preflight(progress_cb: ProgressCb = None) -> None:
 # scripts/launch_comfyui.py CLI) so --disable-dynamic-vram is always applied.
 # build_launch_command() is the single source of truth for HOW to start it.
 
-REQUIRED_FLAGS = ["--disable-dynamic-vram"]
+# --disable-dynamic-vram: avoids the TDR-watchdog crash (see above).
+# --cache-none: re-execute every node each run instead of caching model results in VRAM.
+#   On the 12GB card the dual-14B Wan workflow (~24GB of weights through 12GB) can't keep
+#   the prior run's models resident, so caching just leaves ~4-5GB pinned that the next
+#   render then spills to system RAM over PCIe (the 8 -> 36 s/it slowdown). Dropping the
+#   cache fully unloads each model before the next loads, so each 9GB expert gets the whole
+#   card. Costs a few seconds of reload per run; saves the per-step PCIe streaming.
+REQUIRED_FLAGS = ["--disable-dynamic-vram", "--cache-none"]
 _DEFAULT_FLAGS = [("--listen", "127.0.0.1"), ("--port", str(COMFY_PORT))]  # (flag, value)
 _server_proc: "Optional[subprocess.Popen]" = None  # the ComfyUI we launched, if any
 
@@ -334,18 +341,49 @@ def _disconnect_consumers(wf: dict, src_id: str) -> None:
             del inputs[field]
 
 
+# Core ComfyUI CLIP-loader node types that expose the optional `device` input
+# (["default","cpu"]); the GGUF/custom loaders aren't guaranteed to, so we don't touch them.
+_CLIP_LOADER_TYPES = frozenset({
+    "CLIPLoader", "DualCLIPLoader", "TripleCLIPLoader", "QuadrupleCLIPLoader",
+})
+
+
+def _force_text_encoder_cpu(wf: dict) -> int:
+    """Pin every CLIP-loader node to the CPU; return how many were switched.
+
+    The text encoder (umt5-xxl here, ~6GB) runs once per render and doesn't need the GPU.
+    On a 12GB card it otherwise competes with the diffusion model for VRAM - and ComfyUI
+    keeps it partially resident across runs - so the 9GB Wan expert spills ~4GB to system
+    RAM and streams it over PCIe every sampling step (the 36 s/it). Running the encoder on
+    CPU keeps those 6GB out of VRAM entirely so the expert fits. Costs a one-time CPU encode
+    per render (seconds); saves the per-step streaming. Only core CLIPLoader-family nodes
+    expose the `device` input, so we set it only on those (setdefault-style, leaving an
+    already-cpu node alone)."""
+    switched = 0
+    for node in wf.values():
+        if isinstance(node, dict) and node.get("class_type") in _CLIP_LOADER_TYPES:
+            node.setdefault("inputs", {})["device"] = "cpu"
+            switched += 1
+    return switched
+
+
 def prepare_workflow(template: dict, *, start_img: Optional[str] = None,
                      end_img: Optional[str] = None, prompt: Optional[str] = None,
                      negative: Optional[str] = None, seed: Optional[int] = None,
                      node_roles: Optional[dict] = None,
-                     sets: Optional[dict] = None) -> dict:
+                     sets: Optional[dict] = None,
+                     text_encoder_cpu: bool = False) -> dict:
     """Return a mutated copy of `template` with our inputs applied.
 
     node_roles (from model_library 'comfy_nodes') may name: start_image, end_image,
     prompt, negative, seed_nodes[]. Missing roles fall back to heuristics.
+
+    text_encoder_cpu pins CLIP-loader nodes to the CPU (see _force_text_encoder_cpu).
     """
     wf = copy.deepcopy(template)
     roles = node_roles or {}
+    if text_encoder_cpu:
+        _force_text_encoder_cpu(wf)
 
     loads = _nodes_by_class(wf, "LoadImage")
     clips = _nodes_by_class(wf, "CLIPTextEncode")
@@ -492,63 +530,156 @@ def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressC
                 pass
 
 
+def _entry_outputs(entry: dict) -> list[Path]:
+    """Absolute paths of every media file a /history entry produced."""
+    produced = []
+    for out in entry.get("outputs", {}).values():
+        for key in ("images", "video", "videos", "gifs"):
+            for item in out.get(key, []):
+                sub = item.get("subfolder", "")
+                produced.append(COMFY_OUTPUT_DIR / sub / item["filename"])
+    return produced
+
+
+def _claim_output(produced: list[Path], out_path: Path) -> dict:
+    """Copy the last produced file to out_path and return the take-result dict."""
+    if produced:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(produced[-1], out_path)
+    return {"video_path": str(out_path), "produced": [str(p) for p in produced]}
+
+
+def _poll_until_done(pid: str, out_path: Path, progress_cb: ProgressCb,
+                     timeout_s: int, poll_s: int) -> dict:
+    """Poll /history/{pid} until the prompt errors, finishes, or times out.
+
+    Shared by submit() (which queues first) and monitor() (which re-attaches to a
+    prompt some earlier, now-dead worker queued). Raises ComfyError on failure.
+    """
+    t0 = time.time()
+    while True:
+        time.sleep(poll_s)
+        hist = _api(f"/history/{pid}")
+        if pid in hist:
+            entry = hist[pid]
+            status = entry.get("status", {})
+            if status.get("status_str") == "error":
+                msgs = status.get("messages", [])
+                detail = next((json.dumps(m[1])[:1500] for m in msgs
+                               if m[0] == "execution_error"), "")
+                raise ComfyError(f"workflow error: {detail}")
+            if status.get("completed") and not entry.get("outputs"):
+                raise ComfyError("completed with NO outputs (full cache hit?) - "
+                                 "change seed/prompt so something renders")
+            if entry.get("outputs"):
+                _log(progress_cb, f"done in {int(time.time() - t0)}s")
+                return _claim_output(_entry_outputs(entry), out_path)
+        if time.time() - t0 > timeout_s:
+            raise ComfyError("timed out after 1h")
+
+
 def submit(wf: dict, out_path: Path, progress_cb: ProgressCb = None,
-           timeout_s: int = 3600, poll_s: int = 5) -> dict:
+           timeout_s: int = 3600, poll_s: int = 5,
+           on_submit: Optional[Callable[[str], None]] = None) -> dict:
     preflight(progress_cb)
     client_id = uuid.uuid4().hex
     res = _api("/prompt", {"prompt": wf, "client_id": client_id})
     pid = res["prompt_id"]
     _log(progress_cb, f"queued {pid}")
+    if on_submit:                     # record the prompt id NOW so a take orphaned mid-render
+        on_submit(pid)                # (app restart) can be reconciled against the backend
     stop = threading.Event()
     ws_thread: Optional[threading.Thread] = None
-    if progress_cb is not None:      # listen for live step progress over the WS (best-effort)
+    if progress_cb is not None:       # live step progress over the WS (best-effort)
         ws_thread = threading.Thread(target=_ws_progress_listener,
                                      args=(client_id, pid, progress_cb, stop), daemon=True)
         ws_thread.start()
-    t0 = time.time()
     try:
-        while True:
-            time.sleep(poll_s)
-            hist = _api(f"/history/{pid}")
-            if pid in hist:
-                entry = hist[pid]
-                status = entry.get("status", {})
-                if status.get("status_str") == "error":
-                    msgs = status.get("messages", [])
-                    detail = next((json.dumps(m[1])[:1500] for m in msgs
-                                   if m[0] == "execution_error"), "")
-                    raise ComfyError(f"workflow error: {detail}")
-                if status.get("completed") and not entry.get("outputs"):
-                    raise ComfyError("completed with NO outputs (full cache hit?) - "
-                                     "change seed/prompt so something renders")
-                if entry.get("outputs"):
-                    produced = []
-                    for out in entry["outputs"].values():
-                        for key in ("images", "video", "videos", "gifs"):
-                            for item in out.get(key, []):
-                                sub = item.get("subfolder", "")
-                                produced.append(COMFY_OUTPUT_DIR / sub / item["filename"])
-                    _log(progress_cb, f"done in {int(time.time() - t0)}s")
-                    if produced:
-                        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(produced[-1], out_path)
-                    return {"video_path": str(out_path), "produced": [str(p) for p in produced]}
-            if time.time() - t0 > timeout_s:
-                raise ComfyError("timed out after 1h")
+        return _poll_until_done(pid, out_path, progress_cb, timeout_s, poll_s)
     finally:
         stop.set()
         if ws_thread is not None:
             ws_thread.join(timeout=2)
 
 
+def monitor(prompt_id: str, out_path: Path, progress_cb: ProgressCb = None,
+            timeout_s: int = 3600, poll_s: int = 5) -> dict:
+    """Re-attach to an already-queued prompt and collect its output when it finishes.
+
+    Used by orphan recovery: a take that was rendering when the app died still has its
+    prompt running/queued on the (separate, surviving) ComfyUI process. No preflight or
+    /prompt POST here - the work is already in flight; we only poll and claim the file.
+    """
+    _log(progress_cb, f"re-attached to {prompt_id}")
+    return _poll_until_done(prompt_id, out_path, progress_cb, timeout_s, poll_s)
+
+
+def _seeds_in_workflow(wf) -> set:
+    """Every concrete seed/noise_seed baked into a workflow's nodes."""
+    seeds = set()
+    if isinstance(wf, dict):
+        for node in wf.values():
+            ins = node.get("inputs", {}) if isinstance(node, dict) else {}
+            for f in ("seed", "noise_seed"):
+                if isinstance(ins.get(f), int):
+                    seeds.add(ins[f])
+    return seeds
+
+
+def _prompt_workflow(prompt_field) -> dict:
+    """Pull the node-graph dict out of a /history or /queue 'prompt' field.
+
+    Comfy stores it as a list whose elements vary by endpoint; the graph is the dict
+    whose values look like nodes (have 'class_type' / 'inputs')."""
+    if isinstance(prompt_field, dict):
+        return prompt_field
+    if isinstance(prompt_field, list):
+        for el in prompt_field:
+            if isinstance(el, dict) and any(
+                    isinstance(v, dict) and ("class_type" in v or "inputs" in v)
+                    for v in el.values()):
+                return el
+    return {}
+
+
+def history_view(timeout: int = 5) -> list[dict]:
+    """Normalized /history: [{prompt_id, seeds, outputs, ok}], oldest-first."""
+    hist = _api("/history", timeout=timeout)
+    out = []
+    for pid, entry in hist.items():
+        status = entry.get("status", {})
+        out.append({
+            "prompt_id": pid,
+            "seeds": _seeds_in_workflow(_prompt_workflow(entry.get("prompt"))),
+            "outputs": _entry_outputs(entry),
+            "ok": status.get("status_str") != "error",
+        })
+    return out
+
+
+def queue_view(timeout: int = 5) -> list[dict]:
+    """Normalized /queue: [{prompt_id, seeds, state}] for running + pending prompts."""
+    q = _api("/queue", timeout=timeout)
+    out = []
+    for state, key in (("running", "queue_running"), ("pending", "queue_pending")):
+        for item in q.get(key, []):
+            pid = item[1] if len(item) > 1 else None
+            wf = item[2] if len(item) > 2 else None
+            out.append({"prompt_id": pid, "seeds": _seeds_in_workflow(wf), "state": state})
+    return out
+
+
 def generate(template_path: str | Path, out_path: Path, *, start: Optional[str] = None,
              end: Optional[str] = None, prompt: Optional[str] = None,
              negative: Optional[str] = None, seed: Optional[int] = None,
              node_roles: Optional[dict] = None, sets: Optional[dict] = None,
-             progress_cb: ProgressCb = None, dry_run: bool = False) -> dict:
+             progress_cb: ProgressCb = None, dry_run: bool = False,
+             on_submit: Optional[Callable[[str], None]] = None,
+             text_encoder_cpu: bool = False) -> dict:
     template = json.loads(Path(template_path).read_text(encoding="utf-8"))
     wf = prepare_workflow(template, start_img=start, end_img=end, prompt=prompt,
-                          negative=negative, seed=seed, node_roles=node_roles, sets=sets)
+                          negative=negative, seed=seed, node_roles=node_roles, sets=sets,
+                          text_encoder_cpu=text_encoder_cpu)
     if dry_run:
         return {"dry_run": True, "workflow": wf}
-    return submit(wf, Path(out_path), progress_cb)
+    return submit(wf, Path(out_path), progress_cb, on_submit=on_submit)
