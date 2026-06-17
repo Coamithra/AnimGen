@@ -405,8 +405,11 @@ def test_progress_fraction() -> None:
     assert (round(frac, 3), label) == (0.15, "step 3/20")   # furthest-along running node
     assert pf({"type": "progress_state",
                "data": {"prompt_id": "p1", "nodes": {"7": {"value": 20, "max": 20}}}}, "p1") \
-        == (1.0, "")                                        # every node finished
+        == (None, "")                                       # no running node -> no premature 100%
     assert pf({"type": "executing", "data": {"node": None, "prompt_id": "p1"}}, "p1") == (1.0, "")
+    assert pf({"type": "progress", "data": {"value": 40, "max": 30}}, "p1") == (1.0, "step 40/30")  # clamp > max
+    assert pf({"type": "progress", "data": {"value": 1, "max": 0}}, "p1") == (None, "")  # no div-by-zero
+    assert pf({"type": "progress"}, "p1") == (None, "")     # missing data dict
     assert pf({"type": "status", "data": {}}, "p1") == (None, "")
     print("progress_fraction OK: progress/progress_state/executing parsed, prompt_id filtered")
 

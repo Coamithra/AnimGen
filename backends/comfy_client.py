@@ -429,15 +429,15 @@ def progress_fraction(msg: dict, prompt_id: str) -> tuple[Optional[float], str]:
     if mtype == "progress":
         return _frac(data.get("value"), data.get("max"))
     if mtype == "progress_state":
-        nodes = [n for n in (data.get("nodes") or {}).values() if isinstance(n, dict)]
-        running = [n for n in nodes
-                   if 0 < (n.get("value") or 0) < (n.get("max") or 0)]
-        if running:                  # report the furthest-along actively-running node
+        # Report only the furthest-along actively-running node. Deliberately DON'T infer
+        # 100% from "all listed nodes finished": progress_state lists only nodes seen so far,
+        # so between two samplers (sampler 1 done, sampler 2 not yet listed) that would flash
+        # a premature 100%. The terminal 1.0 comes from the 'executing' null message below.
+        running = [n for n in (data.get("nodes") or {}).values()
+                   if isinstance(n, dict) and 0 < (n.get("value") or 0) < (n.get("max") or 0)]
+        if running:
             pick = max(running, key=lambda n: (n.get("value") or 0) / (n.get("max") or 1))
             return _frac(pick.get("value"), pick.get("max"))
-        maxes = [(n.get("value") or 0, n.get("max") or 0) for n in nodes]
-        if maxes and all(m > 0 and v >= m for v, m in maxes):
-            return 1.0, ""           # every node finished
         return None, ""
     if mtype == "executing" and data.get("node") is None:
         return 1.0, ""               # our prompt finished sampling
@@ -471,7 +471,7 @@ def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressC
             except Exception:
                 break
             if not isinstance(raw, str) or not raw:
-                continue             # binary frames are preview images - skip
+                continue             # skip binary frames (preview images in practice)
             try:
                 msg = json.loads(raw)
             except (ValueError, TypeError):

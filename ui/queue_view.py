@@ -150,6 +150,9 @@ class QueueView(QWidget):
 
         self._progress_items.clear()
         self._progress_bars.clear()
+        live = {t.id for t in rows}                 # drop cached lines/pcts for evicted takes
+        self._latest = {k: v for k, v in self._latest.items() if k in live}
+        self._latest_pct = {k: v for k, v in self._latest_pct.items() if k in live}
         self.table.setRowCount(len(rows))
         for row, take in enumerate(rows):
             shot = self.project.get_shot(take.shot_id)
