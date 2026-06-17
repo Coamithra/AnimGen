@@ -751,7 +751,21 @@ def test_orphan_recovery() -> None:
     assert plans["nope"].action == recovery.CANCEL
     assert plans["dup1"].action == recovery.RECLAIM and plans["dup2"].action == recovery.FAIL, \
         "a finished render must be claimed by exactly one take"
-    print("orphan recovery OK: select + reclaim/reattach/fail/cancel + prompt-id + seed dedup")
+
+    # plan_offline_recovery: ComfyUI unreachable (no history/queue). A submitted take (has a
+    # prompt id) is LEFT generating to reclaim later; a never-submitted generating take (no
+    # prompt id) -> FAIL rather than a permanent zombie; a pending take -> CANCEL.
+    offline = [
+        t("submitted",  STATUS_GENERATING, seed=10, job="Plive"),  # has prompt id -> LEAVE
+        t("zombie",     STATUS_GENERATING, seed=20),               # no prompt id  -> FAIL
+        t("queued",     STATUS_PENDING,    seed=30),               # never ran     -> CANCEL
+    ]
+    off = {p.take_id: p for p in recovery.plan_offline_recovery(offline)}
+    assert off["submitted"].action == recovery.LEAVE and off["submitted"].prompt_id == "Plive"
+    assert off["zombie"].action == recovery.FAIL, "generating-without-prompt-id must not be left"
+    assert off["queued"].action == recovery.CANCEL
+    print("orphan recovery OK: select + reclaim/reattach/fail/cancel + prompt-id + seed dedup "
+          "+ offline leave/fail/cancel")
 
 
 def test_crash_recovery() -> None:
