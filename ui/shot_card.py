@@ -60,7 +60,7 @@ def framed_thumb(shot, which: str, long: int = 88) -> QPixmap:
         cache_key = (asset, st.st_mtime_ns, st.st_size)
         sprite = _KEYED_CACHE.get(cache_key)
         if sprite is None:
-            sprite = framing.keyed_sprite(asset, max_side=_THUMB_KEY_MAX)
+            sprite = framing.keyed_sprite(asset, max_side=_THUMB_KEY_MAX, crop_to_content=False)
             _KEYED_CACHE[cache_key] = sprite
         placement = (shot.crop or {}).get(which) or {}
         return pil_to_pixmap(framing.render_placement(asset, placement, canvas, sprite=sprite))

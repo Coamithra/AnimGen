@@ -1,11 +1,13 @@
 """Placement canvas - drag/scale a keyed keyframe sprite onto the shot's aspect canvas.
 
 Replaces the old crop-rect tool. Shows the magenta contract canvas at the shot's chosen
-aspect ratio; the keyed sprite is a movable item framed by a classic transform box - a
-dashed outline with corner handles. Drag the body to move; drag a corner to scale
-(uniform, since placement stores a single scale). Placement is reported normalized so it
-survives aspect changes:
-    {scale: sprite-height / canvas-height, cx, cy: sprite center as 0..1 of the canvas}.
+aspect ratio; the keyed sprite (the full original frame keyed transparent, NOT cropped to
+the cutout) is a movable item framed by a classic transform box - a dashed outline with
+corner handles. Drag the body to move; drag a corner to scale (uniform, since placement
+stores a single scale). Placement is reported normalized so it survives aspect changes:
+    {scale: original-image-height / canvas-height, cx, cy: frame center as 0..1 of the canvas}.
+Scale relative to the original image (not the cutout) means two to-scale source frames at
+the same scale render at the same size.
 """
 from __future__ import annotations
 
