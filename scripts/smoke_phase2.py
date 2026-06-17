@@ -389,6 +389,59 @@ def test_cancel_pending() -> None:
     print("cancel_pending OK: queued cancelled, in-progress job left running")
 
 
+def test_progress_fraction() -> None:
+    from backends.comfy_client import progress_fraction as pf
+
+    assert pf({"type": "progress", "data": {"value": 12, "max": 30, "prompt_id": "p1"}}, "p1") \
+        == (0.4, "step 12/30")
+    assert pf({"type": "progress", "data": {"value": 1, "max": 2, "prompt_id": "pX"}}, "p1") \
+        == (None, "")                                       # different prompt, ignored
+    assert pf({"type": "progress", "data": {"value": 5, "max": 10}}, "p1") \
+        == (0.5, "step 5/10")                               # legacy message, no prompt_id
+    frac, label = pf({"type": "progress_state",
+                      "data": {"prompt_id": "p1",
+                               "nodes": {"7": {"value": 3, "max": 20},
+                                         "8": {"value": 0, "max": 1}}}}, "p1")
+    assert (round(frac, 3), label) == (0.15, "step 3/20")   # furthest-along running node
+    assert pf({"type": "progress_state",
+               "data": {"prompt_id": "p1", "nodes": {"7": {"value": 20, "max": 20}}}}, "p1") \
+        == (1.0, "")                                        # every node finished
+    assert pf({"type": "executing", "data": {"node": None, "prompt_id": "p1"}}, "p1") == (1.0, "")
+    assert pf({"type": "status", "data": {}}, "p1") == (None, "")
+    print("progress_fraction OK: progress/progress_state/executing parsed, prompt_id filtered")
+
+
+def test_progress_pct() -> None:
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    jm = JobManager(project)
+    lines, pcts = [], []
+    jm.progress.connect(lambda tid, line: lines.append(line))
+    jm.progress_pct.connect(lambda tid, frac, label: pcts.append((frac, label)))
+
+    take = project.add_take(shot.id, status=STATUS_PENDING)
+
+    def runner(progress):
+        progress("queued abc")                  # milestone: logged
+        progress(frac=0.5, label="step 1/2")    # fraction: UI-only, must NOT be logged
+        progress(frac=1.0, label="step 2/2")
+        return {"video_path": "y.mp4"}
+
+    jm.enqueue(take.id, "comfyui", runner)
+    assert jm.wait_for_done(20000), "job did not finish"
+    app.processEvents()
+
+    assert (0.5, "step 1/2") in pcts and (1.0, "step 2/2") in pcts
+    assert "queued abc" in lines
+    assert not any("step" in ln for ln in lines), "pct-only updates must bypass the log signal"
+    print("progress_pct OK: fraction signal fires; pct-only updates skip the log")
+
+
 if __name__ == "__main__":
     test_build_input()
     test_capability_sync()
@@ -403,4 +456,6 @@ if __name__ == "__main__":
     test_cost_summary()
     test_cancel_pending()
     test_job_manager()
+    test_progress_fraction()
+    test_progress_pct()
     print("PHASE 2 SMOKE: PASS")

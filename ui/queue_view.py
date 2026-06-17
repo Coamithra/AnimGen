@@ -8,17 +8,20 @@ list: one row per active (queued / generating) take plus the most-recently finis
 each showing its shot, model, backend, status, latest progress line, and - for a still-queued
 take - a per-row Cancel.
 
-It owns no real state of its own beyond a cache of each take's latest progress line. Rows are
-derived from project.list_takes() by status and refreshed from the JobManager's existing
-signals (progress / status_changed / finished / failed) and whenever the tab is shown - the
-queue engine is untouched. Progress is free text (backends emit log lines, not a percentage),
-so the Progress column shows the latest line rather than a bar.
+It owns no real state of its own beyond a cache of each take's latest progress line and
+fraction. Rows are derived from project.list_takes() by status and refreshed from the
+JobManager's signals (progress / progress_pct / status_changed / finished / failed) and
+whenever the tab is shown - the queue engine is untouched. The Progress column shows a
+QProgressBar: a determinate % bar for a local (ComfyUI) render, which reports real per-step
+progress over its WebSocket via the progress_pct signal, and an indeterminate "busy" bar
+labelled with the latest line (e.g. elapsed time) for hosted (Replicate) takes, which expose
+no native percentage. Failed takes show their error as text instead.
 """
 from __future__ import annotations
 
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHeaderView, QLabel, QPushButton, QTableWidget,
+    QAbstractItemView, QHeaderView, QLabel, QProgressBar, QPushButton, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -49,9 +52,12 @@ class QueueView(QWidget):
         self.project = project
         self.jobs = jobs
         self._latest: dict[str, str] = {}              # take_id -> last progress line
-        self._progress_items: dict[str, QTableWidgetItem] = {}  # take_id -> its Progress cell
+        self._latest_pct: dict[str, tuple[float, str]] = {}     # take_id -> (fraction, label)
+        self._progress_items: dict[str, QTableWidgetItem] = {}  # take_id -> its Progress text cell
+        self._progress_bars: dict[str, QProgressBar] = {}       # take_id -> its Progress bar
         self._build()
         jobs.progress.connect(self._on_progress)
+        jobs.progress_pct.connect(self._on_progress_pct)
         jobs.status_changed.connect(lambda *_: self.refresh())
         jobs.finished.connect(lambda *_: self.refresh())
         jobs.failed.connect(lambda *_: self.refresh())
@@ -61,6 +67,7 @@ class QueueView(QWidget):
         """Point the queue view at a newly opened/created project (see MainWindow._switch_project)."""
         self.project = project
         self._latest.clear()
+        self._latest_pct.clear()
         self.refresh()
 
     # ---- build ----------------------------------------------------------
@@ -101,12 +108,33 @@ class QueueView(QWidget):
         name = m["display_name"] if m else (model_id or "?")
         return name, snap.get("backend", "") or (m["backend"] if m else "")
 
-    def _progress_text(self, take) -> str:
-        if take.status == STATUS_FAILED and take.error:
-            return take.error
+    def _set_progress_cell(self, row: int, take, backend: str) -> None:
+        """Fill the Progress column for one row: a determinate % bar for an active local
+        (ComfyUI) render, an indeterminate busy bar labelled with the latest line for an
+        active hosted take (or anything still queued), or plain text otherwise (errors)."""
         if take.status in (STATUS_GENERATING, STATUS_PENDING):
-            return self._latest.get(take.id, "")
-        return ""
+            bar = QProgressBar()
+            bar.setTextVisible(True)
+            if backend == "comfyui" and take.status == STATUS_GENERATING:
+                frac, lbl = self._latest_pct.get(take.id, (0.0, ""))
+                bar.setRange(0, 100)
+                bar.setValue(round(frac * 100))
+                bar.setFormat(lbl or "%p%")
+            else:                                     # hosted (no native %), or still queued
+                bar.setRange(0, 0)                    # busy / indeterminate
+                txt = self._latest.get(take.id, "")
+                bar.setFormat(txt)
+                bar.setToolTip(txt)
+            self.table.setItem(row, _PROGRESS_COL, QTableWidgetItem())   # clear stale text
+            self.table.setCellWidget(row, _PROGRESS_COL, bar)
+            self._progress_bars[take.id] = bar
+            return
+        self.table.removeCellWidget(row, _PROGRESS_COL)                  # finished/failed: text
+        text = take.error if (take.status == STATUS_FAILED and take.error) else ""
+        item = QTableWidgetItem(text)
+        item.setToolTip(text)
+        self.table.setItem(row, _PROGRESS_COL, item)
+        self._progress_items[take.id] = item
 
     def refresh(self) -> None:
         rows = self._rows()
@@ -121,21 +149,20 @@ class QueueView(QWidget):
         self.summary.setText(summary)
 
         self._progress_items.clear()
+        self._progress_bars.clear()
         self.table.setRowCount(len(rows))
         for row, take in enumerate(rows):
             shot = self.project.get_shot(take.shot_id)
             model, backend = self._model_backend(take)
             label, tint = _STATUS_DISPLAY.get(take.status, (take.status, None))
-            prog = self._progress_text(take)
-            cells = [shot.name if shot else take.shot_id[:8], model, backend, label, prog]
+            cells = [shot.name if shot else take.shot_id[:8], model, backend, label]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setToolTip(text)
                 if col == 3 and tint is not None:
                     item.setForeground(tint)
                 self.table.setItem(row, col, item)
-                if col == _PROGRESS_COL:
-                    self._progress_items[take.id] = item
+            self._set_progress_cell(row, take, backend)
             if take.status == STATUS_PENDING:
                 btn = QPushButton("Cancel")
                 btn.setToolTip("Remove this queued generation before it starts")
@@ -151,10 +178,23 @@ class QueueView(QWidget):
 
     def _on_progress(self, take_id: str, line: str) -> None:
         self._latest[take_id] = line
-        item = self._progress_items.get(take_id)      # update just this row, no full rebuild
+        bar = self._progress_bars.get(take_id)         # busy (hosted/queued) bar: relabel it
+        if bar is not None and bar.maximum() == 0:
+            bar.setFormat(line)
+            bar.setToolTip(line)
+        item = self._progress_items.get(take_id)       # failed-text cell, if any
         if item is not None:
             item.setText(line)
             item.setToolTip(line)
+
+    def _on_progress_pct(self, take_id: str, frac: float, label: str) -> None:
+        self._latest_pct[take_id] = (frac, label)
+        bar = self._progress_bars.get(take_id)         # update just this row, no full rebuild
+        if bar is not None:
+            if bar.maximum() == 0:                     # first fraction: flip busy -> determinate
+                bar.setRange(0, 100)
+            bar.setValue(round(frac * 100))
+            bar.setFormat(label or "%p%")
 
     def _cancel(self, take_id: str) -> None:
         self.jobs.cancel_take(take_id)

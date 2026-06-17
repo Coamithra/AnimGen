@@ -21,7 +21,9 @@ from store.models import (
     STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
 )
 
-Runner = Callable[[Callable[[str], None]], dict]
+# A runner is handed a progress callback: progress(line) logs a milestone (persisted),
+# progress(frac=.., label=..) reports a 0..1 completion fraction for the UI bar (ephemeral).
+Runner = Callable[[Callable[..., None]], dict]
 
 # take fields a runner may return that we persist on success.
 _TAKE_FIELDS = ("video_path", "fps", "frame_count", "cost_actual", "preview_gif", "thumbnail")
@@ -30,6 +32,7 @@ _TAKE_FIELDS = ("video_path", "fps", "frame_count", "cost_actual", "preview_gif"
 class _JobSignals(QObject):
     status_changed = Signal(str, str)   # take_id, status
     progress = Signal(str, str)         # take_id, line
+    progress_pct = Signal(str, float, str)  # take_id, fraction 0..1, label (ephemeral, UI-only)
     finished = Signal(str)              # take_id
     failed = Signal(str, str)           # take_id, error
 
@@ -58,10 +61,14 @@ class GenerationJob(QRunnable):
 
         log_lines: list[str] = []
 
-        def progress(line: str) -> None:
-            log_lines.append(line)
-            self.signals.progress.emit(tid, line)
-            self.project.update_job(job.id, log="\n".join(log_lines))
+        def progress(line: str | None = None, *, frac: float | None = None,
+                     label: str = "") -> None:
+            if line is not None:                 # milestone: log line + persist (infrequent)
+                log_lines.append(line)
+                self.signals.progress.emit(tid, line)
+                self.project.update_job(job.id, log="\n".join(log_lines))
+            if frac is not None:                 # per-step fraction: UI bar only, no JSON write
+                self.signals.progress_pct.emit(tid, frac, label)
 
         try:
             result = self.runner(progress) or {}
@@ -85,6 +92,7 @@ class GenerationJob(QRunnable):
 class JobManager(QObject):
     status_changed = Signal(str, str)
     progress = Signal(str, str)
+    progress_pct = Signal(str, float, str)
     finished = Signal(str)
     failed = Signal(str, str)
 
@@ -94,6 +102,7 @@ class JobManager(QObject):
         self._signals = _JobSignals()
         self._signals.status_changed.connect(self.status_changed)
         self._signals.progress.connect(self.progress)
+        self._signals.progress_pct.connect(self.progress_pct)
         self._signals.finished.connect(self.finished)
         self._signals.failed.connect(self.failed)
 

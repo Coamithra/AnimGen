@@ -15,9 +15,11 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -27,7 +29,9 @@ COMFY_PORT = 8188
 COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
 COMFY_OUTPUT_DIR = COMFY_DIR / "output"
 
-ProgressCb = Optional[Callable[[str], None]]
+# A progress callback takes either progress(line) for a milestone log line, or
+# progress(frac=.., label=..) for a 0..1 completion fraction (the WS step progress below).
+ProgressCb = Optional[Callable[..., None]]
 
 
 class ComfyError(RuntimeError):
@@ -401,41 +405,140 @@ def prepare_workflow(template: dict, *, start_img: Optional[str] = None,
     return wf
 
 
+def progress_fraction(msg: dict, prompt_id: str) -> tuple[Optional[float], str]:
+    """(fraction 0..1, label) from a ComfyUI WS message, or (None, '') if it carries no
+    usable progress for our prompt.
+
+    Handles both the flat 'progress' message (value/max) and the newer per-node
+    'progress_state', plus 'executing' with a null node (sampling done). Filters by
+    prompt_id when the message carries one - local renders are serialized (one prompt at a
+    time), so a legacy 'progress' with no prompt_id is still unambiguously ours. Pure (no
+    I/O) so it's unit-testable headless.
+    """
+    data = msg.get("data") or {}
+    mpid = data.get("prompt_id")
+    if mpid is not None and prompt_id and mpid != prompt_id:
+        return None, ""              # progress for some other prompt
+
+    def _frac(value, mx) -> tuple[Optional[float], str]:
+        if isinstance(value, (int, float)) and isinstance(mx, (int, float)) and mx > 0:
+            return max(0.0, min(1.0, value / mx)), f"step {int(value)}/{int(mx)}"
+        return None, ""
+
+    mtype = msg.get("type")
+    if mtype == "progress":
+        return _frac(data.get("value"), data.get("max"))
+    if mtype == "progress_state":
+        nodes = [n for n in (data.get("nodes") or {}).values() if isinstance(n, dict)]
+        running = [n for n in nodes
+                   if 0 < (n.get("value") or 0) < (n.get("max") or 0)]
+        if running:                  # report the furthest-along actively-running node
+            pick = max(running, key=lambda n: (n.get("value") or 0) / (n.get("max") or 1))
+            return _frac(pick.get("value"), pick.get("max"))
+        maxes = [(n.get("value") or 0, n.get("max") or 0) for n in nodes]
+        if maxes and all(m > 0 and v >= m for v, m in maxes):
+            return 1.0, ""           # every node finished
+        return None, ""
+    if mtype == "executing" and data.get("node") is None:
+        return 1.0, ""               # our prompt finished sampling
+    return None, ""
+
+
+def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressCb,
+                          stop: "threading.Event") -> None:
+    """Best-effort: stream ComfyUI's WebSocket progress into progress_cb(frac=.., label=..).
+
+    Any failure (no websocket-client, server without /ws, dropped socket) is swallowed - the
+    /history poll in submit() still drives the render to completion, just without a live bar.
+    """
+    if progress_cb is None:
+        return
+    try:
+        import websocket  # websocket-client; optional dependency, best-effort
+    except Exception:
+        return
+    ws_url = (COMFY_URL.replace("https://", "wss://").replace("http://", "ws://")
+              + f"/ws?clientId={client_id}")
+    ws = None
+    try:
+        ws = websocket.create_connection(ws_url, timeout=5)
+        ws.settimeout(1.0)
+        while not stop.is_set():
+            try:
+                raw = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue             # tick so we can re-check stop
+            except Exception:
+                break
+            if not isinstance(raw, str) or not raw:
+                continue             # binary frames are preview images - skip
+            try:
+                msg = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            frac, label = progress_fraction(msg, prompt_id)
+            if frac is not None:
+                try:
+                    progress_cb(frac=frac, label=label)
+                except Exception:
+                    pass
+    except Exception:
+        return
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
 def submit(wf: dict, out_path: Path, progress_cb: ProgressCb = None,
            timeout_s: int = 3600, poll_s: int = 5) -> dict:
     preflight(progress_cb)
-    res = _api("/prompt", {"prompt": wf})
+    client_id = uuid.uuid4().hex
+    res = _api("/prompt", {"prompt": wf, "client_id": client_id})
     pid = res["prompt_id"]
     _log(progress_cb, f"queued {pid}")
+    stop = threading.Event()
+    ws_thread: Optional[threading.Thread] = None
+    if progress_cb is not None:      # listen for live step progress over the WS (best-effort)
+        ws_thread = threading.Thread(target=_ws_progress_listener,
+                                     args=(client_id, pid, progress_cb, stop), daemon=True)
+        ws_thread.start()
     t0 = time.time()
-    while True:
-        time.sleep(poll_s)
-        hist = _api(f"/history/{pid}")
-        if pid in hist:
-            entry = hist[pid]
-            status = entry.get("status", {})
-            if status.get("status_str") == "error":
-                msgs = status.get("messages", [])
-                detail = next((json.dumps(m[1])[:1500] for m in msgs
-                               if m[0] == "execution_error"), "")
-                raise ComfyError(f"workflow error: {detail}")
-            if status.get("completed") and not entry.get("outputs"):
-                raise ComfyError("completed with NO outputs (full cache hit?) - "
-                                 "change seed/prompt so something renders")
-            if entry.get("outputs"):
-                produced = []
-                for out in entry["outputs"].values():
-                    for key in ("images", "video", "videos", "gifs"):
-                        for item in out.get(key, []):
-                            sub = item.get("subfolder", "")
-                            produced.append(COMFY_OUTPUT_DIR / sub / item["filename"])
-                _log(progress_cb, f"done in {int(time.time() - t0)}s")
-                if produced:
-                    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(produced[-1], out_path)
-                return {"video_path": str(out_path), "produced": [str(p) for p in produced]}
-        if time.time() - t0 > timeout_s:
-            raise ComfyError("timed out after 1h")
+    try:
+        while True:
+            time.sleep(poll_s)
+            hist = _api(f"/history/{pid}")
+            if pid in hist:
+                entry = hist[pid]
+                status = entry.get("status", {})
+                if status.get("status_str") == "error":
+                    msgs = status.get("messages", [])
+                    detail = next((json.dumps(m[1])[:1500] for m in msgs
+                                   if m[0] == "execution_error"), "")
+                    raise ComfyError(f"workflow error: {detail}")
+                if status.get("completed") and not entry.get("outputs"):
+                    raise ComfyError("completed with NO outputs (full cache hit?) - "
+                                     "change seed/prompt so something renders")
+                if entry.get("outputs"):
+                    produced = []
+                    for out in entry["outputs"].values():
+                        for key in ("images", "video", "videos", "gifs"):
+                            for item in out.get(key, []):
+                                sub = item.get("subfolder", "")
+                                produced.append(COMFY_OUTPUT_DIR / sub / item["filename"])
+                    _log(progress_cb, f"done in {int(time.time() - t0)}s")
+                    if produced:
+                        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(produced[-1], out_path)
+                    return {"video_path": str(out_path), "produced": [str(p) for p in produced]}
+            if time.time() - t0 > timeout_s:
+                raise ComfyError("timed out after 1h")
+    finally:
+        stop.set()
+        if ws_thread is not None:
+            ws_thread.join(timeout=2)
 
 
 def generate(template_path: str | Path, out_path: Path, *, start: Optional[str] = None,
