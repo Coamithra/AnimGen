@@ -630,10 +630,20 @@ class MainWindow(QMainWindow):
             data_uri = model.get("requires_data_uri", False)
             extra = {k: v for k, v in settings.items() if k not in _EXPLICIT_SETTINGS}
 
-            def on_submit(pid):   # persist the prediction id so a delete-while-rendering
-                self.project.update_take(take_id, backend_job_id=pid)  # can cancel it
-
             def runner(progress):
+                def on_submit(pid):
+                    # Record the prediction id NOW so a delete/stop mid-render can cancel it.
+                    self.project.update_take(take_id, backend_job_id=pid)
+                    # Close the create-POST window: if a stop was requested before the id
+                    # existed, request_stop's cancel was skipped - self-cancel here so a
+                    # prediction that would otherwise succeed and orphan its .mp4 halts spend.
+                    if self.jobs.is_stop_requested(take_id):
+                        progress("stop requested during submit - cancelling prediction")
+                        try:
+                            replicate_client.cancel_prediction(pid)
+                        except Exception:  # noqa: BLE001 - best-effort, mirrors request_stop
+                            pass
+
                 start_kp, end_kp = framing.render_keyposes(shot, tempfile.mkdtemp(prefix="animgen_kp_"))
                 return replicate_client.generate(
                     rid, start=start_kp, end=end_kp, prompt=shot.prompt,

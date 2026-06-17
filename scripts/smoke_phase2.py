@@ -505,6 +505,83 @@ def test_request_stop_calls_backend() -> None:
     print("request_stop OK: flags take, calls right backend, swallows backend errors")
 
 
+def test_is_stop_requested() -> None:
+    # request_stop on a hosted take whose create-POST hasn't returned (no backend_job_id):
+    # it flags the take and is_stop_requested reports True, but sends no replicate cancel
+    # (there's no prediction id to cancel yet) - the runner's on_submit closes that window.
+    from PySide6.QtWidgets import QApplication
+
+    from backends import replicate_client
+    from backends.jobs import JobManager
+    from store.models import STATUS_GENERATING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    jm = JobManager(project)
+
+    calls = []
+    saved = replicate_client.cancel_prediction
+    replicate_client.cancel_prediction = lambda *a, **k: calls.append(a)
+    try:
+        ht = project.add_take(shot.id, status=STATUS_GENERATING,
+                              settings_snapshot={"backend": "replicate"})  # no backend_job_id
+        assert jm.is_stop_requested(ht.id) is False
+        assert jm.request_stop(ht.id) is True
+        assert jm.is_stop_requested(ht.id) is True
+        assert calls == []   # no cancel sent - the prediction id isn't recorded yet
+    finally:
+        replicate_client.cancel_prediction = saved
+    print("is_stop_requested OK: flags take during create-POST window, no premature cancel")
+
+
+def test_stop_during_submit_window() -> None:
+    # A stop requested during the create-POST window (before backend_job_id exists) must
+    # still halt spend: the runner's on_submit re-checks is_stop_requested right after
+    # recording the id and self-cancels, so the take lands CANCELLED, not DONE. Mirrors
+    # ui.main_window._make_runner's replicate on_submit with a fake backend (hermetic - no
+    # server, no spend), run through a real GenerationJob for the CANCELLED mapping.
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import GenerationJob, JobManager
+    from store.models import STATUS_CANCELLED, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    jm = JobManager(project)
+    take = project.add_take(shot.id, status=STATUS_PENDING,
+                            settings_snapshot={"backend": "replicate"})
+
+    cancelled = []
+
+    def runner(progress):
+        def on_submit(pid):                      # mirrors main_window's replicate on_submit
+            project.update_take(take.id, backend_job_id=pid)
+            if jm.is_stop_requested(take.id):
+                progress("stop requested during submit - cancelling prediction")
+                cancelled.append(pid)            # stands in for cancel_prediction (no raise)
+        on_submit("pred_during_post")
+        # Mimic run_prediction's poll loop: a cancelled prediction reports "canceled", so
+        # run_prediction raises -> GenerationJob maps the _stopping flag to CANCELLED.
+        if cancelled:
+            raise RuntimeError("prediction canceled")
+        return {"video_path": "x.mp4"}           # would land DONE if the window weren't closed
+
+    jm._stopping.add(take.id)                    # stop requested while the create-POST is in flight
+    job = GenerationJob(project, take.id, "replicate", runner, jm._signals,
+                        jm._cancelled, jm._stopping)
+    job.run()
+    app.processEvents()
+
+    got = project.get_take(take.id)
+    assert cancelled == ["pred_during_post"], cancelled
+    assert got.backend_job_id == "pred_during_post"   # id was recorded before the self-cancel
+    assert got.status == STATUS_CANCELLED, got.status  # not DONE - spend halted
+    assert take.id not in jm._stopping                 # cleared in the finally
+    print("stop-during-submit OK: on_submit self-cancels, take -> CANCELLED not DONE")
+
+
 def test_progress_fraction() -> None:
     from backends.comfy_client import progress_fraction as pf
 
@@ -868,6 +945,8 @@ if __name__ == "__main__":
     test_cancel_shot_takes()
     test_inflight_stop_maps_to_cancelled()
     test_request_stop_calls_backend()
+    test_is_stop_requested()
+    test_stop_during_submit_window()
     test_job_manager()
     test_progress_fraction()
     test_client_id_in_queue()
