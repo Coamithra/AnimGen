@@ -372,6 +372,11 @@ class Project:
         if gone:
             self._write_takes_file()
 
+    def set_shot_starred(self, shot_id: str, starred: bool) -> None:
+        """Star/unstar a shot. Buffers like any authoring edit (sets dirty); unlike a
+        take's star (write-through), it persists on the next save()."""
+        self.update_shot(shot_id, starred=starred)
+
     def used_model_ids(self) -> list[str]:
         """Distinct model_ids across shots - powers the 'filter by model' dropdown."""
         seen = {s.model_id for s in self._shots.values() if s.model_id}

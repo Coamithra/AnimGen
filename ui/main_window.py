@@ -118,10 +118,16 @@ class MainWindow(QMainWindow):
         self.model_filter.setObjectName("modelFilter")
         self.model_filter.currentIndexChanged.connect(self.reload)
         tb.addWidget(self.model_filter)
-        self.starred_filter = QCheckBox("Starred only")
+        self.starred_filter = QCheckBox("Starred takes")
         self.starred_filter.setObjectName("starredFilter")
+        self.starred_filter.setToolTip("Show only shots that have at least one starred take")
         self.starred_filter.stateChanged.connect(self.reload)
         tb.addWidget(self.starred_filter)
+        self.starred_shots_filter = QCheckBox("Starred shots")
+        self.starred_shots_filter.setObjectName("starredShotsFilter")
+        self.starred_shots_filter.setToolTip("Show only shots you have starred")
+        self.starred_shots_filter.stateChanged.connect(self.reload)
+        tb.addWidget(self.starred_shots_filter)
         exp_view = QAction("Export view", self)
         exp_view.triggered.connect(self.export_current_view)
         tb.addAction(exp_view)
@@ -394,6 +400,7 @@ class MainWindow(QMainWindow):
         self._refresh_model_filter()
         model_sel = self.model_filter.currentData()
         starred_only = self.starred_filter.isChecked()
+        starred_shots_only = self.starred_shots_filter.isChecked()
         expanded = {sid for sid, c in self.cards.items() if c.expand_btn.isChecked()}
 
         while self.cards_layout.count():
@@ -407,6 +414,8 @@ class MainWindow(QMainWindow):
         for shot in shots:
             if model_sel and shot.model_id != model_sel:
                 continue
+            if starred_shots_only and not shot.starred:
+                continue
             if starred_only and not self.project.list_takes(shot.id, starred_only=True):
                 continue
             card = ShotCard(self.project, shot)
@@ -414,6 +423,7 @@ class MainWindow(QMainWindow):
             card.open_requested.connect(self.open_shot)
             card.duplicate_requested.connect(self.duplicate_shot)
             card.delete_requested.connect(self.delete_shot)
+            card.star_toggled.connect(self.toggle_shot_star)
             card.export_takes_requested.connect(self.export_takes)
             card.open_take_requested.connect(self.open_take)
             if shot.id in expanded:
@@ -502,6 +512,14 @@ class MainWindow(QMainWindow):
             return
         self.reload()
         self._log(f"duplicated shot -> {dup.name}")
+
+    def toggle_shot_star(self, shot_id: str) -> None:
+        shot = self.project.get_shot(shot_id)
+        if not shot:
+            return
+        self.project.set_shot_starred(shot_id, not shot.starred)
+        self._update_title()        # buffered edit -> dirty marker
+        self.reload()               # reflect the star + re-apply the "Starred shots" filter
 
     def delete_shot(self, shot_id: str) -> None:
         shot = self.project.get_shot(shot_id)
