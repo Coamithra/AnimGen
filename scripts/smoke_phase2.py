@@ -846,6 +846,72 @@ def test_abandon_local() -> None:
     print("abandon_local OK: local pending cancelled, running + hosted untouched, signal fired")
 
 
+def test_batch() -> None:
+    from backends import batch
+
+    class _Shot:
+        def __init__(self, name, model_id, start_frame="a.png", aspect=None, settings=None):
+            self.name = name
+            self.model_id = model_id
+            self.start_frame = start_frame
+            self.crop = {"aspect": aspect} if aspect else {}
+            self.settings = settings or {}
+
+    models = {
+        "good": {"display_name": "Good", "backend": "replicate",
+                 "default_params": {"duration": 4}},
+        "local": {"display_name": "Local", "backend": "comfyui", "default_params": {}},
+    }
+    aspects = {"good": ["1:1", "16:9"], "local": ["1:1"]}
+    model_of = lambda s: models.get(s.model_id)              # noqa: E731
+    aspects_of = lambda mid: aspects.get(mid, [])            # noqa: E731
+    est_of = lambda mid, settings: None if mid == "local" else 0.5   # noqa: E731
+
+    shots = [
+        _Shot("ok1", "good", aspect="1:1"),
+        _Shot("ok2", "local", aspect="1:1"),
+        _Shot("bad_model", "nope"),
+        _Shot("bad_aspect", "good", aspect="9:21"),
+        _Shot("no_frame", "good", start_frame=""),
+    ]
+    plan = batch.plan_batch(shots, takes_per_shot=3, model_of=model_of,
+                            aspects_of=aspects_of, est_of=est_of)
+    assert len(plan.eligible) == 2, plan.eligible
+    assert plan.take_count == 6 and len(plan.items) == 6
+    it = plan.items[0]
+    assert set(it) >= {"name", "model_display", "backend", "est_cost", "params"}
+    assert {n for n, _ in plan.skipped} == {"bad_model", "bad_aspect", "no_frame"}
+    ok1_item = next(i for i in plan.items if i["name"] == "ok1")
+    assert ok1_item["params"].get("duration") == 4   # default_params merged into settings
+
+    # takes_per_shot floors at 1
+    assert batch.plan_batch([shots[0]], takes_per_shot=0, model_of=model_of,
+                            aspects_of=aspects_of, est_of=est_of).take_count == 1
+
+    # BatchRun completion: terminal-only, complete when all takes drained
+    run = batch.BatchRun(take_ids={"a", "b"}, power_action=batch.POWER_NONE, started="t0")
+    assert not run.complete
+    run.mark("a", "generating")          # non-terminal -> ignored
+    assert run.remaining == {"a", "b"}
+    run.mark("a", "done")
+    run.mark("x", "done")                # not in batch -> ignored
+    assert run.remaining == {"b"} and not run.complete
+    run.mark("b", "cancelled")
+    assert run.complete
+
+    rows = [{"name": "ok1", "status": "done", "cost_actual": 0.5},
+            {"name": "ok2", "status": "failed", "cost_actual": None},
+            {"name": "ok3", "status": "cancelled", "cost_actual": None}]
+    rep = batch.build_batch_report(rows, started="t0", finished="t1",
+                                   power_action=batch.POWER_SLEEP)
+    for token in ("done", "failed", "cancelled", "$0.50", "sleep", "t0", "t1"):
+        assert token in rep, token
+
+    cmd = batch.sleep_command()
+    assert cmd and isinstance(cmd, list)
+    print("batch OK: plan eligibility/N-per-shot, BatchRun completion, report, sleep cmd")
+
+
 if __name__ == "__main__":
     test_build_input()
     test_capability_sync()
@@ -872,4 +938,5 @@ if __name__ == "__main__":
     test_progress_fraction()
     test_client_id_in_queue()
     test_progress_pct()
+    test_batch()
     print("PHASE 2 SMOKE: PASS")

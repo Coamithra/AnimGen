@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -24,14 +25,14 @@ from typing import Optional
 from PySide6.QtCore import Qt, QObject, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDockWidget, QFileDialog, QLabel, QMainWindow,
+    QCheckBox, QComboBox, QDialog, QDockWidget, QFileDialog, QLabel, QMainWindow,
     QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
     QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
 import library
 import paths
-from backends import comfy_client, crash_recovery, recovery, replicate_client
+from backends import batch, comfy_client, crash_recovery, recovery, replicate_client
 from backends.jobs import JobManager
 from pipeline import export, framing
 from store import app_settings
@@ -40,6 +41,7 @@ from store.models import (
     STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
 )
 from ui.assets_view import AssetsView
+from ui.batch_dialog import BatchDialog, SCOPE_VIEW
 from ui.shot_card import ShotCard
 from ui.comfy_monitor_window import ComfyMonitorWindow
 from ui.shot_tab import ShotTab
@@ -51,6 +53,11 @@ from ui.take_player import TakePlayerTab
 # settings keys passed to the hosted client explicitly (everything else -> extra/--set)
 _EXPLICIT_SETTINGS = ("duration", "resolution", "seed", "length")
 _PROJECT_FILTER = "AnimGen project (*.animproj)"
+
+
+def _skipped_text(skipped: list) -> str:
+    """Bullet list of '(name): reason' for shots a batch can't generate."""
+    return "\n".join(f"  - {name}: {reason}" for name, reason in skipped)
 
 
 class _OrphanReconciler(QObject):
@@ -80,6 +87,7 @@ class MainWindow(QMainWindow):
         self.cards: dict[str, ShotCard] = {}
         self.shot_tabs: dict[str, ShotTab] = {}   # shot_id -> its open detail/edit tab
         self.take_tabs: dict[str, TakePlayerTab] = {}  # take_id -> its open viewer tab
+        self._batch: Optional[batch.BatchRun] = None   # in-flight overnight batch, if any
 
         self.jobs = JobManager(project)
         self.jobs.progress.connect(self._on_progress)
@@ -112,6 +120,11 @@ class MainWindow(QMainWindow):
         exp_view = QAction("Export view", self)
         exp_view.triggered.connect(self.export_current_view)
         tb.addAction(exp_view)
+        batch_act = QAction("Generate batch...", self)
+        batch_act.setToolTip("Queue every eligible shot for an unattended (overnight) run, "
+                             "with optional power-down when it finishes")
+        batch_act.triggered.connect(self.start_batch)
+        tb.addAction(batch_act)
         self.cancel_act = QAction("Cancel pending", self)
         self.cancel_act.setToolTip("Cancel all queued generations that haven't started yet")
         self.cancel_act.triggered.connect(self.cancel_pending)
@@ -582,11 +595,21 @@ class MainWindow(QMainWindow):
             self._log("generation cancelled (project not saved)")
             return
 
-        # A 'random' shot rolls a fresh concrete seed per take (so a batch varies); record
-        # it on the take/snapshot for reproducibility. A fixed seed passes through unchanged.
+        self._queue_take(shot, model, settings, est)
+        self._refresh_shot(shot.id)
+        self._refresh_cancel_action()
+        self.queue_tab.refresh()   # a freshly-queued take emits no signal until it starts
+
+    def _queue_take(self, shot, model, settings, est) -> str:
+        """Build the immutable snapshot, create a PENDING take, and enqueue its runner.
+
+        Shared by single-shot Generate and the overnight batch. A 'random' shot rolls a
+        fresh concrete seed *here*, per call, so N takes of the same shot vary and each
+        take's snapshot records the seed actually used. Caller handles confirm + save +
+        refresh. Returns the new take id.
+        """
         if settings.get("seed") == library.SEED_RANDOM:
             settings = {**settings, "seed": library.resolve_seed(library.SEED_RANDOM)}
-
         snapshot = {
             "model_id": shot.model_id, "backend": model["backend"],
             "replicate_model_id": model.get("replicate_model_id"),
@@ -600,11 +623,127 @@ class MainWindow(QMainWindow):
         self.jobs.enqueue(take.id, model["backend"],
                           self._make_runner(model, shot, settings, take.id))
         self._log(f"queued {take.id[:8]} ({shot.name})")
-        self._refresh_shot(shot.id)
+        return take.id
+
+    # ---- overnight batch -----------------------------------------------
+    def start_batch(self) -> None:
+        """Queue every eligible shot x N takes after one up-front cost-confirm.
+
+        Honors the cost gate with a single confirmation for the whole night (the gate
+        already takes a list). Saves once so no take references an unsaved shot. Records a
+        BatchRun so _on_status_changed can detect drain and run the chosen power action.
+        """
+        if self._batch is not None:
+            QMessageBox.information(self, "Generate batch",
+                                    "A batch is already running. Wait for it to finish "
+                                    "(or Cancel pending) before starting another.")
+            return
+        dlg = BatchDialog(self, view_count=len(self.cards))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        scope, n, power = dlg.scope(), dlg.takes_per_shot(), dlg.power_action()
+
+        if scope == SCOPE_VIEW:
+            shots = [s for s in (self.project.get_shot(sid) for sid in self.cards) if s]
+        else:
+            shots = self.project.list_shots()
+        plan = batch.plan_batch(
+            shots, takes_per_shot=n,
+            model_of=lambda s: library.get_model(s.model_id),
+            aspects_of=library.aspect_ratios,
+            est_of=library.estimate_cost)
+
+        if not plan.eligible:
+            QMessageBox.warning(self, "Generate batch",
+                                "No eligible shots to generate.\n\n"
+                                + _skipped_text(plan.skipped))
+            return
+        if plan.skipped:
+            if QMessageBox.question(
+                    self, "Generate batch",
+                    f"{len(plan.eligible)} shot(s) will generate "
+                    f"({plan.take_count} take(s) total).\n"
+                    f"{len(plan.skipped)} shot(s) will be skipped:\n\n"
+                    + _skipped_text(plan.skipped) + "\n\nContinue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+
+        if not confirm_launch(self, plan.items):
+            self._log("batch cancelled")
+            return
+        if not self.save_project():
+            self._log("batch cancelled (project not saved)")
+            return
+
+        take_ids: set[str] = set()
+        for shot, model, settings, est in plan.eligible:
+            for _ in range(n):
+                take_ids.add(self._queue_take(shot, model, settings, est))
+        self._batch = batch.BatchRun(
+            take_ids=take_ids, power_action=power,
+            started=datetime.now().isoformat(timespec="seconds"))
+        self._log(f"batch started: {len(take_ids)} take(s), when-done={power}")
+        self.reload()
         self._refresh_cancel_action()
-        self.queue_tab.refresh()   # a freshly-queued take emits no signal until it starts
+        self.queue_tab.refresh()
+
+    def _finalize_batch(self) -> None:
+        """Every take in the batch has reached a terminal status: write the report, then run
+        the chosen power action. Called from _on_status_changed once BatchRun.complete."""
+        b, self._batch = self._batch, None
+        if b is None:
+            return
+        rows = []
+        for tid in b.take_ids:
+            t = self.project.get_take(tid)
+            if t is None:
+                continue
+            name = (t.settings_snapshot or {}).get("name") or ""
+            if not name:
+                s = self.project.get_shot(t.shot_id)
+                name = s.name if s else tid[:8]
+            rows.append({"name": name, "status": t.status, "cost_actual": t.cost_actual})
+        report = batch.build_batch_report(
+            rows, started=b.started,
+            finished=datetime.now().isoformat(timespec="seconds"),
+            power_action=b.power_action)
+        try:
+            paths.EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_path = paths.EXPORTS_DIR / f"overnight_{stamp}.txt"
+            report_path.write_text(report, encoding="utf-8")
+            self._log(f"batch finished - report: {report_path}")
+        except Exception as e:  # noqa: BLE001 - a failed report must not abort the power action
+            self._log(f"batch finished - report write failed: {e}")
+        if b.power_action != batch.POWER_NONE:
+            self._perform_power_action(b.power_action)
+
+    def _perform_power_action(self, action: str) -> None:
+        """Stop ComfyUI (always) and optionally sleep the PC, on a daemon thread so the GUI
+        isn't blocked (stop_server can take ~10s). Best-effort: every step is guarded."""
+        def work():
+            try:
+                comfy_client.stop_server()
+            except Exception:  # noqa: BLE001 - server may already be down
+                pass
+            if action == batch.POWER_SLEEP:
+                cmd = batch.sleep_command()
+                if cmd:
+                    try:
+                        subprocess.Popen(cmd)
+                    except Exception:  # noqa: BLE001
+                        pass
+        self._log(f"batch power action: {action}")
+        threading.Thread(target=work, daemon=True).start()
 
     def cancel_pending(self) -> None:
+        # Abort an active batch first (before the cancellations fire status_changed), so a
+        # deliberate Cancel doesn't drain the batch into its when-done power action - the
+        # user is clearly present and wouldn't want the PC put to sleep.
+        if self._batch is not None:
+            self._batch = None
+            self._log("batch aborted (cancel pending) - no power action will run")
         n = self.jobs.cancel_pending()
         self._log(f"cancelled {n} pending generation(s)" if n
                   else "no pending generations to cancel")
@@ -905,6 +1044,10 @@ class MainWindow(QMainWindow):
         self._log(f"[{status}] {take_id[:8]}")
         self._refresh_shot_for_take(take_id)
         self._refresh_cancel_action()
+        if self._batch is not None:
+            self._batch.mark(take_id, status)
+            if self._batch.complete:
+                self._finalize_batch()
 
     def _after_job(self, take_id: str, msg: str) -> None:
         self._log(msg)
