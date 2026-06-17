@@ -77,6 +77,9 @@ def run_with_crash_recovery(
                 raise                      # server alive -> genuine workflow error, not a crash
             elapsed = format_elapsed(int(clock() - t0))
             if attempt >= max_attempts:
+                # on_abandon cancels the still-PENDING siblings; THIS take is still
+                # GENERATING so it's untouched there and instead fails normally when the
+                # QueueAbandoned below propagates to the worker's except handler.
                 reason = (f"ComfyUI crashed {max_attempts}x on this take (last after "
                           f"{elapsed}); pausing the local queue. Check the GPU / ComfyUI "
                           "before re-Generating.")

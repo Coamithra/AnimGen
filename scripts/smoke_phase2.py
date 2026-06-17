@@ -630,7 +630,7 @@ def test_crash_recovery() -> None:
 
 def test_wait_until_responsive() -> None:
     # Polls server_status() until it reports running, or times out. Stub server_status so no
-    # real socket/server; poll_s=0 keeps it instant without touching the real time.sleep.
+    # real socket/server; poll_s=0 keeps the between-probe time.sleep(0) effectively instant.
     saved_status = comfy_client.server_status
     try:
         calls = [0]
@@ -712,6 +712,8 @@ def test_abandon_local() -> None:
         if project.get_take(active.id).status == STATUS_GENERATING:
             break
         time.sleep(0.02)
+    assert project.get_take(active.id).status == STATUS_GENERATING, \
+        "local blocker never started; abandon would wrongly cancel it as pending"
 
     n = jm.abandon_local("ComfyUI crashed 3x; pausing the local queue.")
     assert n == 2, n                 # the two queued LOCAL takes, not the hosted one
