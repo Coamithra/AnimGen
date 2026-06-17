@@ -99,12 +99,12 @@ def _async_offload_value(argv: list[str]) -> Optional[int]:
     for i, tok in enumerate(argv):
         if tok == "--async-offload":
             nxt = argv[i + 1] if i + 1 < len(argv) else None
-            if nxt is not None and not nxt.startswith("-"):
-                try:
-                    return int(nxt)
-                except ValueError:
-                    return 2
-            return 2
+            if nxt is None:
+                return 2          # bare trailing flag -> const 2
+            try:
+                return int(nxt)   # explicit count (incl. 0 / negative, like argparse)
+            except ValueError:
+                return 2          # next token isn't a count (e.g. another flag) -> const 2
         if tok.startswith("--async-offload="):
             try:
                 return int(tok.split("=", 1)[1])

@@ -250,6 +250,8 @@ def test_dynamic_vram_gate() -> None:
     assert ao(base + ["--cpu"], "cuda") is False
     assert ao(base + ["--async-offload", "0"], "cuda") is False  # explicit 0 -> off
     assert ao(base + ["--async-offload", "4"], "cpu") is True     # explicit count -> on
+    # mirrors ComfyUI's own `if NUM_STREAMS > 0` gate: a non-positive count never streams
+    assert ao(base + ["--async-offload", "-1"], "cuda") is False
     assert ao(base + ["--async-offload"], "cuda") is True         # bare flag -> const 2
     assert ao(base + ["--async-offload=0"], "cuda") is False
     # --disable-dynamic-vram alone does NOT turn async offload off (the actual TDR bug).
@@ -277,6 +279,13 @@ def test_preflight_gate() -> None:
         # both streaming paths off -> passes
         comfy_client._api = fake_stats(base + ["--disable-dynamic-vram", "--disable-async-offload"])
         comfy_client.preflight()
+        # unknown device type (None) is the safety-critical reading: async offload assumed on
+        comfy_client._api = fake_stats(base + ["--disable-dynamic-vram"], device_type=None)
+        try:
+            comfy_client.preflight()
+            assert False, "preflight should refuse when the device type is unknown (assume GPU)"
+        except comfy_client.ComfyError as e:
+            assert "async weight offloading" in str(e)
         # dynamic VRAM on -> refused
         comfy_client._api = fake_stats(base + ["--disable-async-offload"])
         try:
