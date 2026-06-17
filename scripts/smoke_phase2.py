@@ -661,13 +661,29 @@ def test_orphan_recovery() -> None:
 
 
 def test_crash_recovery() -> None:
-    from backends.crash_recovery import QueueAbandoned, format_elapsed, run_with_crash_recovery
+    from backends.crash_recovery import (QueueAbandoned, _looks_crashed, format_elapsed,
+                                         run_with_crash_recovery)
 
     # format_elapsed: compact span, clamps negatives.
     assert format_elapsed(45) == "45s"
     assert format_elapsed(75) == "1m15s"
     assert format_elapsed(3675) == "1h1m15s"
     assert format_elapsed(-5) == "0s"
+
+    # _looks_crashed: an all-down server is probed exactly `probes` times (bounded), the first
+    # "up" is trusted after a single probe, and `probes <= 0` still floors at one probe.
+    calls = [0]
+    def down():
+        calls[0] += 1
+        return False
+    assert _looks_crashed(down, 3) is True and calls[0] == 3
+    calls[0] = 0
+    def up():
+        calls[0] += 1
+        return True
+    assert _looks_crashed(up, 3) is False and calls[0] == 1
+    calls[0] = 0
+    assert _looks_crashed(down, 0) is True and calls[0] == 1
 
     # A deterministic fake clock: each read advances 1s (so an attempt "takes" 1s).
     def make_clock():

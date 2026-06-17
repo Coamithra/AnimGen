@@ -178,9 +178,6 @@ def launch_server(extra: Optional[list[str]] = None) -> "subprocess.Popen":
     return proc
 
 
-RESTART_SETTLE_S = 2.0   # let the OS release COMFY_PORT after a kill before we rebind it
-
-
 def wait_until_responsive(timeout_s: int = 120, poll_s: float = 2.0,
                           is_alive: Optional[Callable[[], bool]] = None) -> bool:
     """Block until the local ComfyUI answers /system_stats (running) or `timeout_s` elapses.
@@ -203,6 +200,9 @@ def wait_until_responsive(timeout_s: int = 120, poll_s: float = 2.0,
         if time.time() >= deadline:
             return False
         time.sleep(poll_s)
+
+
+RESTART_SETTLE_S = 2.0   # let the OS release COMFY_PORT after a kill before we rebind it
 
 
 def restart_server(progress_cb: ProgressCb = None, ready_timeout_s: int = 120,
