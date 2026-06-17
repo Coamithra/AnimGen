@@ -908,12 +908,23 @@ class MainWindow(QMainWindow):
 
         if self._stop_paused_local or not self._local_work_in_flight():
             return
+        rendering = any(
+            t.status == STATUS_GENERATING
+            and (t.settings_snapshot or {}).get("backend") == "comfyui"
+            for t in self.project.list_takes(include_deleted=False))
         held = self.jobs.pause_local()   # sets the pause flag, clears the local pool
         self._stop_paused_local = True
-        for tid in held:                 # no Resume UI here: cancel the queued local takes
-            self.jobs.cancel_take(tid)
-        self._log("local queue paused (ComfyUI stopped by user) — the current render will stop; "
+        for tid in held:                 # no Resume UI here: cancel the queued local takes.
+            self.jobs.cancel_take(tid)   # a take a worker already dequeued bails on the _cancelled set
+        self._log(f"local queue paused (ComfyUI stopped by user) — "
+                  f"{'the current render will stop; ' if rendering else ''}"
                   f"cancelled {len(held)} queued local take(s).")
+        if not self._local_work_in_flight():
+            # The stop hit a purely-queued local set (nothing GENERATING): there's no in-flight
+            # render whose failure needs covering, and no terminal status_changed will arrive to
+            # trigger the auto-clear in _on_status_changed, so lift the transient pause now.
+            self._stop_paused_local = False
+            self.jobs.clear_local_pause()
         self.reload()
         self._refresh_cancel_action()
         self.queue_tab.refresh()
