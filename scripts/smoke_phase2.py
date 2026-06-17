@@ -660,6 +660,192 @@ def test_orphan_recovery() -> None:
     print("orphan recovery OK: select + reclaim/reattach/fail/cancel + prompt-id + seed dedup")
 
 
+def test_crash_recovery() -> None:
+    from backends.crash_recovery import QueueAbandoned, format_elapsed, run_with_crash_recovery
+
+    # format_elapsed: compact span, clamps negatives.
+    assert format_elapsed(45) == "45s"
+    assert format_elapsed(75) == "1m15s"
+    assert format_elapsed(3675) == "1h1m15s"
+    assert format_elapsed(-5) == "0s"
+
+    # A deterministic fake clock: each read advances 1s (so an attempt "takes" 1s).
+    def make_clock():
+        ticks = [0.0]
+        def clock():
+            ticks[0] += 1.0
+            return ticks[0]
+        return clock
+
+    # (a) success on the first try -> no restart, no abandon, server never consulted.
+    notes, restarts, abandons = [], [], []
+    res = run_with_crash_recovery(
+        render=lambda: {"video_path": "ok.mp4"},
+        server_running=lambda: True, restart_server=lambda: restarts.append(1),
+        note=notes.append, on_abandon=abandons.append, clock=make_clock())
+    assert res == {"video_path": "ok.mp4"} and not restarts and not abandons
+
+    # (b) crash once (server down after the failure) then succeed -> 1 restart, "attempt 2/3".
+    attempts = [0]
+    def render_crash_then_ok():
+        attempts[0] += 1
+        if attempts[0] == 1:
+            raise comfy_client.ComfyError("ComfyUI unreachable")
+        return {"video_path": "recovered.mp4"}
+    notes, restarts, abandons = [], [], []
+    res = run_with_crash_recovery(
+        render=render_crash_then_ok, server_running=lambda: False,
+        restart_server=lambda: restarts.append(1),
+        note=notes.append, on_abandon=abandons.append, clock=make_clock())
+    assert res == {"video_path": "recovered.mp4"}
+    assert len(restarts) == 1 and not abandons
+    assert any("retrying (attempt 2/3)" in n and "failed in" in n for n in notes), notes
+
+    # (c) crash every time -> QueueAbandoned after 3 tries, on_abandon called once, 2 restarts.
+    notes, restarts, abandons = [], [], []
+    def always_crash():
+        raise comfy_client.ComfyError("ComfyUI unreachable")
+    try:
+        run_with_crash_recovery(
+            render=always_crash, server_running=lambda: False,
+            restart_server=lambda: restarts.append(1),
+            note=notes.append, on_abandon=abandons.append, clock=make_clock())
+        assert False, "expected QueueAbandoned"
+    except QueueAbandoned:
+        pass
+    assert len(restarts) == 2 and len(abandons) == 1
+    assert "crashed 3x" in abandons[0] and "pausing the local queue" in abandons[0]
+
+    # (d) failure with the server still UP -> genuine workflow error, propagates unchanged.
+    notes, restarts, abandons = [], [], []
+    def workflow_error():
+        raise comfy_client.ComfyError("workflow error: bad node")
+    try:
+        run_with_crash_recovery(
+            render=workflow_error, server_running=lambda: True,
+            restart_server=lambda: restarts.append(1),
+            note=notes.append, on_abandon=abandons.append, clock=make_clock())
+        assert False, "expected the workflow error to propagate"
+    except comfy_client.ComfyError as e:
+        assert "workflow error" in str(e) and not isinstance(e, QueueAbandoned)
+    assert not restarts and not abandons, "a server-up failure must not restart or abandon"
+
+    # (e) restart itself fails -> QueueAbandoned + on_abandon (can't recover without a server).
+    notes, restarts, abandons = [], [], []
+    def restart_boom():
+        raise comfy_client.ComfyError("did not come back up")
+    try:
+        run_with_crash_recovery(
+            render=always_crash, server_running=lambda: False, restart_server=restart_boom,
+            note=notes.append, on_abandon=abandons.append, clock=make_clock())
+        assert False, "expected QueueAbandoned"
+    except QueueAbandoned:
+        pass
+    assert len(abandons) == 1 and "restart failed" in abandons[0]
+    print("crash_recovery OK: success/retry/abandon/workflow-error/restart-fail + format_elapsed")
+
+
+def test_wait_until_responsive() -> None:
+    # Polls server_status() until it reports running, or times out. Stub server_status so no
+    # real socket/server; poll_s=0 keeps the between-probe time.sleep(0) effectively instant.
+    saved_status = comfy_client.server_status
+    try:
+        calls = [0]
+        def flips_running(timeout=2):
+            calls[0] += 1
+            return {"running": calls[0] >= 3}        # down twice, then up
+        comfy_client.server_status = flips_running
+        assert comfy_client.wait_until_responsive(timeout_s=60, poll_s=0.0) is True
+        assert calls[0] == 3
+
+        comfy_client.server_status = lambda timeout=2: {"running": False}  # never comes up
+        assert comfy_client.wait_until_responsive(timeout_s=0, poll_s=0.0) is False
+    finally:
+        comfy_client.server_status = saved_status
+    print("wait_until_responsive OK: returns on running, False on timeout")
+
+
+def test_restart_server() -> None:
+    # restart_server orchestration: stop (tolerating ComfyError) -> launch -> wait. Stub all
+    # three so no real process/socket; verify call order and the "didn't come up" failure.
+    saved = (comfy_client.stop_server, comfy_client.launch_server,
+             comfy_client.wait_until_responsive)
+    order = []
+    try:
+        def stop():
+            order.append("stop")
+            raise comfy_client.ComfyError("nothing to stop")   # must be swallowed
+        comfy_client.stop_server = stop
+        comfy_client.launch_server = lambda extra=None: order.append("launch")
+        comfy_client.wait_until_responsive = lambda *a, **k: True
+        comfy_client.restart_server()
+        assert order == ["stop", "launch"], order
+
+        comfy_client.wait_until_responsive = lambda *a, **k: False   # server never answers
+        try:
+            comfy_client.restart_server(ready_timeout_s=5)
+            assert False, "expected ComfyError when the server doesn't come back"
+        except comfy_client.ComfyError as e:
+            assert "did not come back up" in str(e)
+    finally:
+        (comfy_client.stop_server, comfy_client.launch_server,
+         comfy_client.wait_until_responsive) = saved
+    print("restart_server OK: stop(tolerant)->launch->wait; raises if unresponsive")
+
+
+def test_abandon_local() -> None:
+    import threading
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+    from store.models import STATUS_CANCELLED, STATUS_DONE, STATUS_GENERATING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    jm = JobManager(project)
+    abandoned = []
+    jm.queue_abandoned.connect(abandoned.append)
+
+    local_snap, hosted_snap = {"backend": "comfyui"}, {"backend": "replicate"}
+    release = threading.Event()
+    active = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+    lq1 = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+    lq2 = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+    hosted = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=hosted_snap)
+
+    def blocker(progress):           # occupies the single local worker until released
+        release.wait(timeout=10)
+        return {"video_path": "x.mp4"}
+
+    jm.enqueue(active.id, "comfyui", blocker)
+    jm.enqueue(lq1.id, "comfyui", blocker)   # never runs - cleared/cancelled by abandon_local
+    jm.enqueue(lq2.id, "comfyui", blocker)
+    jm.enqueue(hosted.id, "replicate", lambda p: {"video_path": "h.mp4"})  # hosted pool
+
+    for _ in range(100):             # wait until the local blocker is actually generating
+        if project.get_take(active.id).status == STATUS_GENERATING:
+            break
+        time.sleep(0.02)
+    assert project.get_take(active.id).status == STATUS_GENERATING, \
+        "local blocker never started; abandon would wrongly cancel it as pending"
+
+    n = jm.abandon_local("ComfyUI crashed 3x; pausing the local queue.")
+    assert n == 2, n                 # the two queued LOCAL takes, not the hosted one
+    assert project.get_take(lq1.id).status == STATUS_CANCELLED
+    assert project.get_take(lq2.id).status == STATUS_CANCELLED
+    assert abandoned == ["ComfyUI crashed 3x; pausing the local queue."]
+
+    release.set()
+    assert jm.wait_for_done(10000), "jobs did not finish"
+    app.processEvents()
+    assert project.get_take(active.id).status == STATUS_DONE   # the running local one untouched
+    assert project.get_take(hosted.id).status == STATUS_DONE   # hosted take untouched
+    print("abandon_local OK: local pending cancelled, running + hosted untouched, signal fired")
+
+
 if __name__ == "__main__":
     test_build_input()
     test_capability_sync()
@@ -672,6 +858,10 @@ if __name__ == "__main__":
     test_comfy_stop_helpers()
     test_comfy_views()
     test_orphan_recovery()
+    test_crash_recovery()
+    test_wait_until_responsive()
+    test_restart_server()
+    test_abandon_local()
     test_total_price()
     test_cost_summary()
     test_cancel_pending()
