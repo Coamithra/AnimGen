@@ -66,6 +66,12 @@ def test_framing() -> None:
     bim.save(big)
     full, capped = framing.keyed_sprite(big), framing.keyed_sprite(big, max_side=128)
     assert max(capped.size) <= 128 < max(full.size), (full.size, capped.size)
+    # crop_to_content=False keeps the full original-image size (placement is original-relative)
+    # with a transparent background; default still crops to the foreground bbox (smaller).
+    uncropped = framing.keyed_sprite(big, crop_to_content=False)
+    assert uncropped.size == (600, 600) and uncropped.mode == "RGBA", uncropped.size
+    assert uncropped.getpixel((0, 0))[3] == 0, "corner background must be transparent"
+    assert full.size[0] < 600 and full.size[1] < 600, full.size  # default crops tighter
     print("framing OK: normalize_keypose + canvas_size (hosted long-side / local /16 budget)")
 
 
@@ -328,6 +334,26 @@ def test_render_keyposes() -> None:
     print("render_keyposes OK: keyed sprite placed on the aspect canvas at gen time")
 
 
+def test_scale_relative_to_original() -> None:
+    """render_placement's scale is relative to the ORIGINAL image, not the cutout: a 200px
+    frame whose character occupies 100px (ratio 0.5), rendered at scale 0.5 on a 400px canvas,
+    yields a 100px character (0.5 * 400 * 0.5) - not the 200px a cutout-relative scale gives."""
+    import numpy as np
+
+    tmp = Path(tempfile.mkdtemp())
+    src = tmp / "halfframe.png"
+    im = Image.new("RGB", (200, 200), (255, 0, 255))
+    ImageDraw.Draw(im).rectangle([90, 50, 110, 149], fill=(0, 0, 0))  # cutout h=100 of 200
+    im.save(src)
+    out = framing.render_placement(src, {"scale": 0.5, "cx": 0.5, "cy": 0.5}, (400, 400))
+    fg = np.abs(np.array(out).astype(int) - [255, 0, 255]).sum(axis=2) > 60
+    rows = np.where(fg.any(axis=1))[0]
+    rendered_h = int(rows.max() - rows.min() + 1)
+    assert abs(rendered_h - 100) <= 6, (rendered_h, "expected ~100 px, original-relative")
+    assert rendered_h < 150, (rendered_h, "cutout-relative would render ~200 px")
+    print("render_placement OK: scale is relative to the original image, not the cutout")
+
+
 if __name__ == "__main__":
     test_framing()
     test_placement_canvas()
@@ -335,4 +361,5 @@ if __name__ == "__main__":
     test_negative_and_templates()
     test_mode_widget_live_enum()
     test_render_keyposes()
+    test_scale_relative_to_original()
     print("PHASE 3 SMOKE: PASS")

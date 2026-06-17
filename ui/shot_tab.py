@@ -429,7 +429,7 @@ class ShotTab(QWidget):
         if not (asset and Path(asset).exists()):
             return None
         try:
-            return pil_to_pixmap(framing.keyed_sprite(asset))
+            return pil_to_pixmap(framing.keyed_sprite(asset, crop_to_content=False))
         except Exception:  # noqa: BLE001 - unreadable image -> empty canvas
             return None
 
@@ -451,7 +451,7 @@ class ShotTab(QWidget):
         try:
             sprite = self._keyed_cache.get(asset)
             if sprite is None:
-                sprite = framing.keyed_sprite(asset)
+                sprite = framing.keyed_sprite(asset, crop_to_content=False)
                 self._keyed_cache[asset] = sprite
             img = framing.render_placement(asset, self._frames[which], self._thumb_canvas(),
                                            sprite=sprite)

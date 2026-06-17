@@ -157,9 +157,13 @@ def display_size(aspect: str, *, resolution: Optional[str] = None,
 
 
 def keyed_sprite(src: str | Path, *, bg_thresh: int = 60, min_blob: int = 50,
-                 max_side: Optional[int] = None) -> Image.Image:
-    """Key the foreground off the corner background; return it as an RGBA image cropped to
-    the sprite's bounding box (alpha = the kept mask). No foreground found -> whole image.
+                 max_side: Optional[int] = None, crop_to_content: bool = True) -> Image.Image:
+    """Key the foreground off the corner background; return it as an RGBA image with the
+    background transparent (alpha = the kept mask). No foreground found -> whole image.
+
+    crop_to_content=True (default) crops to the sprite's bounding box. crop_to_content=False
+    keeps the full image size, so placement/scale is relative to the *original image* rather
+    than the cutout (two to-scale source frames at the same scale render at the same size).
 
     max_side downsamples the source's longest side before keying (cheap previews/thumbnails
     avoid keying at full contract resolution); None keys at native resolution."""
@@ -172,8 +176,10 @@ def keyed_sprite(src: str | Path, *, bg_thresh: int = 60, min_blob: int = 50,
     ys, xs = np.where(keep)
     if len(ys) == 0:
         return im.convert("RGBA")
-    x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
     rgba = np.dstack([arr, (keep * 255).astype("uint8")])
+    if not crop_to_content:
+        return Image.fromarray(rgba, "RGBA")
+    x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
     return Image.fromarray(rgba[y0:y1 + 1, x0:x1 + 1], "RGBA")
 
 
@@ -181,15 +187,17 @@ def render_placement(asset: str | Path, placement: dict, canvas: tuple[int, int]
                      out_path: Optional[str | Path] = None,
                      *, sprite: Optional[Image.Image] = None) -> Image.Image:
     """Paste a keyed sprite onto a magenta canvas per a normalized placement
-    {scale: sprite-height / canvas-height, cx, cy: center as 0..1 of the canvas}.
+    {scale: original-image-height / canvas-height, cx, cy: center as 0..1 of the canvas}.
 
-    Pass `sprite` (a pre-keyed RGBA image) to skip the keying step - lets a caller
-    cache the keyed sprite and re-render placements/canvases cheaply (e.g. thumbnails)."""
+    The sprite is the full original frame keyed transparent (not cropped to the cutout), so
+    scale and position are relative to the original image: two to-scale source frames at the
+    same scale render at the same size. Pass `sprite` (a pre-keyed RGBA image, keyed with
+    crop_to_content=False) to skip keying - lets a caller cache it and re-render cheaply."""
     W, H = int(canvas[0]), int(canvas[1])
     scale = float(placement.get("scale", 0.65))
     cx = float(placement.get("cx", 0.5))
     cy = float(placement.get("cy", 0.6))
-    sprite = sprite if sprite is not None else keyed_sprite(asset)
+    sprite = sprite if sprite is not None else keyed_sprite(asset, crop_to_content=False)
     target_h = max(1, round(scale * H))
     ratio = target_h / sprite.height
     sprite = sprite.resize((max(1, round(sprite.width * ratio)), target_h),
