@@ -35,6 +35,7 @@ class _JobSignals(QObject):
     progress_pct = Signal(str, float, str)  # take_id, fraction 0..1, label (ephemeral, UI-only)
     finished = Signal(str)              # take_id
     failed = Signal(str, str)           # take_id, error
+    queue_abandoned = Signal(str)       # reason - local queue paused after repeated crashes
 
 
 class GenerationJob(QRunnable):
@@ -95,6 +96,7 @@ class JobManager(QObject):
     progress_pct = Signal(str, float, str)
     finished = Signal(str)
     failed = Signal(str, str)
+    queue_abandoned = Signal(str)       # reason - local queue paused after repeated crashes
 
     def __init__(self, project: Project, hosted_concurrency: int = 3):
         super().__init__()
@@ -105,6 +107,7 @@ class JobManager(QObject):
         self._signals.progress_pct.connect(self.progress_pct)
         self._signals.finished.connect(self.finished)
         self._signals.failed.connect(self.failed)
+        self._signals.queue_abandoned.connect(self.queue_abandoned)
 
         self._hosted_pool = QThreadPool()
         self._hosted_pool.setMaxThreadCount(hosted_concurrency)
@@ -162,6 +165,28 @@ class JobManager(QObject):
             self._cancelled.add(t.id)
             self.project.update_take(t.id, status=STATUS_CANCELLED, error="cancelled by user")
             self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
+        return len(pending)
+
+    def abandon_local(self, reason: str) -> int:
+        """Pause the local (ComfyUI) queue after repeated crashes; return how many were cancelled.
+
+        Drops the not-yet-started local runnables and marks every still-pending COMFYUI take
+        CANCELLED with `reason` (hosted takes are untouched - a dead GPU doesn't affect a
+        Replicate render). Emits `queue_abandoned` so the UI can surface the pause. Called from
+        the crash-recovery worker thread: `clear()` only drops *queued* runnables (not the
+        active one that's abandoning), `update_take` is RLock-guarded, and the signal auto-queues
+        to the GUI thread. The shared `_cancelled` set is the safety net for a runnable already
+        dequeued when we cleared.
+        """
+        self._local_pool.clear()
+        pending = [t for t in self.project.list_takes(include_deleted=False)
+                   if t.status == STATUS_PENDING
+                   and (t.settings_snapshot or {}).get("backend") == "comfyui"]
+        for t in pending:
+            self._cancelled.add(t.id)
+            self.project.update_take(t.id, status=STATUS_CANCELLED, error=reason)
+            self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
+        self._signals.queue_abandoned.emit(reason)
         return len(pending)
 
     def wait_for_done(self, msecs: int = -1) -> bool:

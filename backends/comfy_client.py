@@ -178,6 +178,43 @@ def launch_server(extra: Optional[list[str]] = None) -> "subprocess.Popen":
     return proc
 
 
+def wait_until_responsive(timeout_s: int = 120, poll_s: float = 2.0) -> bool:
+    """Block until the local ComfyUI answers /system_stats (running) or `timeout_s` elapses.
+
+    Returns whether it came up. Used by restart_server after a crash relaunch. Each probe
+    eats a full socket timeout while the port is still closed (SYNs to a closed port are
+    dropped, not refused, on this machine - see CLAUDE.md), so server_status's own short
+    timeout doubles as the inter-poll wait; poll_s is a small extra breather between probes.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+        if server_status(timeout=2)["running"]:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(poll_s)
+
+
+def restart_server(progress_cb: ProgressCb = None, ready_timeout_s: int = 120) -> None:
+    """Stop the current ComfyUI (ours, or whatever's on the port) and relaunch a fresh one
+    with the required safe flags, blocking until it's responsive.
+
+    Used by crash recovery: a TDR watchdog crash kills the process mid-render, so we bring it
+    back. launch_server() always re-applies --disable-dynamic-vram (build_launch_command), so
+    the relaunched server also fixes the crash's root cause. Raises ComfyError if the install
+    can't be found or the server doesn't answer within ready_timeout_s.
+    """
+    _log(progress_cb, "comfy crash detected - restarting ComfyUI")
+    try:
+        stop_server()                 # kill our proc or whatever holds the port; ok if down
+    except ComfyError:
+        pass
+    launch_server()                   # detached, with --disable-dynamic-vram --cache-none
+    if not wait_until_responsive(ready_timeout_s):
+        raise ComfyError(f"ComfyUI did not come back up within {ready_timeout_s}s of restart.")
+    _log(progress_cb, "ComfyUI restarted - retrying take")
+
+
 def monitor_snapshot(timeout: int = 2) -> dict:
     """One-shot gather of live ComfyUI state for the monitor window. Non-raising.
 

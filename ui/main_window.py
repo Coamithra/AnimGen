@@ -16,6 +16,7 @@ import json
 import shutil
 import tempfile
 import threading
+import time
 from collections import Counter
 from datetime import datetime
 from typing import Optional
@@ -30,7 +31,7 @@ from PySide6.QtWidgets import (
 
 import library
 import paths
-from backends import comfy_client, recovery, replicate_client
+from backends import comfy_client, crash_recovery, recovery, replicate_client
 from backends.jobs import JobManager
 from pipeline import export, framing
 from store import app_settings
@@ -86,6 +87,7 @@ class MainWindow(QMainWindow):
         self.jobs.finished.connect(lambda tid: self._after_job(tid, f"✓ done {tid[:8]}"))
         self.jobs.failed.connect(
             lambda tid, err: self._after_job(tid, f"✗ FAILED {tid[:8]}: {err}"))
+        self.jobs.queue_abandoned.connect(self._on_queue_abandoned)
 
         self.resize(1180, 820)
         self._build_body()
@@ -591,6 +593,14 @@ class MainWindow(QMainWindow):
     def _refresh_cancel_action(self) -> None:
         self.cancel_act.setEnabled(self.jobs.pending_count() > 0)
 
+    def _on_queue_abandoned(self, reason: str) -> None:
+        """The local (ComfyUI) queue was paused after a take crashed repeatedly. Log it,
+        refresh the Cancel action (its pending takes are now cancelled), and warn the user."""
+        self._log(f"⚠ local queue paused: {reason}")
+        self._refresh_cancel_action()
+        self.queue_tab.refresh()
+        QMessageBox.warning(self, "ComfyUI queue paused", reason)
+
     def _make_runner(self, model, shot, settings, take_id):
         # Keyposes are framed from the shot's assets at generation time (on the worker
         # thread) into a temp dir, rather than baked at save time. See framing.render_keyposes.
@@ -625,13 +635,27 @@ class MainWindow(QMainWindow):
             self.project.update_take(take_id, backend_job_id=pid)  # can reconcile this take
 
         def runner(progress):
-            start_kp, end_kp = framing.render_keyposes(shot, tempfile.mkdtemp(prefix="animgen_kp_"))
-            return comfy_client.generate(
-                tpl, out_path, start=start_kp, end=end_kp,
-                prompt=shot.prompt or None, negative=shot.negative_prompt or None,
-                seed=settings.get("seed"), node_roles=roles, sets=size_sets,
-                progress_cb=progress, on_submit=on_submit,
-                text_encoder_cpu=True)   # keep the ~6GB encoder off the 12GB card (see comfy_client)
+            # One render attempt; wrapped below in crash recovery. A ComfyUI process crash
+            # (GPU watchdog/TDR) restarts the server and retries this take in place, while the
+            # rest of the local queue waits behind it on the serialized worker. After 3 crashes
+            # the whole local queue is abandoned (see backends/crash_recovery.py).
+            def attempt():
+                start_kp, end_kp = framing.render_keyposes(
+                    shot, tempfile.mkdtemp(prefix="animgen_kp_"))
+                return comfy_client.generate(
+                    tpl, out_path, start=start_kp, end=end_kp,
+                    prompt=shot.prompt or None, negative=shot.negative_prompt or None,
+                    seed=settings.get("seed"), node_roles=roles, sets=size_sets,
+                    progress_cb=progress, on_submit=on_submit,
+                    text_encoder_cpu=True)  # keep the ~6GB encoder off the 12GB card (see comfy_client)
+
+            return crash_recovery.run_with_crash_recovery(
+                render=attempt,
+                server_running=lambda: comfy_client.server_status()["running"],
+                restart_server=lambda: comfy_client.restart_server(progress_cb=progress),
+                note=progress,
+                on_abandon=self.jobs.abandon_local,
+                clock=time.time)
         return runner
 
     def _make_monitor_runner(self, take_id: str, prompt_id: str):
