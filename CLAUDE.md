@@ -46,10 +46,38 @@ for n in 1 2 3 4 5 6 7; do QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
 # (re)build the starter project from the shipped-move manifest (idempotent;
 # delete data/Fighter.animproj + data/Fighter.assets first for a clean rebuild)
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/seed_configs.py
+
+# live-drive the running GUI without full-PC control (see "Driving the app" below)
+ANIMGEN_REMOTE=1 .venv/Scripts/python.exe app.py        # launch with the control server
+python scripts/remote_cli.py snapshot                  # list drivable widgets
+python scripts/remote_cli.py shot out.png              # screenshot the window
+python scripts/remote_cli.py set --ref mainTabs --value Assets   # switch tab
 ```
 
 Setup if `.venv` is missing: `python -m venv .venv` then
 `.venv/Scripts/python.exe -m pip install -r requirements.txt`.
+
+### Driving the app (agents: use this to live-test, don't ask for PC control)
+
+**If you (an agent) need to interactively test the GUI — click things, switch tabs,
+read on-screen state, take screenshots — use the built-in control server, NOT desktop
+computer-use / full-PC-control.** It's the supported flow and scoped to AnimGen:
+
+1. Launch with the server on: `ANIMGEN_REMOTE=1 .venv/Scripts/python.exe app.py`
+   (background it; it logs `Remote control listening on http://127.0.0.1:<port>`,
+   default 8765 via `ANIMGEN_REMOTE_PORT`).
+2. Drive it with `scripts/remote_cli.py` (or `curl`): `snapshot` (DOM-like widget list),
+   `shot <file>` (PNG screenshot via `QWidget.grab()`), `click`/`type`/`key`/`set`
+   targeting a widget by `--ref` / `--object-name` / `--text`.
+3. Read the PNG back to *see* the result; re-`snapshot` to confirm state.
+4. Stop it by `taskkill //F //PID <pid>` for **that** instance's port (find it with
+   `netstat -ano | grep :<port>` — never blanket-kill `python.exe`, other agents share it).
+
+Still the rules: **a live hosted/local *take* spends money / GPU — explicit go-ahead only.**
+Driving the UI (tabs, framing, dialogs) is free; only the Generate launch costs. The
+cost-confirm gate still appears and must be driven, never bypassed. Headless `smoke_phase*`
+remains the gate for logic; the control server is for *interactive* UI verification.
+Full mechanism + invariants in **Hard-won rule #13**.
 
 ## Architecture map
 
