@@ -511,7 +511,7 @@ def test_inflight_stop_maps_to_cancelled() -> None:
 
     jm._stopping.add(take.id)               # mark it as an intentional stop
     job = GenerationJob(project, take.id, "comfyui", runner, jm._signals,
-                        jm._cancelled, jm._stopping)
+                        jm._cancelled, jm._stopping, jm._requeue, jm._on_job_done)
     job.run()
     app.processEvents()
 
@@ -887,8 +887,28 @@ def test_crash_recovery() -> None:
     except comfy_client.ComfyError:
         pass
     assert one_probe[0] == 1, "common workflow-error path must probe the server only once"
+
+    # (g) should_abort True (user paused / deliberately stopped ComfyUI): a render failure is
+    # NOT a crash to restart even with the server down - re-raise verbatim, never restart or
+    # abandon (the holding is done by JobManager.pause_local clearing the pool).
+    notes, restarts, abandons = [], [], []
+    probed = [0]
+    def server_probe():
+        probed[0] += 1
+        return False
+    try:
+        run_with_crash_recovery(
+            render=always_crash, server_running=server_probe,
+            restart_server=lambda: restarts.append(1),
+            note=notes.append, on_abandon=abandons.append,
+            should_abort=lambda: True, clock=make_clock())
+        assert False, "expected the failure to propagate when should_abort is True"
+    except comfy_client.ComfyError as e:
+        assert not isinstance(e, QueueAbandoned)
+    assert not restarts and not abandons, "a deliberate user stop must not restart or abandon"
+    assert probed[0] == 0, "should_abort short-circuits before the crash probe"
     print("crash_recovery OK: success/retry/abandon/workflow-error/restart-fail/"
-          "transient-down + format_elapsed")
+          "transient-down/user-abort + format_elapsed")
 
 
 def test_wait_until_responsive() -> None:
@@ -1067,6 +1087,142 @@ def test_abandon_local() -> None:
     assert project.get_take(active.id).status == STATUS_DONE   # the running local one untouched
     assert project.get_take(hosted.id).status == STATUS_DONE   # hosted take untouched
     print("abandon_local OK: local pending cancelled, running + hosted untouched, signal fired")
+
+
+def test_pause_resume_local() -> None:
+    """Pause holds queued local takes (kept PENDING, not cancelled) and flips is_local_paused;
+    resume re-enqueues them with their original runners. The running local take is left to
+    finish (card #41 'pause after current')."""
+    import threading
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+    from store.models import STATUS_DONE, STATUS_GENERATING, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    jm = JobManager(project)
+
+    local_snap = {"backend": "comfyui"}
+    gate1, gate2 = threading.Event(), threading.Event()
+    active = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+    q1 = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+    q2 = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+
+    runs = {"count": 0}
+    def active_runner(progress):
+        runs["count"] += 1
+        gate1.wait(timeout=10)
+        return {"video_path": "active.mp4"}
+    def quick(progress):
+        gate2.wait(timeout=10)
+        return {"video_path": "q.mp4"}
+
+    jm.enqueue(active.id, "comfyui", active_runner)
+    jm.enqueue(q1.id, "comfyui", quick)
+    jm.enqueue(q2.id, "comfyui", quick)
+
+    for _ in range(100):
+        if project.get_take(active.id).status == STATUS_GENERATING:
+            break
+        time.sleep(0.02)
+    assert project.get_take(active.id).status == STATUS_GENERATING
+
+    held = jm.pause_local()              # "pause after current": hold the two queued, not active
+    assert jm.is_local_paused() is True
+    assert set(held) == {q1.id, q2.id}, held
+    assert project.get_take(q1.id).status == STATUS_PENDING   # held, NOT cancelled
+    assert project.get_take(q2.id).status == STATUS_PENDING
+
+    gate1.set()                          # let the active take finish (it was untouched)
+    for _ in range(100):
+        if project.get_take(active.id).status == STATUS_DONE:
+            break
+        time.sleep(0.02)
+    app.processEvents()
+    assert project.get_take(active.id).status == STATUS_DONE
+    # While paused the held takes stay queued and never start.
+    time.sleep(0.1)
+    assert project.get_take(q1.id).status == STATUS_PENDING
+
+    gate2.set()                          # unblock the held runners for when they run
+    n = jm.resume_local(held)            # re-enqueue both held takes with their original runners
+    assert n == 2 and jm.is_local_paused() is False
+    assert jm.wait_for_done(10000), "resumed jobs did not finish"
+    app.processEvents()
+    assert project.get_take(q1.id).status == STATUS_DONE
+    assert project.get_take(q2.id).status == STATUS_DONE
+
+    # resume_local skips ids that are no longer PENDING (already done) or unknown (runner
+    # dropped) - a no-op that still clears the flag and re-enqueues nothing.
+    assert jm.resume_local([q1.id, q2.id, "nonexistent-id"]) == 0
+    assert jm.is_local_paused() is False
+    print("pause_resume_local OK: held PENDING, active finished, resume re-ran the held takes")
+
+
+def test_pause_requeue_current() -> None:
+    """Pause with requeue_current halts the in-flight local take and resets it to PENDING
+    (not terminal) so resume re-runs it from scratch (card #41 'halt current & re-add')."""
+    import threading
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from backends import comfy_client
+    from backends.jobs import JobManager
+    from store.models import STATUS_GENERATING, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    jm = JobManager(project)
+
+    # stop_and_requeue calls comfy_client.stop_work(); stub it so no real server is touched and
+    # make the interrupt actually unblock the runner (mimicking ComfyUI aborting the prompt).
+    interrupted = threading.Event()
+    orig_stop_work = comfy_client.stop_work
+    comfy_client.stop_work = lambda: interrupted.set()  # type: ignore[assignment]
+    try:
+        local_snap = {"backend": "comfyui"}
+        active = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+
+        attempts = {"n": 0}
+        def runner(progress):
+            attempts["n"] += 1
+            if attempts["n"] == 1:                 # first run is interrupted by the requeue stop
+                interrupted.wait(timeout=10)
+                raise comfy_client.ComfyError("interrupted")
+            return {"video_path": "rerun.mp4"}     # the resumed run succeeds
+
+        jm.enqueue(active.id, "comfyui", runner)
+        for _ in range(100):
+            if project.get_take(active.id).status == STATUS_GENERATING:
+                break
+            time.sleep(0.02)
+        assert project.get_take(active.id).status == STATUS_GENERATING
+
+        held = jm.pause_local(requeue_current=True)
+        assert active.id in held, held
+        for _ in range(100):                       # worker unwinds the interrupted render to PENDING
+            if project.get_take(active.id).status == STATUS_PENDING:
+                break
+            time.sleep(0.02)
+        app.processEvents()
+        assert project.get_take(active.id).status == STATUS_PENDING, "halted take must be re-queued"
+
+        n = jm.resume_local(held)                  # re-runs the same take; second attempt succeeds
+        assert n == 1
+        assert jm.wait_for_done(10000)
+        app.processEvents()
+        t = project.get_take(active.id)
+        assert t.status == STATUS_DONE and t.video_path == "rerun.mp4", (t.status, t.video_path)
+        assert attempts["n"] == 2, "the re-added take must run a second time"
+    finally:
+        comfy_client.stop_work = orig_stop_work  # type: ignore[assignment]
+    print("pause_requeue_current OK: in-flight take halted, reset PENDING, re-ran on resume")
 
 
 def test_batch() -> None:
@@ -1253,6 +1409,8 @@ if __name__ == "__main__":
     test_restart_server()
     test_ensure_server()
     test_abandon_local()
+    test_pause_resume_local()
+    test_pause_requeue_current()
     test_total_price()
     test_cost_summary()
     test_cancel_pending()

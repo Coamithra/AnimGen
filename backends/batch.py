@@ -85,6 +85,8 @@ class BatchRun:
     power_action: str
     started: str                            # ISO timestamp, stamped by the caller
     remaining: set = field(default_factory=set)
+    paused: bool = False                    # user paused this batch's local queue
+    held: list = field(default_factory=list)  # take ids held by the pause, for resume
 
     def __post_init__(self):
         if not self.remaining:

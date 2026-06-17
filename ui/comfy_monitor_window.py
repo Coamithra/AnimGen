@@ -84,6 +84,10 @@ class _AsyncCall(QObject):
 
 
 class ComfyMonitorWindow(QWidget):
+    # Emitted right before a deliberate Stop working / Shut down so the host can pause an
+    # active batch first - otherwise crash-recovery's auto-restart undoes the stop (card #41).
+    stop_intent = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("ComfyUI Monitor")
@@ -268,6 +272,7 @@ class ComfyMonitorWindow(QWidget):
         # the poller will reflect the server coming up
 
     def _stop_work(self) -> None:
+        self.stop_intent.emit()   # pause an active batch first (see stop_intent)
         self.activity_lbl.setText("stopping current work...")
         self._run_action(comfy_client.stop_work, "stopped current work")
 
@@ -278,6 +283,7 @@ class ComfyMonitorWindow(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
+        self.stop_intent.emit()   # pause an active batch first (see stop_intent)
         self.activity_lbl.setText("shutting down...")
         self._run_action(comfy_client.stop_server, "ComfyUI shut down")
 

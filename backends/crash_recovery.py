@@ -70,6 +70,7 @@ def run_with_crash_recovery(
     note: Callable[[str], None],
     on_abandon: Callable[[str], None],
     clock: Callable[[], float],
+    should_abort: Callable[[], bool] = lambda: False,
     max_attempts: int = MAX_ATTEMPTS,
     crash_probes: int = CRASH_PROBES,
 ) -> dict:
@@ -84,16 +85,23 @@ def run_with_crash_recovery(
     on_abandon      -> pause the rest of the local queue with this reason (called once, before
                        the QueueAbandoned raise).
     clock           -> time source (time.time); injected so tests don't sleep.
+    should_abort    -> True if the user deliberately stopped the local queue (paused a batch /
+                       shut ComfyUI down by hand). A render failure then is NOT a crash to be
+                       restarted - it's the intended stop, so re-raise the failure verbatim
+                       (the worker records the take terminally / requeues it) and do NOT
+                       restart or abandon. Default never-abort preserves the old behaviour.
 
     Returns render()'s result on success. Re-raises render()'s exception verbatim for a
-    genuine workflow error (server still up). Raises QueueAbandoned after `max_attempts`
-    crashes, or if a restart fails.
+    genuine workflow error (server still up) or a deliberate user stop. Raises QueueAbandoned
+    after `max_attempts` crashes, or if a restart fails.
     """
     for attempt in range(1, max_attempts + 1):
         t0 = clock()
         try:
             return render()
         except Exception as exc:  # noqa: BLE001 - any render failure is inspected below
+            if should_abort():
+                raise                      # user deliberately stopped -> don't restart/retry
             if not _looks_crashed(server_running, crash_probes):
                 raise                      # server alive -> genuine workflow error, not a crash
             elapsed = format_elapsed(int(clock() - t0))
