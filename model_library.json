@@ -345,6 +345,43 @@
         "size_node": "11"
       },
       "notes": "Local Wan 2.2 14B. The app picks the workflow from the shot's keyframes: end keyframe set -> FLF first-last tween; no end -> open-ended (I2V-style) continuation from the start frame (prepare_workflow severs the end-image node). ~3 min/render. ComfyUI must run on 127.0.0.1:8188. Best for transitions: stand<->crouch, hurt snap/recovery, block flinch. Template node ids match the FLF_*.json family. Capability flags are local-authored (comfyui has no Replicate schema): negative via comfy_nodes.negative, end_frame via comfy_nodes.end_image; the Refresh from Replicate sync skips comfyui models. (VACE multi-pin deferred until 3-4 pin keyframes exist; build per-job via scripts/make_vace_workflow.py.)"
+    },
+    {
+      "id": "local-wan14b-lightning",
+      "aspect_ratios": [
+        "1:1",
+        "16:9",
+        "9:16",
+        "4:3",
+        "3:4",
+        "21:9"
+      ],
+      "display_name": "Wan 2.2 14B Lightning (local, 4+4-step)",
+      "backend": "comfyui",
+      "workflow_template": "workflows/FLF_wan14b_lightning.json",
+      "tier": "local-free",
+      "supports_end_frame": true,
+      "supports_negative_prompt": false,
+      "supports_camera_fixed": false,
+      "requires_data_uri": false,
+      "cost_per_second_usd": 0.0,
+      "frames": 17,
+      "default_params": {
+        "seed": -1,
+        "length": 17
+      },
+      "comfy_nodes": {
+        "start_image": "9",
+        "end_image": "10",
+        "prompt": "7",
+        "negative": "8",
+        "seed_nodes": [
+          "12",
+          "13"
+        ],
+        "size_node": "11"
+      },
+      "notes": "Local Wan 2.2 14B with the lightx2v Lightning step-distill LoRAs (Wan2.2-I2V-A14B-Lightning-4steps-High/LowNoise.safetensors in comfyui/models/loras, downloaded 2026-06-18). Same two-expert FLF/I2V graph as local-flf-wan14b but cfg=1, shift=5, and an 8-step 4+4 split (high-noise expert steps 0->4, low 4->end) via two LoraLoaderModelOnly nodes (17 high, 18 low) - the HighNoise LoRA MUST stay on the high-noise expert path and LowNoise on the low; swapping them wrecks quality. ~4-5x faster than the 20-step local-flf-wan14b (observed 2026-06-18; the headline 20x is steps-only vs a 40-step+CFG baseline - here it's 40->8 model evals since cfg=1 drops the uncond pass = 5x sampling, diluted by model-load + --cache-none expert-reload overhead). supports_negative_prompt is FALSE on purpose: cfg=1 means no classifier-free guidance, so the negative prompt is inert (the node exists so prepare_workflow doesn't error, but it has no effect). BENCHED 2026-06-18 - human verdict 'decent enough' for the free bench tier, kept; community reports 4+4 keeps motion better than a bare 4-step. LoraLoaderModelOnly is a core ComfyUI node (no third-party node pack). Same node-id contract as the FLF_*.json family, so comfy_nodes is reused verbatim."
     }
   ]
 }
