@@ -599,14 +599,57 @@ def prepare_workflow(template: dict, *, start_img: Optional[str] = None,
     return wf
 
 
-def progress_fraction(msg: dict, prompt_id: str) -> tuple[Optional[float], str]:
+def sampler_step_plan(wf: dict) -> dict:
+    """{node_id: (global_offset, global_total)} for a multi-stage sampler chain, so a per-node
+    step count can be reported against the run's TOTAL steps instead of restarting each stage.
+
+    Wan 2.2 14B is a two-expert (high-/low-noise) model: its workflow splits the denoise across
+    two KSamplerAdvanced nodes (e.g. steps 0->10 then 10->20). ComfyUI reports progress per node
+    as value/own-steps, so without this map the bar fills 0..100% once per sampler and "counts to
+    10 twice". With it, node A maps to steps 0..10 of 20 and node B to 10..20 of 20.
+
+    Returns {} for a single-sampler workflow (nothing to remap -> the per-node value/max is already
+    the whole run). Ordering is by start_at_step (the split-sampler chaining), node id breaking ties.
+    Pure (no I/O); keys are str node ids to match the WS message ids.
+    """
+    stages = []
+    for nid, node in (wf or {}).items():
+        if not isinstance(node, dict) or "KSampler" not in str(node.get("class_type", "")):
+            continue
+        ins = node.get("inputs") or {}
+        steps = ins.get("steps")
+        if not isinstance(steps, int) or steps <= 0:
+            continue
+        start = ins.get("start_at_step")
+        start = start if isinstance(start, int) and start > 0 else 0
+        end = ins.get("end_at_step")
+        end = min(end, steps) if isinstance(end, int) else steps
+        run = max(0, end - start)
+        if run > 0:
+            stages.append((start, str(nid), run))
+    if len(stages) < 2:
+        return {}
+    stages.sort()
+    total = sum(r for _, _, r in stages)
+    plan, off = {}, 0
+    for _, nid, run in stages:
+        plan[nid] = (off, total)
+        off += run
+    return plan
+
+
+def progress_fraction(msg: dict, prompt_id: str, plan: Optional[dict] = None) -> tuple[Optional[float], str]:
     """(fraction 0..1, label) from a ComfyUI WS message, or (None, '') if it carries no
     usable progress for our prompt.
 
     Handles both the flat 'progress' message (value/max) and the newer per-node
     'progress_state', plus 'executing' with a null node (sampling done). Filters by
     prompt_id when the message carries one - local renders are serialized (one prompt at a
-    time), so a legacy 'progress' with no prompt_id is still unambiguously ours. Pure (no
+    time), so a legacy 'progress' with no prompt_id is still unambiguously ours.
+
+    `plan` (from sampler_step_plan) remaps a per-node step count onto the run's TOTAL steps so a
+    multi-stage sampler chain reports one continuous bar (e.g. "step 14/20") instead of restarting
+    each stage. When the running node isn't in the plan the raw per-node value/max is used. Pure (no
     I/O) so it's unit-testable headless.
     """
     data = msg.get("data") or {}
@@ -614,24 +657,28 @@ def progress_fraction(msg: dict, prompt_id: str) -> tuple[Optional[float], str]:
     if mpid is not None and prompt_id and mpid != prompt_id:
         return None, ""              # progress for some other prompt
 
-    def _frac(value, mx) -> tuple[Optional[float], str]:
-        if isinstance(value, (int, float)) and isinstance(mx, (int, float)) and mx > 0:
-            return max(0.0, min(1.0, value / mx)), f"step {int(value)}/{int(mx)}"
-        return None, ""
+    def _frac(value, mx, nid=None) -> tuple[Optional[float], str]:
+        if not (isinstance(value, (int, float)) and isinstance(mx, (int, float)) and mx > 0):
+            return None, ""
+        if plan and nid is not None and str(nid) in plan:
+            off, total = plan[str(nid)]
+            g = off + value
+            return max(0.0, min(1.0, g / total)), f"step {int(g)}/{int(total)}"
+        return max(0.0, min(1.0, value / mx)), f"step {int(value)}/{int(mx)}"
 
     mtype = msg.get("type")
     if mtype == "progress":
-        return _frac(data.get("value"), data.get("max"))
+        return _frac(data.get("value"), data.get("max"), data.get("node"))
     if mtype == "progress_state":
         # Report only the furthest-along actively-running node. Deliberately DON'T infer
         # 100% from "all listed nodes finished": progress_state lists only nodes seen so far,
         # so between two samplers (sampler 1 done, sampler 2 not yet listed) that would flash
         # a premature 100%. The terminal 1.0 comes from the 'executing' null message below.
-        running = [n for n in (data.get("nodes") or {}).values()
+        running = [(nid, n) for nid, n in (data.get("nodes") or {}).items()
                    if isinstance(n, dict) and 0 < (n.get("value") or 0) < (n.get("max") or 0)]
         if running:
-            pick = max(running, key=lambda n: (n.get("value") or 0) / (n.get("max") or 1))
-            return _frac(pick.get("value"), pick.get("max"))
+            nid, pick = max(running, key=lambda kv: (kv[1].get("value") or 0) / (kv[1].get("max") or 1))
+            return _frac(pick.get("value"), pick.get("max"), nid)
         return None, ""
     if mtype == "executing" and data.get("node") is None:
         return 1.0, ""               # our prompt finished sampling
@@ -639,7 +686,7 @@ def progress_fraction(msg: dict, prompt_id: str) -> tuple[Optional[float], str]:
 
 
 def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressCb,
-                          stop: "threading.Event") -> None:
+                          stop: "threading.Event", plan: Optional[dict] = None) -> None:
     """Best-effort: stream ComfyUI's WebSocket progress into progress_cb(frac=.., label=..).
 
     Any failure (no websocket-client, server without /ws, dropped socket) is swallowed - the
@@ -670,7 +717,7 @@ def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressC
                 msg = json.loads(raw)
             except (ValueError, TypeError):
                 continue
-            frac, label = progress_fraction(msg, prompt_id)
+            frac, label = progress_fraction(msg, prompt_id, plan)
             if frac is not None:
                 try:
                     progress_cb(frac=frac, label=label)
@@ -687,18 +734,19 @@ def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressC
 
 
 def _start_progress_ws(client_id: Optional[str], prompt_id: str,
-                       progress_cb: ProgressCb) -> "tuple[Optional[threading.Thread], Optional[threading.Event]]":
+                       progress_cb: ProgressCb, plan: Optional[dict] = None) -> "tuple[Optional[threading.Thread], Optional[threading.Event]]":
     """Spawn the best-effort WS progress listener; return (thread, stop_event).
 
     No-op (returns (None, None)) when there's no callback to feed or no client_id to
     subscribe with - ComfyUI routes progress to the socket holding the submitting
-    client_id, so without it there's nothing to listen for.
+    client_id, so without it there's nothing to listen for. `plan` (sampler_step_plan) maps a
+    multi-stage sampler chain onto one continuous step count.
     """
     if progress_cb is None or not client_id:
         return None, None
     stop = threading.Event()
     t = threading.Thread(target=_ws_progress_listener,
-                         args=(client_id, prompt_id, progress_cb, stop), daemon=True)
+                         args=(client_id, prompt_id, progress_cb, stop, plan), daemon=True)
     t.start()
     return t, stop
 
@@ -800,7 +848,10 @@ def submit(wf: dict, out_path: Path, progress_cb: ProgressCb = None,
     _log(progress_cb, f"queued {pid}")
     if on_submit:                     # record the prompt id NOW so a take orphaned mid-render
         on_submit(pid)                # (app restart) can be reconciled against the backend
-    ws_thread, ws_stop = _start_progress_ws(client_id, pid, progress_cb)  # live step % (best-effort)
+    # map the workflow's sampler chain onto one continuous step count (Wan's 2 experts -> 0..20,
+    # not 0..10 twice); {} for single-sampler workflows leaves the raw per-node % unchanged.
+    ws_thread, ws_stop = _start_progress_ws(client_id, pid, progress_cb,
+                                            sampler_step_plan(wf))  # live step % (best-effort)
     try:
         return _poll_until_done(pid, out_path, progress_cb, timeout_s, poll_s)
     finally:
