@@ -36,15 +36,19 @@ _BADGE_COLOR = {"pending": "#b0b0b0", "generating": "#5aa0ff",
 _GRID_PAD_W = 26
 _GRID_PAD_H = 42
 _VIEW_SPACING = 8     # QListView.setSpacing - margin around each grid cell
+_VIEW_FRAME_PAD = 4   # QListView frame border (top + bottom), so rows aren't clipped by it
 _PREVIEW_ROWS = 2.0   # preview area is locked to this many grid rows tall
 
 
 def preview_height(icon_size: int, rows: float = _PREVIEW_ROWS) -> int:
     """Fixed pixel height for the takes preview list: `rows` grid rows of `icon_size`
     icons, plus the list's spacing/frame padding. Pure so it's unit-testable headlessly.
-    The list keeps its own scrollbar, so more takes scroll inside this fixed window."""
+    The list keeps its own scrollbar, so more takes scroll inside this fixed window.
+
+    Spacing falls between rows as well as above/below them, so N rows need (N+1) gaps;
+    erring slightly tall keeps whole rows from being clipped before the scrollbar kicks in."""
     grid_h = icon_size + _GRID_PAD_H
-    return round(grid_h * rows) + _VIEW_SPACING * 2 + 4
+    return round(grid_h * rows) + round(_VIEW_SPACING * (rows + 1)) + _VIEW_FRAME_PAD
 
 
 class _StripLoader(QObject):

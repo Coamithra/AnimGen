@@ -89,14 +89,15 @@ def test_takes_view() -> None:
     assert tv.model.rowCount() == 1 and project.get_take(r1.id).deleted
     _ = r3
 
-    # Preview list has a FIXED height (1.5/2 grid rows) so it doesn't shift with the
-    # window when a shot row is expanded; the height tracks the Size slider.
+    # Preview list has a FIXED height (2 grid rows) so it doesn't shift with the window
+    # when a shot row is expanded; the height tracks the Size slider.
     from ui.takes_view import preview_height
     assert tv.view.minimumHeight() == tv.view.maximumHeight()   # fixed, both ends pinned
     assert tv.view.maximumHeight() == preview_height(tv.size_slider.value())
     before = tv.view.maximumHeight()
     tv.size_slider.setValue(tv.size_slider.value() + 60)         # bigger icons -> taller preview
-    assert tv.view.maximumHeight() == preview_height(tv.size_slider.value()) > before
+    assert tv.view.maximumHeight() == preview_height(tv.size_slider.value())
+    assert tv.view.maximumHeight() > before
     print("TakesView OK: filter, star toggle, delete-to-bin, counts, fixed preview height")
 
 
