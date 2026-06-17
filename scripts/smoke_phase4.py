@@ -89,16 +89,35 @@ def test_takes_view() -> None:
     assert tv.model.rowCount() == 1 and project.get_take(r1.id).deleted
     _ = r3
 
-    # Preview list has a FIXED height (2 grid rows) so it doesn't shift with the window
-    # when a shot row is expanded; the height tracks the Size slider.
-    from ui.takes_view import preview_height
+    # Preview height auto-fits the rows the takes actually occupy (1.._MAX_PREVIEW_ROWS),
+    # so a single row of takes doesn't reserve an empty second row. Both ends stay pinned
+    # (fixed height) so the panel doesn't drift with the window.
+    from ui.takes_view import (
+        _DRAG_MAX_ROWS, _MAX_PREVIEW_ROWS, columns_for, preview_height, rows_for,
+    )
     assert tv.view.minimumHeight() == tv.view.maximumHeight()   # fixed, both ends pinned
-    assert tv.view.maximumHeight() == preview_height(tv.size_slider.value())
-    before = tv.view.maximumHeight()
-    tv.size_slider.setValue(tv.size_slider.value() + 60)         # bigger icons -> taller preview
-    assert tv.view.maximumHeight() == preview_height(tv.size_slider.value())
-    assert tv.view.maximumHeight() > before
-    print("TakesView OK: filter, star toggle, delete-to-bin, counts, fixed preview height")
+
+    # Pure row/column math (headless-safe, no layout needed).
+    assert columns_for(0, 140) == 0                             # width unknown -> can't tell
+    assert columns_for(2000, 140) >= 4                          # wide -> several columns
+    assert rows_for(2, 2000, 140) == 1                          # 2 takes, wide -> one row
+    assert rows_for(50, 2000, 140) == _MAX_PREVIEW_ROWS         # many takes -> capped, scroll
+    assert rows_for(0, 2000, 140) == 1                          # empty -> still one row
+    assert rows_for(5, 0, 140) == _MAX_PREVIEW_ROWS             # width unknown -> full cap
+    assert preview_height(140, 2) > preview_height(140, 1)      # taller for more rows
+    assert preview_height(200, 1) > preview_height(140, 1)      # taller for bigger icons
+
+    # A manual drag-resize pins an explicit height (clamped) and overrides auto-fit;
+    # clearing it returns to auto-fit.
+    s = tv.size_slider.value()
+    tv.set_manual_height(99999)                                 # absurd -> clamped to the row cap
+    assert tv.view.maximumHeight() == preview_height(s, _DRAG_MAX_ROWS)
+    assert tv.view.minimumHeight() == tv.view.maximumHeight()
+    tv.set_manual_height(0)                                     # below min -> clamped to one row
+    assert tv.view.maximumHeight() == preview_height(s, 1)
+    tv.clear_manual_height()
+    assert tv._user_height is None
+    print("TakesView OK: filter, star toggle, delete-to-bin, counts, auto-fit + drag-resize height")
 
 
 def test_assets_view() -> None:
