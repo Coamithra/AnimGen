@@ -403,6 +403,108 @@ def test_cancel_pending() -> None:
     print("cancel_pending OK: queued cancelled, in-progress job left running")
 
 
+def test_cancel_shot_takes() -> None:
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+    from store.models import STATUS_CANCELLED, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot_a = project.add_shot("kick", model_id="seedance-2.0-std")
+    shot_b = project.add_shot("punch", model_id="seedance-2.0-std")
+    jm = JobManager(project)
+
+    a1 = project.add_take(shot_a.id, status=STATUS_PENDING)
+    a2 = project.add_take(shot_a.id, status=STATUS_PENDING)
+    b1 = project.add_take(shot_b.id, status=STATUS_PENDING)
+
+    n = jm.cancel_shot_takes(shot_a.id)
+    assert n == 2, n
+    assert project.get_take(a1.id).status == STATUS_CANCELLED
+    assert project.get_take(a2.id).status == STATUS_CANCELLED
+    assert a1.id in jm._cancelled and a2.id in jm._cancelled
+    assert project.get_take(b1.id).status == STATUS_PENDING  # other shot untouched
+    print("cancel_shot_takes OK: only this shot's queued takes cancelled")
+
+
+def test_inflight_stop_maps_to_cancelled() -> None:
+    # A backend error raised because we asked the render to stop must land the take as
+    # CANCELLED, not FAILED. Run the QRunnable directly (no pool) for determinism.
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import GenerationJob, JobManager
+    from store.models import STATUS_CANCELLED, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    jm = JobManager(project)
+    take = project.add_take(shot.id, status=STATUS_PENDING)
+
+    def runner(progress):
+        raise RuntimeError("interrupted")   # mimics the backend unwinding after a stop
+
+    jm._stopping.add(take.id)               # mark it as an intentional stop
+    job = GenerationJob(project, take.id, "comfyui", runner, jm._signals,
+                        jm._cancelled, jm._stopping)
+    job.run()
+    app.processEvents()
+
+    got = project.get_take(take.id)
+    assert got.status == STATUS_CANCELLED, got.status
+    assert "stopped by user" in (got.error or "")
+    assert take.id not in jm._stopping       # cleared in the finally
+    print("inflight stop OK: stop-induced backend error -> CANCELLED, not FAILED")
+
+
+def test_request_stop_calls_backend() -> None:
+    # request_stop must flag the take and issue the right best-effort backend stop, and
+    # must swallow a backend that's down (no raise out of a delete). Monkeypatch the two
+    # backend stop calls so the test is hermetic - no server, no network, no spend.
+    from PySide6.QtWidgets import QApplication
+
+    from backends import comfy_client, replicate_client
+    from backends.jobs import JobManager
+    from store.models import STATUS_GENERATING, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    jm = JobManager(project)
+
+    calls = []
+    saved_stop, saved_cancel = comfy_client.stop_work, replicate_client.cancel_prediction
+    comfy_client.stop_work = lambda *a, **k: calls.append(("comfy", a, k))
+
+    def fake_cancel(pred_id, token=None):
+        calls.append(("replicate", pred_id))
+        raise replicate_client.ReplicateError("server down")   # must be swallowed
+
+    replicate_client.cancel_prediction = fake_cancel
+    try:
+        # local in-flight take -> comfy interrupt
+        lt = project.add_take(shot.id, status=STATUS_GENERATING,
+                              settings_snapshot={"backend": "comfyui"})
+        assert jm.request_stop(lt.id) is True
+        assert lt.id in jm._stopping and ("comfy", (), {}) in calls
+
+        # hosted in-flight take with a recorded prediction id -> replicate cancel (raises,
+        # request_stop swallows it)
+        ht = project.add_take(shot.id, status=STATUS_GENERATING,
+                              settings_snapshot={"backend": "replicate"},
+                              backend_job_id="pred_xyz")
+        assert jm.request_stop(ht.id) is True
+        assert ("replicate", "pred_xyz") in calls
+
+        # a PENDING take is not in-flight -> request_stop no-ops
+        pt = project.add_take(shot.id, status=STATUS_PENDING)
+        assert jm.request_stop(pt.id) is False
+    finally:
+        comfy_client.stop_work, replicate_client.cancel_prediction = saved_stop, saved_cancel
+    print("request_stop OK: flags take, calls right backend, swallows backend errors")
+
+
 def test_progress_fraction() -> None:
     from backends.comfy_client import progress_fraction as pf
 
@@ -426,6 +528,21 @@ def test_progress_fraction() -> None:
     assert pf({"type": "progress"}, "p1") == (None, "")     # missing data dict
     assert pf({"type": "status", "data": {}}, "p1") == (None, "")
     print("progress_fraction OK: progress/progress_state/executing parsed, prompt_id filtered")
+
+
+def test_client_id_in_queue() -> None:
+    from backends.comfy_client import _client_id_in_queue as cid
+
+    # entry shape: [number, prompt_id, prompt, extra_data{client_id}, outputs]
+    q = {"queue_running": [[2, "p1", {"...": "wf"}, {"client_id": "abc", "create_time": 1}, ["16"]]],
+         "queue_pending": [[3, "p2", {"...": "wf"}, {"client_id": "def"}, ["16"]]]}
+    assert cid(q, "p1") == "abc"                         # found in running bucket
+    assert cid(q, "p2") == "def"                         # found in pending bucket
+    assert cid(q, "p3") is None                          # absent prompt
+    assert cid({}, "p1") is None                         # empty payload
+    assert cid({"queue_running": [[2, "p1", {"x": 1}, ["16"]]]}, "p1") is None  # no extra_data dict
+    assert cid({"queue_running": [[2, "p1", {"x": 1}, {"create_time": 1}, []]]}, "p1") is None  # no client_id key
+    print("client_id_in_queue OK: running/pending lookup, missing extra_data/client_id tolerated")
 
 
 def test_progress_pct() -> None:
@@ -748,7 +865,11 @@ if __name__ == "__main__":
     test_total_price()
     test_cost_summary()
     test_cancel_pending()
+    test_cancel_shot_takes()
+    test_inflight_stop_maps_to_cancelled()
+    test_request_stop_calls_backend()
     test_job_manager()
     test_progress_fraction()
+    test_client_id_in_queue()
     test_progress_pct()
     print("PHASE 2 SMOKE: PASS")

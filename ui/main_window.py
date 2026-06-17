@@ -473,9 +473,13 @@ class MainWindow(QMainWindow):
         if not shot:
             return
         takes = self.project.list_takes(shot_id, include_deleted=True)
+        inflight = [t for t in takes if t.status == STATUS_GENERATING]
         msg = f"Delete shot '{shot.name}'?"
         if takes:
             msg += f"\n\nIts {len(takes)} take(s) will also be removed from the project."
+        if inflight:
+            msg += (f"\n\n{len(inflight)} take(s) are still rendering and will be stopped "
+                    "(their spend/GPU is halted).")
         if QMessageBox.question(
                 self, "Delete shot", msg,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -487,9 +491,25 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.tabs.removeTab(idx)
             tab.deleteLater()
+        # Neutralize this shot's in-flight work BEFORE removing it from the index: cancel
+        # its queued takes (so they never fire the backend and orphan an .mp4) and stop any
+        # mid-render take (so spend/GPU halts). Both read take state from the project, so
+        # they must run before delete_shot drops the takes.
+        cancelled = self.jobs.cancel_shot_takes(shot_id)
+        stopped = sum(1 for t in inflight if self.jobs.request_stop(t.id))
         self.project.delete_shot(shot_id)
         self.reload()
-        self._log(f"deleted shot '{shot.name}'")
+        self._refresh_cancel_action()
+        self.queue_tab.refresh()
+        note = ""
+        if cancelled or stopped:
+            bits = []
+            if cancelled:
+                bits.append(f"cancelled {cancelled} queued")
+            if stopped:
+                bits.append(f"stopped {stopped} rendering")
+            note = " (" + ", ".join(bits) + ")"
+        self._log(f"deleted shot '{shot.name}'{note}")
 
     def _commit_open_shot_tabs(self) -> None:
         """Flush every open shot-tab editor into the project buffer so File > Save
@@ -610,13 +630,17 @@ class MainWindow(QMainWindow):
             data_uri = model.get("requires_data_uri", False)
             extra = {k: v for k, v in settings.items() if k not in _EXPLICIT_SETTINGS}
 
+            def on_submit(pid):   # persist the prediction id so a delete-while-rendering
+                self.project.update_take(take_id, backend_job_id=pid)  # can cancel it
+
             def runner(progress):
                 start_kp, end_kp = framing.render_keyposes(shot, tempfile.mkdtemp(prefix="animgen_kp_"))
                 return replicate_client.generate(
                     rid, start=start_kp, end=end_kp, prompt=shot.prompt,
                     negative=shot.negative_prompt, duration=settings.get("duration"),
                     resolution=settings.get("resolution"), seed=settings.get("seed"),
-                    extra=extra, data_uri=data_uri, out_path=out_path, progress_cb=progress)
+                    extra=extra, data_uri=data_uri, out_path=out_path, progress_cb=progress,
+                    on_submit=on_submit)
             return runner
 
         tpl = paths.resolve_template(model.get("workflow_template") or "")

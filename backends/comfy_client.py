@@ -567,6 +567,62 @@ def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressC
                 pass
 
 
+def _start_progress_ws(client_id: Optional[str], prompt_id: str,
+                       progress_cb: ProgressCb) -> "tuple[Optional[threading.Thread], Optional[threading.Event]]":
+    """Spawn the best-effort WS progress listener; return (thread, stop_event).
+
+    No-op (returns (None, None)) when there's no callback to feed or no client_id to
+    subscribe with - ComfyUI routes progress to the socket holding the submitting
+    client_id, so without it there's nothing to listen for.
+    """
+    if progress_cb is None or not client_id:
+        return None, None
+    stop = threading.Event()
+    t = threading.Thread(target=_ws_progress_listener,
+                         args=(client_id, prompt_id, progress_cb, stop), daemon=True)
+    t.start()
+    return t, stop
+
+
+def _stop_progress_ws(thread: "Optional[threading.Thread]",
+                      stop: "Optional[threading.Event]") -> None:
+    """Signal and join the listener started by _start_progress_ws (tolerates (None, None))."""
+    if stop is not None:
+        stop.set()
+    if thread is not None:
+        thread.join(timeout=2)
+
+
+def _client_id_in_queue(queue: dict, prompt_id: str) -> Optional[str]:
+    """Pure: the submitting client_id for `prompt_id` in a /queue payload, or None.
+
+    A queue entry is [number, prompt_id, prompt, extra_data{client_id,...}, outputs]; the
+    client_id rides in the extra_data dict. Scans both running and pending buckets. Split
+    out from the I/O wrapper so it's unit-testable headless.
+    """
+    for bucket in ("queue_running", "queue_pending"):
+        for entry in queue.get(bucket) or []:
+            if isinstance(entry, list) and len(entry) > 1 and entry[1] == prompt_id:
+                for part in entry[2:]:
+                    if isinstance(part, dict) and part.get("client_id"):
+                        return part["client_id"]
+    return None
+
+
+def _client_id_for_prompt(prompt_id: str, timeout: int = 5) -> Optional[str]:
+    """The client_id that submitted `prompt_id`, read from the live /queue, or None.
+
+    Orphan recovery re-attaches to a render whose submitting process is gone, so the
+    original client_id (needed to resubscribe to its WS progress) survives only in the
+    queue entry. Best-effort - never raises.
+    """
+    try:
+        q = _api("/queue", timeout=timeout)
+    except Exception:  # noqa: BLE001 - resubscription is best-effort
+        return None
+    return _client_id_in_queue(q, prompt_id)
+
+
 def _entry_outputs(entry: dict) -> list[Path]:
     """Absolute paths of every media file a /history entry produced."""
     produced = []
@@ -625,18 +681,11 @@ def submit(wf: dict, out_path: Path, progress_cb: ProgressCb = None,
     _log(progress_cb, f"queued {pid}")
     if on_submit:                     # record the prompt id NOW so a take orphaned mid-render
         on_submit(pid)                # (app restart) can be reconciled against the backend
-    stop = threading.Event()
-    ws_thread: Optional[threading.Thread] = None
-    if progress_cb is not None:       # live step progress over the WS (best-effort)
-        ws_thread = threading.Thread(target=_ws_progress_listener,
-                                     args=(client_id, pid, progress_cb, stop), daemon=True)
-        ws_thread.start()
+    ws_thread, ws_stop = _start_progress_ws(client_id, pid, progress_cb)  # live step % (best-effort)
     try:
         return _poll_until_done(pid, out_path, progress_cb, timeout_s, poll_s)
     finally:
-        stop.set()
-        if ws_thread is not None:
-            ws_thread.join(timeout=2)
+        _stop_progress_ws(ws_thread, ws_stop)
 
 
 def monitor(prompt_id: str, out_path: Path, progress_cb: ProgressCb = None,
@@ -646,9 +695,18 @@ def monitor(prompt_id: str, out_path: Path, progress_cb: ProgressCb = None,
     Used by orphan recovery: a take that was rendering when the app died still has its
     prompt running/queued on the (separate, surviving) ComfyUI process. No preflight or
     /prompt POST here - the work is already in flight; we only poll and claim the file.
+
+    The submitting process is gone, so we recover its client_id from the live /queue to
+    resubscribe to the WS step-% (same listener submit() uses); if it can't be found - the
+    prompt already finished, or the queue dropped it - we just poll, as before.
     """
     _log(progress_cb, f"re-attached to {prompt_id}")
-    return _poll_until_done(prompt_id, out_path, progress_cb, timeout_s, poll_s)
+    client_id = _client_id_for_prompt(prompt_id)
+    ws_thread, ws_stop = _start_progress_ws(client_id, prompt_id, progress_cb)
+    try:
+        return _poll_until_done(prompt_id, out_path, progress_cb, timeout_s, poll_s)
+    finally:
+        _stop_progress_ws(ws_thread, ws_stop)
 
 
 def _seeds_in_workflow(wf) -> set:
