@@ -843,6 +843,13 @@ class MainWindow(QMainWindow):
             self.project.update_take(take_id, backend_job_id=pid)  # can reconcile this take
 
         def runner(progress):
+            # Cold-start ComfyUI if it isn't running, before the render. The local pool is
+            # serialized, so the first queued take starts the server and the rest find it up.
+            # Done here (not via crash recovery) so a not-yet-started server is an honest
+            # "starting ComfyUI" step rather than a failure misread as a crash; a genuine
+            # start failure raises out of the runner and fails just this take, cleanly.
+            comfy_client.ensure_server(progress_cb=progress)
+
             # One render attempt; wrapped below in crash recovery. A ComfyUI process crash
             # (GPU watchdog/TDR) restarts the server and retries this take in place, while the
             # rest of the local queue waits behind it on the serialized worker. After 3 crashes
