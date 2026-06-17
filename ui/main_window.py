@@ -90,6 +90,7 @@ class MainWindow(QMainWindow):
         self.shot_tabs: dict[str, ShotTab] = {}   # shot_id -> its open detail/edit tab
         self.take_tabs: dict[str, TakePlayerTab] = {}  # take_id -> its open viewer tab
         self._batch: Optional[batch.BatchRun] = None   # in-flight overnight batch, if any
+        self._stop_paused_local = False   # transient non-batch local pause from a manual ComfyUI stop
 
         self.jobs = JobManager(project)
         self.jobs.progress.connect(self._on_progress)
@@ -248,7 +249,7 @@ class MainWindow(QMainWindow):
         self.assets_tab = AssetsView(self.project)
         self.library_tab = ModelLibraryWindow(self)
         self.comfy_tab = ComfyMonitorWindow(self)
-        self.comfy_tab.stop_intent.connect(self._pause_batch_if_running)
+        self.comfy_tab.stop_intent.connect(self._pause_local_on_stop_intent)
 
         self.shots_tab = shots_tab
         # Fixed tabs are closable (the x) and reopen from the View menu; shot tabs are
@@ -799,6 +800,7 @@ class MainWindow(QMainWindow):
         if self._batch is not None:
             self._batch = None
             self._log("batch aborted (cancel pending) - no power action will run")
+        self._stop_paused_local = False   # cancel_pending clears jobs._local_paused too
         n = self.jobs.cancel_pending()
         self._log(f"cancelled {n} pending generation(s)" if n
                   else "no pending generations to cancel")
@@ -868,21 +870,61 @@ class MainWindow(QMainWindow):
         self._refresh_cancel_action()
         self.queue_tab.refresh()
 
-    def _pause_batch_if_running(self) -> None:
+    def _local_work_in_flight(self) -> bool:
+        """Whether any local (ComfyUI) take is still GENERATING or queued PENDING. Used to
+        decide whether a manual ComfyUI stop has anything to pause, and (in _on_status_changed)
+        when a non-batch stop-pause has drained so the transient pause can be lifted."""
+        return any(
+            t.status in (STATUS_GENERATING, STATUS_PENDING)
+            and (t.settings_snapshot or {}).get("backend") == "comfyui"
+            for t in self.project.list_takes(include_deleted=False))
+
+    def _pause_local_on_stop_intent(self) -> None:
         """A deliberate ComfyUI stop (Stop working / Shut down) was requested from the ComfyUI
-        Status tab. If a batch is running and not already paused, pause it first so the stop
-        sticks instead of being undone by crash-recovery's auto-restart. The in-flight take is
-        lost/interrupted by the stop itself (those buttons already warn of that); the queued
-        local takes are held for resume."""
+        Status tab. Pause the local queue so the resulting render failure is treated as the
+        intended stop, not a crash to auto-restart (rule #12 should_abort -> is_local_paused).
+
+        Batch case (rule #16): pause it, holding the queued local takes PENDING for Resume batch.
+
+        Non-batch case (card #42): there's no Resume affordance, so cancel the queued local
+        takes and mark a transient pause that _on_status_changed auto-clears once the in-flight
+        take drains. Without this, a manual Shut down outside a batch is fought by crash-recovery
+        (server down read as a crash -> relaunch + retry). In both cases the GENERATING take is
+        left to fail; those buttons already warn the running render is lost."""
         b = self._batch
-        if b is None or b.paused:
+        if b is not None:
+            if b.paused:
+                return
+            held = self.jobs.pause_local()
+            b.paused = True
+            b.held = held
+            self._log(f"batch paused (ComfyUI stopped by user) — holding {len(held)} local "
+                      "take(s). Resume batch to continue.")
+            self._refresh_pause_action()
+            self.reload()
+            self._refresh_cancel_action()
+            self.queue_tab.refresh()
             return
-        held = self.jobs.pause_local()
-        b.paused = True
-        b.held = held
-        self._log(f"batch paused (ComfyUI stopped by user) — holding {len(held)} local "
-                  "take(s). Resume batch to continue.")
-        self._refresh_pause_action()
+
+        if self._stop_paused_local or not self._local_work_in_flight():
+            return
+        rendering = any(
+            t.status == STATUS_GENERATING
+            and (t.settings_snapshot or {}).get("backend") == "comfyui"
+            for t in self.project.list_takes(include_deleted=False))
+        held = self.jobs.pause_local()   # sets the pause flag, clears the local pool
+        self._stop_paused_local = True
+        for tid in held:                 # no Resume UI here: cancel the queued local takes.
+            self.jobs.cancel_take(tid)   # a take a worker already dequeued bails on the _cancelled set
+        self._log(f"local queue paused (ComfyUI stopped by user) — "
+                  f"{'the current render will stop; ' if rendering else ''}"
+                  f"cancelled {len(held)} queued local take(s).")
+        if not self._local_work_in_flight():
+            # The stop hit a purely-queued local set (nothing GENERATING): there's no in-flight
+            # render whose failure needs covering, and no terminal status_changed will arrive to
+            # trigger the auto-clear in _on_status_changed, so lift the transient pause now.
+            self._stop_paused_local = False
+            self.jobs.clear_local_pause()
         self.reload()
         self._refresh_cancel_action()
         self.queue_tab.refresh()
@@ -1241,6 +1283,12 @@ class MainWindow(QMainWindow):
             self._batch.mark(take_id, status)
             if self._batch.complete:
                 self._finalize_batch()
+        elif self._stop_paused_local and not self._local_work_in_flight():
+            # The deliberately-stopped non-batch local queue has drained: lift the transient
+            # pause so a later render recovers from a genuine crash normally (card #42).
+            self._stop_paused_local = False
+            self.jobs.clear_local_pause()
+            self._log("local queue idle — ComfyUI stop complete, crash-recovery re-armed")
 
     def _after_job(self, take_id: str, msg: str) -> None:
         self._log(msg)

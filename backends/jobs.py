@@ -292,6 +292,16 @@ class JobManager(QObject):
         restart. GIL-atomic bool read."""
         return self._local_paused
 
+    def clear_local_pause(self) -> None:
+        """Clear the local-queue pause flag without re-enqueuing anything.
+
+        The non-batch deliberate-stop path (card #42): a manual ComfyUI stop pauses the local
+        queue so crash recovery doesn't fight it, but there's no Resume UI for single takes -
+        once the in-flight take has drained, MainWindow calls this to lift the transient pause
+        so a later render recovers from a genuine crash normally. Distinct from resume_local,
+        which also re-enqueues held takes. GIL-atomic bool write."""
+        self._local_paused = False
+
     def stop_and_requeue(self, take_id: str) -> bool:
         """Halt an in-flight (GENERATING) local render and reset it to PENDING so a resume
         re-runs it (Pause batch -> "halt current & re-add"). Returns whether we acted.
