@@ -109,6 +109,9 @@ def test_project() -> None:
     p.update_shot(shot.id, prompt="fierce kick", settings={"seed": 9, "duration": 5})
     got = p.get_shot(shot.id)
     assert got.prompt == "fierce kick" and got.settings["seed"] == 9
+    assert not got.starred, "shots default to unstarred"
+    p.set_shot_starred(shot.id, True)
+    assert p.get_shot(shot.id).starred and p.dirty, "starring a shot buffers (dirty)"
 
     take = p.add_take(
         shot.id, status=STATUS_DONE, seed=7,
@@ -134,6 +137,7 @@ def test_project() -> None:
     assert not p.dirty and proj_path.exists()
     q = Project.load(proj_path)
     assert len(q.list_shots()) == 1 and q.list_shots()[0].prompt == "fierce kick"
+    assert q.list_shots()[0].starred, "shot star must survive save/load"
     assert len(q.list_takes()) == 1 and q.list_takes()[0].starred
     print("project OK: shot+take+job round-trip, snapshot, star/delete/restore, save/load")
 
@@ -166,17 +170,27 @@ def test_shot_context_ops() -> None:
     card = ShotCard(p, src)
     menu = card._build_context_menu()
     labels = [a.text() for a in menu.actions() if a.text()]
-    assert labels == ["Edit", "Generate", "Duplicate", "Delete"], labels
+    assert labels == ["Edit", "Generate", "Duplicate", "Star shot", "Delete"], labels
     fired: dict = {}
     card.duplicate_requested.connect(lambda sid: fired.__setitem__("dup", sid))
     card.delete_requested.connect(lambda sid: fired.__setitem__("del", sid))
     card.open_requested.connect(lambda sid: fired.__setitem__("edit", sid))
     card.generate_requested.connect(lambda sid: fired.__setitem__("gen", sid))
+    card.star_toggled.connect(lambda sid: fired.__setitem__("star", sid))
     by_text = {a.text(): a for a in menu.actions()}
-    for label in ("Duplicate", "Delete", "Edit", "Generate"):
+    for label in ("Duplicate", "Delete", "Edit", "Generate", "Star shot"):
         by_text[label].trigger()
-    assert fired == {"dup": src.id, "del": src.id, "edit": src.id, "gen": src.id}, fired
-    print("shot context ops OK: duplicate is independent + no takes; menu signals fire")
+    assert fired == {"dup": src.id, "del": src.id, "edit": src.id,
+                     "gen": src.id, "star": src.id}, fired
+
+    # The header star button toggles glyph + emits, and the menu label flips once starred.
+    assert card.star_btn.text() == "☆"
+    p.set_shot_starred(src.id, True)
+    card.shot = p.get_shot(src.id)
+    card._refresh_star_btn()
+    assert card.star_btn.text() == "★" and card.star_btn.isChecked()
+    assert "Unstar shot" in [a.text() for a in card._build_context_menu().actions()]
+    print("shot context ops OK: duplicate is independent + no takes; menu signals fire; star toggles")
 
 
 def test_hybrid_persistence() -> None:
