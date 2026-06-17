@@ -16,7 +16,9 @@ references assets for its start/end keyframes.
 ## Project links
 
 - **GitHub:** https://github.com/Coamithra/AnimGen  (public, `main`)
-- **Trello (build board):** https://trello.com/b/7SycR6UZ  ("Animation Generator Tool")
+- **Trello (build board):** https://trello.com/b/7SycR6UZ  ("Animation Generator Tool").
+  **When grabbing a ticket from Trello, follow @CONTRIBUTING.md** — it's the
+  card-pickup runbook (two-phase claim handshake, worktree flow, smoke-gate, ship steps).
 - Origin/source project: *Fighter* (`../Fighter`), referenced at runtime — see "External wiring".
 
 ## Status (2026-06-16)
