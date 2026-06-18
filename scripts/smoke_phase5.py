@@ -715,6 +715,72 @@ def test_run_survives_deleted_signals() -> None:
     print("run survives deleted _JobSignals OK: emits no-op, take recorded, slot freed on early fail")
 
 
+def test_refresher_survives_deleted_signals() -> None:
+    """The Model Library's off-thread schema fetcher must not crash if its QObject is deleted
+    out from under the daemon thread (window/app torn down while the fetch is still walking the
+    roster) - the teardown emit degrades to a dropped signal. Regression for the phase-5
+    exit-time SIGSEGV: an unguarded emit raised RuntimeError('Signal source has been deleted')
+    on the EXIT path -> native crash at shutdown (same class as jobs.py's card #48 guard, but
+    in model_library_window and on close). Also covers the cooperative stop flag."""
+    import shiboken6
+    from PySide6.QtWidgets import QApplication
+
+    import library
+    from backends import replicate_client
+    from store import schema_cache
+    from ui import model_library_window as mlw
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    models = [{"id": "m1", "replicate_model_id": "owner/m1"},
+              {"id": "m2", "replicate_model_id": "owner/m2"}]
+
+    # (a) token-missing branch: emits one `result` per model + `finished`, all on a dead source.
+    ref = mlw._ReplicateRefresher(models)
+    orig_token = replicate_client.load_token
+    replicate_client.load_token = lambda: (_ for _ in ()).throw(RuntimeError("no token"))
+    shiboken6.delete(ref)                              # tear down the C++ source mid-life
+    assert not shiboken6.isValid(ref)
+    try:
+        ref._run()                                    # must NOT raise despite dead-source emits
+    finally:
+        replicate_client.load_token = orig_token
+
+    # (b) success branch: the per-model `result` emit also hits a dead source and must no-op.
+    ref2 = mlw._ReplicateRefresher(models[:1])
+    saved = (replicate_client.load_token, replicate_client.get_input_schema,
+             replicate_client.derive_capabilities, library.sync_model_capabilities,
+             schema_cache.put)
+    replicate_client.load_token = lambda: "tok"
+    replicate_client.get_input_schema = lambda token, rid: ({"prompt": {}}, None)
+    replicate_client.derive_capabilities = lambda props: {}
+    library.sync_model_capabilities = lambda mid, caps: False
+    schema_cache.put = lambda rid, props: None
+    shiboken6.delete(ref2)
+    try:
+        ref2._run()                                   # success-path result emit hits a dead source
+    finally:
+        (replicate_client.load_token, replicate_client.get_input_schema,
+         replicate_client.derive_capabilities, library.sync_model_capabilities,
+         schema_cache.put) = saved
+
+    # (c) cooperative stop: a set stop flag makes a live _run bail before any per-model fetch,
+    # so no `result` is emitted (and no network is touched) - only the final `finished` fires.
+    fired = []
+    ref3 = mlw._ReplicateRefresher(models)
+    ref3.result.connect(lambda *a: fired.append(("result", a)))
+    ref3.finished.connect(lambda *a: fired.append(("finished", a)))
+    orig_token = replicate_client.load_token
+    replicate_client.load_token = lambda: "tok"
+    ref3.stop()
+    try:
+        ref3._run()
+        app.processEvents()
+    finally:
+        replicate_client.load_token = orig_token
+    assert fired == [("finished", (0, 0, 0))], fired   # bailed before any per-model result
+    print("model_library OK: refresher survives deleted signals (token/success) + cooperative stop")
+
+
 def test_save_as_rollback_on_write_failure() -> None:
     """A save_as whose document write raises must leave the project exactly as it was:
     identity (path/name/_assets_dir) unchanged, the in-memory path remap reversed, and the
@@ -904,6 +970,11 @@ def test_take_player_gif_export() -> None:
     urls = QApplication.clipboard().mimeData().urls()
     assert urls and Path(urls[0].toLocalFile()).name == "manual.gif", \
         [u.toString() for u in urls]
+    # Release the mime data before the process tears down: the offscreen QPA's in-process
+    # clipboard SIGSEGVs at interpreter exit if QMimeData is still on it (a Qt teardown
+    # artifact of the offscreen platform, NOT the app - real Windows hands the file off to the
+    # OS clipboard and persists it). Leaving it set is what made phase 5 exit 139 after PASS.
+    QApplication.clipboard().clear()
 
     tab.close_player()
     print("TakePlayerTab OK: GIF menu (source-gated), default name, encode + clipboard URL")
@@ -926,5 +997,6 @@ if __name__ == "__main__":
     test_take_player_gif_export()
     test_runner_self_cancel_during_submit()
     test_run_survives_deleted_signals()
+    test_refresher_survives_deleted_signals()
     test_save_as_rollback_on_write_failure()
     print("PHASE 5 SMOKE: PASS")

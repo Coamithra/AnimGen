@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import threading
 
+import shiboken6
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QPushButton, QTableWidget,
@@ -112,9 +113,31 @@ class _ReplicateRefresher(QObject):
     def __init__(self, models: list[dict]):
         super().__init__()
         self._models = models          # replicate models only; need both id and replicate id
+        self._stop = threading.Event()
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self) -> None:
+        """Ask the daemon fetch thread to bail between models (no new network calls). Set on
+        window/app close so the fetcher isn't still walking the roster at teardown."""
+        self._stop.set()
+
+    def _emit(self, name: str, *args) -> None:
+        """Emit a signal on self, degrading to a no-op if its C++ QObject was deleted.
+
+        _run executes on a daemon thread; if this QObject is torn down (window/app shutdown at
+        the end of the run) while the thread is still going, an unguarded self.<sig>.emit(...)
+        raises RuntimeError('Signal source has been deleted') on the worker thread - the
+        exit-time segfault this guards against (same class as jobs.GenerationJob._emit, card
+        #48, but on the EXIT path). shiboken6.isValid gates the common case; the try/except
+        closes the race between the check and the emit."""
+        try:
+            if not shiboken6.isValid(self):
+                return
+            getattr(self, name).emit(*args)
+        except RuntimeError:
+            pass
 
     def _run(self) -> None:
         from backends import replicate_client
@@ -122,11 +145,13 @@ class _ReplicateRefresher(QObject):
             token = replicate_client.load_token()
         except Exception as e:  # noqa: BLE001 - no token -> the whole batch fails the same way
             for m in self._models:
-                self.result.emit(m["replicate_model_id"], -1, str(e), None)
-            self.finished.emit(0, len(self._models), 0)
+                self._emit("result", m["replicate_model_id"], -1, str(e), None)
+            self._emit("finished", 0, len(self._models), 0)
             return
         ok = fail = changed = 0
         for m in self._models:
+            if self._stop.is_set():    # window/app closing - stop issuing new fetches
+                break
             rid = m["replicate_model_id"]
             try:
                 props, _ = replicate_client.get_input_schema(token, rid)
@@ -136,11 +161,11 @@ class _ReplicateRefresher(QObject):
                 if diff:
                     changed += 1
                 ok += 1
-                self.result.emit(rid, len(props), "", caps)
+                self._emit("result", rid, len(props), "", caps)
             except Exception as e:  # noqa: BLE001 - report per-model and keep going
                 fail += 1
-                self.result.emit(rid, -1, str(e), None)
-        self.finished.emit(ok, fail, changed)
+                self._emit("result", rid, -1, str(e), None)
+        self._emit("finished", ok, fail, changed)
 
 
 class ModelLibraryWindow(QWidget):
@@ -208,6 +233,13 @@ class ModelLibraryWindow(QWidget):
         button and by MainWindow's 'update model data on startup' setting. Caches each
         model's input schema and syncs its capability flags into model_library.json."""
         self._refresh_all()
+
+    def stop_fetch(self) -> None:
+        """Stop an in-flight refresh so its daemon thread isn't still walking the roster when
+        the window/app tears down (MainWindow.closeEvent calls this). Best-effort: the
+        thread's emits are guarded too, so a stop that lands mid-fetch can't crash."""
+        if self._refresher is not None:
+            self._refresher.stop()
 
     def _refresh_all(self) -> None:
         rep_models = [m for m in self.models

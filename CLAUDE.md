@@ -39,9 +39,12 @@ and a live local take. The backends are verified offline only.
 # from the repo root
 .venv/Scripts/python.exe app.py                      # launch the app (Windows)
 
-# headless smoke tests (no spend, no GPU, no real renderer)
+# headless smoke tests (no spend, no GPU, no real renderer). Check the EXIT CODE, not just
+# the "PASS" line: a teardown segfault AFTER PASS still exits non-zero (139) and is a real
+# failure (card #78) - the bare loop below hides it, so gate on rc.
 for n in 1 2 3 4 5 6 7; do QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
-  .venv/Scripts/python.exe scripts/smoke_phase$n.py; done
+  .venv/Scripts/python.exe scripts/smoke_phase$n.py; rc=$?; \
+  [ $rc -eq 0 ] || { echo "PHASE $n FAILED (exit $rc)"; break; }; done
 
 # phase 8 is the OPT-IN offline integration smoke (NOT in the 1-7 gate): drives one real
 # take through the mock-ComfyUI submit -> /history -> claim path. Run it when touching the
@@ -148,7 +151,7 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
 | `ui/assets_view.py` | the **Assets** tab: drag-drop / Import keyframe images into `.assets/`; thumbnail grid + delete |
 | `ui/cost_confirm.py` | the launch gate (`confirm_launch(items: list)` — takes a **batch**, shown as one summary; the overnight batch uses this to confirm the whole run once) |
 | `ui/batch_dialog.py` | the **Generate batch…** dialog (Shots-tab control strip): scope (all shots / current view), takes-per-shot, and the when-finished power action (nothing / stop ComfyUI / sleep PC). Thin Qt over `backends/batch.py` |
-| `ui/model_library_window.py` | the **Model Library** tab: model roster + a **Refresh from Replicate** button (off-thread `_SchemaFetcher`) that pulls every Replicate model's input schema into `store/schema_cache.py` AND derives + syncs its capability flags into `model_library.json` (`library.sync_model_capabilities`); a **Schema** column shows the cached field count and a **Capabilities** column shows the synced negative/fixed-camera flags. Pricing isn't API-exposed, so costs are left alone |
+| `ui/model_library_window.py` | the **Model Library** tab: model roster + a **Refresh from Replicate** button (off-thread `_ReplicateRefresher`) that pulls every Replicate model's input schema into `store/schema_cache.py` AND derives + syncs its capability flags into `model_library.json` (`library.sync_model_capabilities`); a **Schema** column shows the cached field count and a **Capabilities** column shows the synced negative/fixed-camera flags. Pricing isn't API-exposed, so costs are left alone. **`_ReplicateRefresher` runs on a daemon thread and emits its `result`/`finished` signals through a guarded `_emit()` (shiboken6.isValid + try/except RuntimeError — the same card #48 pattern as `jobs.GenerationJob._emit`, here on the EXIT path): a fetch still walking the roster when the window/app tears down would otherwise emit after its own C++ QObject was deleted → `RuntimeError('Signal source has been deleted')` → exit-time SIGSEGV (card #78). `MainWindow.closeEvent` also calls `library_tab.stop_fetch()` (a cooperative `threading.Event` checked between models) so the thread stops issuing new fetches at close. Don't add a raw `self.result.emit(...)`** |
 | `store/schema_cache.py` | persistent cache of Replicate input schemas (`data/schema_cache.json`, keyed by `replicate_model_id`); lock-guarded, atomic writes (reuses `store.project._atomic_write_json`). Populated by the Model Library tab; read by the shot editor for per-param enums/types **and to decide whether a model accepts a negative prompt** |
 | `store/app_settings.py` | app-global user preferences (`data/app_settings.json`; `get_bool`/`set_bool`). Own file (NOT `app_state.json`, which `main_window._remember_last` rewrites wholesale). Same lock + atomic-write discipline as `schema_cache`. First key `update_schemas_on_startup` (default off) — read by `MainWindow` to auto-refresh Replicate schemas at launch, toggled from the **Settings** menu |
 | `store/prompt_library.py` | app-global library of reusable prompt prefabs (`data/prompt_templates.json`; entry = `{name, positive, negative}`, upsert-by-name). Same lock + atomic-write discipline as `schema_cache`; ships seed templates; read/written by the shot tab's Prompt subtab template combo |
@@ -286,7 +289,14 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
 4. **Smoke tests run headless** with `QT_QPA_PLATFORM=offscreen`; never call a modal's
    `.exec()` in a test (it blocks). Tests override `paths.SCRATCH_DIR` to a tempdir so
    untitled-project scratch stays out of `data/`. `build_summary` / pure functions are
-   split out for exactly this reason.
+   split out for exactly this reason. **Gate on the process EXIT CODE, not just the printed
+   "PASS"** — a *teardown* segfault after PASS still exits 139 and is a real failure (card
+   #78). Two known offscreen-teardown traps: (a) leaving `QMimeData` on
+   `QApplication.clipboard()` at interpreter exit SIGSEGVs on the offscreen QPA (the
+   in-process clipboard, not the app — real Windows hands the file to the OS clipboard), so a
+   clipboard test must `clipboard().clear()` before returning; (b) a daemon thread still
+   emitting a Qt signal during teardown crashes if its C++ source was deleted — guard the
+   emit (`shiboken6.isValid` + try/except, card #48/#78).
 5. **`model_library.json` is mostly authored, with two auto-synced capability flags.**
    IDs, costs, notes, aspect_ratios, and `supports_end_frame` are hand-authored
    (Replicate's API exposes **NO** pricing — costs are scraped from the web pricing page,
