@@ -249,7 +249,30 @@ def test_shot_star_write_through() -> None:
     assert m.get_shot("s1").starred, "legacy .animproj star must be read on load"
     migrated = json.loads((m.assets_dir / "shot_stars.json").read_text(encoding="utf-8"))
     assert migrated["starred"] == ["s1"], "legacy star must migrate into the sidecar"
-    print("shot star write-through OK: sidecar persist, reload, unstar, legacy migration")
+
+    # Corrupt sidecar must NOT silently lose legacy stars (card #55): a legacy starred
+    # .animproj beside an UNREADABLE shot_stars.json must keep the in-memory star AND
+    # re-materialize the sidecar from it, so a later ordinary Save (which strips `starred`
+    # from the .animproj) + reload still reports the shot as starred.
+    corrupt_path = Path(tempfile.mkdtemp()) / "corrupt.animproj"
+    corrupt_doc = {"format": "animgen-project", "version": 1, "name": "corrupt",
+                   "shots": [{"id": "c1", "name": "old", "starred": True, "crop": {},
+                              "settings": {}, "created": "", "updated": ""}]}
+    corrupt_path.write_text(json.dumps(corrupt_doc), encoding="utf-8")
+    corrupt_assets = corrupt_path.with_name(corrupt_path.stem + ".assets")
+    corrupt_assets.mkdir(parents=True, exist_ok=True)
+    (corrupt_assets / "shot_stars.json").write_text("{ not valid json", encoding="utf-8")
+    c = Project.load(corrupt_path)
+    assert c.get_shot("c1").starred, "legacy star must survive an unreadable sidecar on load"
+    rebuilt = json.loads((corrupt_assets / "shot_stars.json").read_text(encoding="utf-8"))
+    assert rebuilt["starred"] == ["c1"], "unreadable sidecar must be rebuilt from the legacy flag"
+    c.update_shot("c1", prompt="edited")      # a normal authoring edit -> dirty -> next Save strips `starred`
+    c.save()
+    doc2 = json.loads(corrupt_path.read_text(encoding="utf-8"))
+    assert all("starred" not in sd for sd in doc2["shots"]), "Save still strips starred from the .animproj"
+    reloaded = Project.load(corrupt_path)
+    assert reloaded.get_shot("c1").starred, "star must survive corrupt-sidecar + Save + reload"
+    print("shot star write-through OK: sidecar persist, reload, unstar, legacy migration, corrupt-sidecar rescue")
 
 
 def test_keypose_migration_persist() -> None:
