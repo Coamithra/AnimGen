@@ -701,8 +701,13 @@ class MainWindow(QMainWindow):
         take = self.project.add_take(shot.id, status=STATUS_PENDING,
                                      seed=settings.get("seed"), cost_estimate=est,
                                      settings_snapshot=snapshot)
+        # Render from the take's frozen snapshot, not the live Shot. The serialized local
+        # worker (or a later batch round) can dequeue long after the shot was edited+saved;
+        # feeding _make_runner a snapshot-derived synth Shot keeps the render matching the
+        # take's immutable settings_snapshot (rule #3). Same helper the restart path uses.
+        synth = self._shot_from_snapshot(shot.id, snapshot)
         self.jobs.enqueue(take.id, model["backend"],
-                          self._make_runner(model, shot, settings, take.id))
+                          self._make_runner(model, synth, settings, take.id))
         self._log(f"queued {take.id[:8]} ({shot.name})")
         return take.id
 
