@@ -120,7 +120,9 @@ class _ReplicateRefresher(QObject):
 
     def stop(self) -> None:
         """Ask the daemon fetch thread to bail between models (no new network calls). Set on
-        window/app close so the fetcher isn't still walking the roster at teardown."""
+        window/app close so the fetcher isn't still walking the roster at teardown. Single-use:
+        the flag is never cleared, so a stopped instance stays stopped - each refresh builds a
+        fresh _ReplicateRefresher (see _refresh_all), so this is a one-shot cancel, not a pause."""
         self._stop.set()
 
     def _emit(self, name: str, *args) -> None:

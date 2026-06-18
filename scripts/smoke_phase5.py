@@ -763,21 +763,24 @@ def test_refresher_survives_deleted_signals() -> None:
          replicate_client.derive_capabilities, library.sync_model_capabilities,
          schema_cache.put) = saved
 
-    # (c) cooperative stop: a set stop flag makes a live _run bail before any per-model fetch,
-    # so no `result` is emitted (and no network is touched) - only the final `finished` fires.
-    fired = []
+    # (c) cooperative stop: a set stop flag makes a live _run bail before any per-model fetch -
+    # the schema fetch is never called (proves the stop flag, not an incidental network error),
+    # no `result` is emitted, only the final `finished` fires with zero counts.
+    fired, fetched = [], []
     ref3 = mlw._ReplicateRefresher(models)
     ref3.result.connect(lambda *a: fired.append(("result", a)))
     ref3.finished.connect(lambda *a: fired.append(("finished", a)))
-    orig_token = replicate_client.load_token
+    saved_c = (replicate_client.load_token, replicate_client.get_input_schema)
     replicate_client.load_token = lambda: "tok"
+    replicate_client.get_input_schema = lambda token, rid: (fetched.append(rid) or ({}, None))
     ref3.stop()
     try:
         ref3._run()
         app.processEvents()
     finally:
-        replicate_client.load_token = orig_token
-    assert fired == [("finished", (0, 0, 0))], fired   # bailed before any per-model result
+        (replicate_client.load_token, replicate_client.get_input_schema) = saved_c
+    assert fetched == [], fetched                       # stop flag bailed before any fetch
+    assert fired == [("finished", (0, 0, 0))], fired    # no per-model result, just finished
     print("model_library OK: refresher survives deleted signals (token/success) + cooperative stop")
 
 
