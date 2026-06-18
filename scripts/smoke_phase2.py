@@ -1726,6 +1726,27 @@ def test_restart_from_snapshot() -> None:
         # A non-cancelled selection has no Restart entry.
         project.update_take(good.id, status=STATUS_PENDING)
         assert not any("Restart" in a.text() for a in tv._build_context_menu([good.id]).actions())
+
+        # A crash-interrupted FAILED take (in-flight render lost to an app/ComfyUI death) ALSO offers
+        # a per-take Restart - mirroring the bulk action, which already picks it up (card #64).
+        project.update_take(failed_orphan.id, status=STATUS_FAILED, interrupted=True)  # bulk flipped it
+        restart_emits.clear()
+        fo_menu = tv._build_context_menu([failed_orphan.id])
+        assert any("Restart" in a.text() for a in fo_menu.actions()), [a.text() for a in fo_menu.actions()]
+        next(a for a in fo_menu.actions() if "Restart" in a.text()).trigger()
+        assert restart_emits == [[failed_orphan.id]], restart_emits
+        # ...but a deliberately-FAILED (non-interrupted) take does NOT - a plain render failure is
+        # not a restart candidate, only a crash-interrupted one is.
+        plain_failed = project.add_take(shot.id, status=STATUS_FAILED, interrupted=False,
+                                        settings_snapshot=snap)
+        assert not any("Restart" in a.text()
+                       for a in tv._build_context_menu([plain_failed.id]).actions())
+        # The by-ids handler enforces the same gate: it forwards the FAILED+interrupted take and a
+        # cancelled one to _restart_takes, but drops the deliberately-FAILED one.
+        forwarded = {}
+        win._restart_takes = lambda takes: forwarded.setdefault("ids", [t.id for t in takes])
+        win._restart_takes_by_ids([failed_orphan.id, plain_failed.id, user_cancelled.id])
+        assert forwarded["ids"] == [failed_orphan.id, user_cancelled.id], forwarded["ids"]
     finally:
         QMessageBox.information = orig_info
     print("restart from snapshot OK: in-place replay, unrestartable->failed, headless menu entry")

@@ -857,10 +857,13 @@ class MainWindow(QMainWindow):
         self._restart_takes(interrupted)
 
     def _restart_takes_by_ids(self, ids: list) -> None:
-        """Restart just the given takes (the takes-grid context-menu entry). Non-cancelled ids
-        are ignored - the menu only offers Restart when a cancelled take is selected."""
+        """Restart just the given takes (the takes-grid context-menu entry). Restarts any cancelled
+        take (an explicit user override) plus a crash-interrupted FAILED take (its in-flight render
+        was lost to an app/ComfyUI death); a deliberately-failed (non-interrupted) take is ignored,
+        mirroring the menu gate in takes_view._build_context_menu."""
         takes = [t for t in (self.project.get_take(i) for i in ids)
-                 if t and t.status == STATUS_CANCELLED]
+                 if t and (t.status == STATUS_CANCELLED
+                           or (t.status == STATUS_FAILED and t.interrupted))]
         self._restart_takes(takes)
 
     def _restart_takes(self, takes: list) -> None:
