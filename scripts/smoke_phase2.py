@@ -2076,14 +2076,17 @@ def test_select_rows() -> None:
 
     gen = Take(id="g", shot_id="s", status=STATUS_GENERATING)
     pend = Take(id="p", shot_id="s", status=STATUS_PENDING)
-    done = Take(id="d", shot_id="s", status=STATUS_DONE)
-    fail = Take(id="f", shot_id="s", status=STATUS_FAILED)
-    canc = Take(id="c", shot_id="s", status=STATUS_CANCELLED)
+    # Finished takes with OUT-OF-ORDER completion stamps: list order (d, f, c) deliberately
+    # differs from completion order (f newest, then c, then d) so the ordering assertion
+    # tests "by completion time", not "by list position" (the bug card #74 fixed).
+    done = Take(id="d", shot_id="s", status=STATUS_DONE, completed="2026-06-18T10:00:00")
+    fail = Take(id="f", shot_id="s", status=STATUS_FAILED, completed="2026-06-18T12:00:00")
+    canc = Take(id="c", shot_id="s", status=STATUS_CANCELLED, completed="2026-06-18T11:00:00")
     takes = [done, gen, fail, pend, canc]
 
-    # No dismissals: active first (generating, then pending), finished newest-first after.
+    # Active first (generating, then pending), then finished by completion time, newest first.
     ids = [t.id for t in select_rows(takes)]
-    assert ids == ["g", "p", "c", "f", "d"], ids
+    assert ids == ["g", "p", "f", "c", "d"], ids
 
     # Clearing dismisses every finished take but leaves active ones in.
     dismissed = {t.id for t in takes if t.status in (STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED)}
@@ -2091,20 +2094,36 @@ def test_select_rows() -> None:
     assert ids == ["g", "p"], ids
 
     # A finished take that appears *after* a clear (not in dismissed) still shows.
-    newdone = Take(id="d2", shot_id="s", status=STATUS_DONE)
+    newdone = Take(id="d2", shot_id="s", status=STATUS_DONE, completed="2026-06-18T13:00:00")
     ids = [t.id for t in select_rows(takes + [newdone], dismissed)]
     assert ids == ["g", "p", "d2"], ids
 
-    # An active take is never hidden even if its id is (wrongly) in dismissed, and a
-    # non-empty dismissed of only active ids leaves the finished tail untouched.
+    # An active take is never hidden even if its id is (wrongly) in dismissed; finished
+    # stay ordered newest-first by completion.
     ids = [t.id for t in select_rows(takes, {"g", "p"})]
-    assert ids == ["g", "p", "c", "f", "d"], ids
+    assert ids == ["g", "p", "f", "c", "d"], ids
 
-    # recent_limit caps the finished tail, newest-first.
-    many = [Take(id=f"x{i}", shot_id="s", status=STATUS_DONE) for i in range(20)]
-    ids = [t.id for t in select_rows(many, recent_limit=3)]
-    assert ids == ["x19", "x18", "x17"], ids
-    print("select_rows OK: active-first, clear hides finished, active never hidden, recent cap")
+    # The core fix: a RESTARTED take finishes at its original (earlier) list position but
+    # with the newest `completed`, so it must surface on TOP of the finished section -
+    # under the old slice-by-list-position it stayed buried and the section showed stale rows.
+    restarted = Take(id="r", shot_id="s", status=STATUS_DONE, completed="2026-06-18T14:00:00")
+    ids = [t.id for t in select_rows([restarted, done, fail, canc])]
+    assert ids == ["r", "f", "c", "d"], ids
+
+    # Missing `completed` (e.g. some cancelled takes) falls back to `created` for ordering.
+    c_old = Take(id="co", shot_id="s", status=STATUS_CANCELLED, created="2026-06-18T08:00:00")
+    c_new = Take(id="cn", shot_id="s", status=STATUS_CANCELLED, created="2026-06-18T09:00:00")
+    ids = [t.id for t in select_rows([c_old, c_new])]
+    assert ids == ["cn", "co"], ids
+
+    # No cap: every finished take shows (the old 15-row limit is gone), newest-first.
+    many = [Take(id=f"x{i}", shot_id="s", status=STATUS_DONE,
+                 completed=f"2026-06-18T{i:02d}:00:00") for i in range(20)]
+    ids = [t.id for t in select_rows(many)]
+    assert len(ids) == 20, len(ids)
+    assert ids == [f"x{i}" for i in range(19, -1, -1)], ids
+    print("select_rows OK: active-first, finished newest-by-completion, created fallback, "
+          "clear hides finished, active never hidden, no cap")
 
 
 def test_queue_actions_in_queue_tab() -> None:

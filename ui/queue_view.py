@@ -4,8 +4,8 @@ The generation queue (backends/jobs.JobManager) runs hosted jobs a few in parall
 local jobs one at a time, streaming free-text progress lines into the main log. That log
 interleaves every job's output keyed only by an 8-char take-id, so it's hard to see *what's
 running, what's queued behind it, and how far along each is*. This tab assembles that into a
-list: one row per active (queued / generating) take plus the most-recently finished ones,
-each showing its shot, model, backend, status and progress.
+list: one row per active (queued / generating) take plus every finished take (most-recent
+first), each showing its shot, model, backend, status and progress.
 
 **No per-row widgets (rule #18).** This is a `QTableView` over a `QAbstractTableModel`; the
 Progress column is **delegate-painted** (`QStyle.CE_ProgressBar`) - a determinate bar is
@@ -47,7 +47,6 @@ from store.models import (
 
 _COLUMNS = ["Shot", "Model", "Backend", "Status", "Progress"]
 _SHOT_COL, _MODEL_COL, _BACKEND_COL, _STATUS_COL, _PROGRESS_COL = range(len(_COLUMNS))
-_RECENT_LIMIT = 15      # how many finished takes to keep visible below the active ones
 _FINISHED = (STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED)
 
 # custom item-data roles the Progress delegate reads (an int 0..100 + label when the cell
@@ -99,19 +98,29 @@ def done_elapsed(take) -> str:
     return _elapsed(take.started or take.created, take.completed)
 
 
-def select_rows(takes, dismissed: "frozenset[str] | set[str]" = frozenset(),
-                recent_limit: int = _RECENT_LIMIT) -> list:
+def select_rows(takes, dismissed: "frozenset[str] | set[str]" = frozenset()) -> list:
     """The takes the queue shows: every active (generating/pending) take first, in queue
-    order, then the most-recently *added* finished ones (capped at recent_limit), reversed
-    so the latest is on top (takes arrive in list_takes() creation order, not completion order).
+    order, then *every* finished take sorted by completion time, newest first.
 
-    Finished takes whose id is in `dismissed` are filtered out — that's what the Clear
-    button does. Active takes are never dismissable, so a still-queued or in-flight take
+    Finished takes are ordered by `completed` (falling back to `created` for a take with no
+    completion stamp, e.g. some cancelled takes), descending — so the most-recently finished
+    surface on top regardless of their creation order. This matters for a restarted take: it
+    finishes at its original, earlier list position, and ordering by completion (not list
+    order) is what lets its fresh result reach the top instead of staying buried.
+
+    There is no cap. The view is a virtualized QTableView with zero per-row widgets (rule
+    #18), so an unbounded finished list costs the same as a short one; the Clear button is
+    how the user prunes. Finished takes whose id is in `dismissed` are filtered out — that's
+    what Clear does. Active takes are never dismissable, so a still-queued or in-flight take
     always shows even if its id somehow lands in `dismissed`."""
     active = [t for t in takes if t.status == STATUS_GENERATING]
     active += [t for t in takes if t.status == STATUS_PENDING]
-    finished = [t for t in takes if t.status in _FINISHED and t.id not in dismissed]
-    return active + finished[-recent_limit:][::-1]   # latest-added finished on top
+    finished = sorted(
+        (t for t in takes if t.status in _FINISHED and t.id not in dismissed),
+        key=lambda t: t.completed or t.created or "",
+        reverse=True,
+    )
+    return active + finished
 
 
 def _model_backend(take) -> tuple[str, str]:

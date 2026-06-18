@@ -619,3 +619,11 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     rule-#18 overflow's most likely trigger is removed at the source. Smoke:
     `smoke_phase4.test_queue_view` (child-widget count stays bounded vs queue depth; a progress tick
     touches one row; a per-take signal storm coalesces to a single rebuild).
+    **Follow-on (card #74, 2026-06-18):** with zero per-row widgets the Queue can now show *every*
+    finished take, not a capped tail — `queue_view.select_rows` dropped the 15-row `_RECENT_LIMIT`
+    cap and orders the finished section by **completion time descending** (`completed`, falling back
+    to `created`), newest on top, instead of the old slice-by-list-position. That fixes the stale-
+    completions bug: a restarted take finishes at its original (earlier) list position, so list-order
+    slicing left the freshly-finished result buried and the section frozen on old completions; ordering
+    by completion surfaces it. Active rows still come first; `Clear finished` is how the user prunes the
+    now-unbounded finished list. Smoke: `smoke_phase2.test_select_rows`.
