@@ -137,9 +137,18 @@ Full mechanism + invariants in **Hard-won rule #13**.
   from the doc when empty; a missing key (older/seeded files) falls back to the default
   full fixed-tab set. Restore reopens shot/take tabs by id via `open_shot`/`open_take`,
   which silently skip an id whose shot/take was since deleted. A pure tab rearrange on an
-  otherwise-clean project is NOT an unsaved edit and won't arm the save-prompt, so layout
-  persists on the next save, not on a no-save close. Smoke-tested in
-  `smoke_phase5.test_tab_state_persistence`.
+  otherwise-clean project is NOT an unsaved edit and won't arm the save-prompt. **It IS,
+  however, persisted at window close (card #50):** `closeEvent` → `_persist_layout_on_close`
+  records the layout even on a no-save close, but **only on the genuinely-clean path** —
+  titled project, and **no unsaved authoring edits** (`_has_unsaved_edits` checked *before*
+  `_maybe_save_changes`). It's skipped on Discard (writing would serialize the just-discarded
+  in-memory shots back to disk) and on untitled (nowhere to write without a Save-As prompt),
+  and it's gated on the layout *actually differing* from disk — `_compute_tab_state()` vs the
+  effective on-disk state (`project.ui_state`, or `_default_tab_state()` when empty) — so an
+  unchanged close never touches the `.animproj` mtime. The write goes through
+  `Project.persist_ui_state()`, which rewrites **only the `.animproj`** (not `takes.json`) and
+  does **not** clear `dirty`, keeping it out of the authoring save contract. Smoke-tested in
+  `smoke_phase5.test_tab_state_persistence` + `test_tab_state_persists_on_close`.
 - **Assets & framing:** keyframe images live flat in the `.assets/` root (folder-scanned).
   Drag images into the **Assets** tab (or Import) to `import_asset` them (copied in,
   originals untouched). A shot's `start_frame`/`end_frame` point at assets; `shot.crop` is

@@ -294,6 +294,68 @@ def test_tab_state_active_survives_skip() -> None:
     print("MainWindow OK: active tab restored by identity across a skipped earlier tab")
 
 
+def test_tab_state_persists_on_close() -> None:
+    """A tab rearrange on an otherwise-clean titled project is persisted at window close
+    (no Save needed), gated on the layout actually changing so an unchanged close writes
+    nothing, and suppressed when the project is untitled or the user Discards real edits."""
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "close.animproj"
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+    project.save_as(path)
+    assert not project.ui_state, "fresh save records no ui_state (default layout)"
+    base_mtime = path.stat().st_mtime_ns
+
+    # Close a couple of fixed tabs on a clean project (a rearrange does NOT set dirty),
+    # then close the window without saving.
+    win = MainWindow(Project.load(path))
+    assert not win._has_unsaved_edits(), "tab rearrange must not arm the save-prompt"
+    win._on_tab_close(win.tabs.indexOf(win.assets_tab))
+    win._on_tab_close(win.tabs.indexOf(win.library_tab))
+    win.closeEvent(QCloseEvent())
+
+    # The .animproj now carries the trimmed layout even though nothing was saved.
+    reopened = Project.load(path)
+    keys = [(e["kind"], e.get("key")) for e in reopened.ui_state["tabs"]]
+    assert keys == [("fixed", "Shots"), ("fixed", "Queue"), ("fixed", "ComfyUI Status")], keys
+    win2 = MainWindow(reopened)
+    assert win2.tabs.indexOf(win2.assets_tab) < 0 and win2.tabs.indexOf(win2.library_tab) < 0
+
+    # An unchanged close writes nothing (mtime untouched), so it can't churn the file.
+    mtime_after = path.stat().st_mtime_ns
+    win3 = MainWindow(Project.load(path))
+    win3.closeEvent(QCloseEvent())
+    assert path.stat().st_mtime_ns == mtime_after, "no-change close must not rewrite the file"
+
+    # Untitled project: nothing to write, no crash.
+    untitled = MainWindow(Project.new())
+    untitled._on_tab_close(untitled.tabs.indexOf(untitled.assets_tab))
+    untitled.closeEvent(QCloseEvent())   # is_untitled -> skipped, no exception
+
+    # Discard path: real authoring edits + a tab change, Discard at the prompt -> the
+    # discarded shots must NOT be written back, and the layout change is dropped too.
+    disc_path = Path(tempfile.mkdtemp()) / "disc.animproj"
+    p2 = Project.new()
+    p2.add_shot("a", model_id="seedance-2.0-std")
+    p2.save_as(disc_path)
+    disc_mtime = disc_path.stat().st_mtime_ns
+    w = MainWindow(Project.load(disc_path))
+    w.project.add_shot("ghost", model_id="seedance-2.0-std")   # buffered edit -> dirty
+    w._on_tab_close(w.tabs.indexOf(w.assets_tab))               # + a layout change
+    assert w._has_unsaved_edits()
+    w._maybe_save_changes = lambda: True       # simulate the user picking Discard
+    w.closeEvent(QCloseEvent())
+    assert disc_path.stat().st_mtime_ns == disc_mtime, "Discard close must not write at all"
+    assert "ghost" not in [s.name for s in Project.load(disc_path).list_shots()], "discarded edit not persisted"
+    assert base_mtime != mtime_after          # sanity: the clean-close case really did write
+    print("MainWindow OK: clean-close persists layout; no-change/untitled/Discard write nothing")
+
+
 def test_format_generation_settings() -> None:
     """The take-viewer settings formatter renders a full snapshot and degrades cleanly."""
     from store.models import Take
@@ -529,6 +591,7 @@ if __name__ == "__main__":
     test_close_dirty_tab_guard()
     test_tab_state_persistence()
     test_tab_state_active_survives_skip()
+    test_tab_state_persists_on_close()
     test_format_generation_settings()
     test_snapshot_includes_framing()
     test_take_player_settings_panel()

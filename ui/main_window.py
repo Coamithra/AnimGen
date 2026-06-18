@@ -1306,7 +1306,11 @@ class MainWindow(QMainWindow):
 
     # ---- tab-layout persistence (stored per project in the .animproj) ----
     def _capture_tab_state(self) -> None:
-        """Snapshot the live tab bar into project.ui_state so a save records the layout.
+        """Snapshot the live tab bar into project.ui_state so a save records the layout."""
+        self.project.ui_state = self._compute_tab_state()
+
+    def _compute_tab_state(self) -> dict:
+        """Build the {tabs, active} descriptor for the live tab bar (no side effect).
         Window metadata, not authoring data - written on save, never sets dirty. Pristine
         unsaved blank shot tabs (no id yet, not in shot_tabs) are skipped; commit them
         first via Save. `active` is the index into the captured descriptor list (not a raw
@@ -1332,7 +1336,27 @@ class MainWindow(QMainWindow):
             if w is active_widget:
                 active = len(entries)
             entries.append(entry)
-        self.project.ui_state = {"tabs": entries, "active": active}
+        return {"tabs": entries, "active": active}
+
+    def _default_tab_state(self) -> dict:
+        """The layout an empty ui_state restores to: every fixed tab in order, Shots active.
+        Used as the effective on-disk state so a no-change close of a default-layout project
+        (older/seeded files carry no ui_state) compares equal and writes nothing."""
+        return {"tabs": [{"kind": "fixed", "key": t} for _, t in self._fixed_tabs],
+                "active": 0}
+
+    def _persist_layout_on_close(self) -> None:
+        """Record a tab-layout change at window close even when the project is otherwise
+        clean (a tab rearrange doesn't set dirty, so _maybe_save_changes wouldn't write it).
+        Gated on the layout actually differing from what's on disk, so an unchanged session
+        never touches the .animproj mtime. Only called on the genuinely-clean close path
+        (titled project, no unsaved authoring edits) - see closeEvent."""
+        current = self._compute_tab_state()
+        on_disk = self.project.ui_state or self._default_tab_state()
+        if current == on_disk:
+            return
+        self.project.ui_state = current
+        self.project.persist_ui_state()
 
     def _restore_tab_state(self) -> None:
         """Rebuild the tab bar from the project's saved layout (or the default full set of
@@ -1467,12 +1491,19 @@ class MainWindow(QMainWindow):
         # spontaneous() = the window system initiated it (you clicked X / the OS asked it
         # to close) vs a programmatic close. Logged so a vanished window is explainable.
         spontaneous = event.spontaneous()
+        had_edits = self._has_unsaved_edits()
         if not self._maybe_save_changes():
             applog.logger.info("close aborted at unsaved-changes prompt (spontaneous=%s)", spontaneous)
             event.ignore()
             return
         applog.logger.info("window closing (spontaneous=%s) - %s", spontaneous,
                            "user/OS closed the window" if spontaneous else "programmatic close")
+        # A tab rearrange on an otherwise-clean project doesn't set dirty, so _maybe_save_changes
+        # didn't persist it. Record it now - but only on the genuinely-clean path: if there WERE
+        # edits, the user either Saved (already wrote ui_state) or Discarded (must not write the
+        # discarded shots back to disk). Untitled has nowhere to write without a Save-As prompt.
+        if not had_edits and not self.project.is_untitled:
+            self._persist_layout_on_close()
         if self._remote is not None:
             self._remote.stop()
         self.comfy_tab.stop_monitoring()
