@@ -24,12 +24,12 @@ import paths  # noqa: E402
 
 paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
 
-from pipeline import export  # noqa: E402
+from pipeline import export, extract  # noqa: E402
 from store.project import Project  # noqa: E402
 from store.models import STATUS_DONE, STATUS_FAILED, STATUS_PENDING  # noqa: E402
 
 
-def _make_mp4(path: Path, n: int = 5) -> None:
+def _make_mp4(path: Path, n: int = 5) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     codec = "mpeg4"
     container = av.open(str(path), mode="w")
@@ -43,6 +43,7 @@ def _make_mp4(path: Path, n: int = 5) -> None:
     for pkt in stream.encode():
         container.mux(pkt)
     container.close()
+    return path
 
 
 def test_export() -> None:
@@ -80,6 +81,28 @@ def test_export() -> None:
     res3 = export.export_takes(project, [r3.id], dest_root=dest)
     assert res3["parent"] is None and r3.id in res3["skipped"]
     print("export OK: single(flat)/multi(subfolders)/skipped, settings.txt snapshot")
+
+
+def test_extract_frames_wide_padding() -> None:
+    """Frame filenames zero-pad to a width derived from the true decoded frame count, so a
+    lexicographic sort always equals frame order. A flat {i:03d} pad scrambled takes past
+    999 frames (frame_1000 sorting before frame_999); a take whose top index reaches 1000
+    now widens to 4 digits, while a short take keeps the historic 3-digit floor."""
+    tmp = Path(tempfile.mkdtemp())
+
+    # Short take: the 3-digit floor is preserved (frame_000.png, the historic look).
+    short_names = [p.name for p in extract.extract_frames(_make_mp4(tmp / "short.mp4", 5),
+                                                           tmp / "short_frames")]
+    assert short_names[0] == "frame_000.png", short_names[0]
+
+    # A take whose top index reaches 1000 widens to 4 digits so the sort holds.
+    paths = extract.extract_frames(_make_mp4(tmp / "long.mp4", 1001), tmp / "long_frames")
+    assert len(paths) == 1001, len(paths)
+    names = [p.name for p in paths]             # returned in frame order (0..1000)
+    assert names[0] == "frame_0000.png" and names[-1] == "frame_1000.png", (names[0], names[-1])
+    assert len({len(n) for n in names}) == 1, "padding must be fixed-width across all frames"
+    assert names == sorted(names), "lexicographic sort must equal frame order"
+    print("extract_frames OK: pad width tracks frame count (3-digit floor, 4 digits past 999)")
 
 
 def test_window_builds() -> None:
@@ -368,6 +391,51 @@ def test_tab_state_persists_on_close() -> None:
     print("MainWindow OK: clean-close persists layout; no-change/untitled/Discard write nothing")
 
 
+def test_tab_state_blank_tab_preserves_active() -> None:
+    """Focusing a pristine unsaved blank shot tab (+ New Shot -> new_shot, never registered
+    in shot_tabs so it maps to no descriptor) must not wipe the remembered active tab.
+    _compute_tab_state re-points active at the prior descriptor, so a clean close keeps the
+    on-disk active (Assets) instead of downgrading it to None/Shots (card #65)."""
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "blank.animproj"
+    project = Project.new()
+    project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+    project.save_as(path)
+
+    # Save with Assets active so the remembered active is a non-default (non-Shots) tab.
+    win = MainWindow(project)
+    win.tabs.setCurrentWidget(win.assets_tab)
+    assert win.save_project()
+    assets_idx = next(i for i, e in enumerate(win.project.ui_state["tabs"])
+                      if e == {"kind": "fixed", "key": "Assets"})
+    assert win.project.ui_state["active"] == assets_idx, "sanity: Assets recorded active"
+
+    # Reopen (restores Assets active), then open a blank shot tab -> it takes focus but is
+    # unregistered, so _compute_tab_state can't represent it as a descriptor.
+    w2 = MainWindow(Project.load(path))
+    assert w2.tabs.currentWidget() is w2.assets_tab, "restored on Assets"
+    w2.new_shot()
+    blank = w2.tabs.currentWidget()
+    assert isinstance(blank, ShotTab) and blank not in w2.shot_tabs.values(), \
+        "+ New Shot focuses a pristine, unregistered blank shot tab"
+    assert not w2._has_unsaved_edits(), "a pristine blank tab is not an unsaved edit"
+    state = w2._compute_tab_state()
+    assert state["active"] is not None, "blank-tab focus must not null the active"
+    assert state["tabs"][state["active"]] == {"kind": "fixed", "key": "Assets"}, state
+
+    # A clean close persists that preserved active, so reopening lands on Assets, not Shots.
+    w2.closeEvent(QCloseEvent())
+    w3 = MainWindow(Project.load(path))
+    assert w3.tabs.currentWidget() is w3.assets_tab, "reopens on Assets, not Shots (regression)"
+    print("MainWindow OK: focusing a pristine blank shot tab preserves the remembered active")
+
+
 def test_format_generation_settings() -> None:
     """The take-viewer settings formatter renders a full snapshot and degrades cleanly."""
     from store.models import Take
@@ -431,6 +499,56 @@ def test_snapshot_includes_framing() -> None:
     assert snap["canvas"] == [1254, 704], snap.get("canvas")
     assert snap["crop"] == crop, snap.get("crop")
     print("MainWindow OK: snapshot carries canvas + crop framing")
+
+
+def test_generate_shot_missing_shot() -> None:
+    """generate_shot is fed a deleted/unknown shot_id (generate_requested is a queued
+    signal; the shot can vanish between emit and slot). Both guards - the top-level one
+    and the one after the keyframe picker reloads the shot - must bail quietly: no
+    AttributeError, no launch (_queue_take never reached), the cost gate never shown."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui import main_window
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    project.save_as(Path(tempfile.mkdtemp()) / "p.animproj")
+    win = MainWindow(project)
+
+    gate_shown, queued = [], []
+    orig_confirm = main_window.confirm_launch
+    main_window.confirm_launch = lambda *a, **k: gate_shown.append(True) or True
+    win._queue_take = lambda *a, **k: queued.append(True)   # records any launch attempt
+    try:
+        # (a) top guard: an id that never existed, and one deleted between emit and slot.
+        win.generate_shot("never-existed")
+        ghost = project.add_shot("ghost", model_id="seedance-2.0-std", prompt="p")
+        project.delete_shot(ghost.id)
+        win.generate_shot(ghost.id)
+
+        # (b) picker-reload guard: a shot with no start_frame, deleted while the keyframe
+        # picker is open, so the re-fetch after import_asset returns None (line ~665).
+        shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+        orig_qfd, orig_import = main_window.QFileDialog, project.import_asset
+
+        class _PickerThenDelete:
+            @staticmethod
+            def getOpenFileName(*a, **k):
+                project.delete_shot(shot.id)        # vanishes while the dialog is open
+                return ("frame.png", "")
+        main_window.QFileDialog = _PickerThenDelete
+        project.import_asset = lambda src: Path("frame.png")   # no real file needed
+        try:
+            win.generate_shot(shot.id)
+        finally:
+            main_window.QFileDialog, project.import_asset = orig_qfd, orig_import
+    finally:
+        main_window.confirm_launch = orig_confirm
+
+    assert not gate_shown, "cost gate must never be shown for a missing shot"
+    assert not queued, "no launch (_queue_take) for a missing shot"
+    print("MainWindow OK: generate_shot on a missing/deleted shot is a quiet no-op (both guards)")
 
 
 def test_take_player_settings_panel() -> None:
@@ -597,16 +715,125 @@ def test_run_survives_deleted_signals() -> None:
     print("run survives deleted _JobSignals OK: emits no-op, take recorded, slot freed on early fail")
 
 
+def test_save_as_rollback_on_write_failure() -> None:
+    """A save_as whose document write raises must leave the project exactly as it was:
+    identity (path/name/_assets_dir) unchanged, the in-memory path remap reversed, and the
+    source assets still on disk -- no half-swapped identity, no lost scratch. Covers the
+    untitled path (scratch is MOVED) and the already-saved path (assets are COPIED), and
+    confirms the rolled-back project is still healthy enough to save once the write recovers."""
+    tmp = Path(tempfile.mkdtemp())
+    src = tmp / "kf.png"
+    src.write_bytes(b"\x89PNG\r\n\x1a\n fake keyframe")
+
+    def boom(*_a, **_k):
+        raise PermissionError("simulated AV/indexer lock on the .animproj")
+
+    # --- (A) untitled -> Save As: scratch is MOVED, so a failed write must move it back ---
+    p = Project.new()
+    asset = p.import_asset(src)
+    shot = p.add_shot("kick", model_id="seedance-2.0-std", start_frame=str(asset))
+    old_assets, old_name = p._assets_dir, p.name
+    assert old_assets.exists() and asset.exists(), "scratch + imported asset present pre-save"
+
+    target = tmp / "B.animproj"
+    new_assets = Project._assets_for(target)
+    p._write_project_file = boom                       # the document write fails
+    try:
+        p.save_as(target)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate the write failure")
+
+    assert p.path is None, "identity not swapped: still untitled"
+    assert p.name == old_name and p._assets_dir == old_assets, "name + _assets_dir restored"
+    assert old_assets.exists() and asset.exists(), "scratch + asset preserved (not lost to the move)"
+    assert not new_assets.exists(), "the moved scratch was moved back (no B.assets left behind)"
+    assert not target.exists(), "no orphan .animproj written"
+    assert p._shots[shot.id].start_frame == str(asset), "in-memory path remap was reversed"
+
+    # The rolled-back project is still healthy: clearing the fault lets save_as succeed.
+    del p._write_project_file
+    p.save_as(target)
+    assert p.path == target and target.exists(), "real save swaps identity + writes the doc"
+    assert (new_assets / asset.name).exists(), "scratch moved on the successful save"
+    assert not old_assets.exists(), "scratch consumed by the successful move"
+
+    # --- (B) already-saved -> Save As elsewhere: assets are COPIED, original must survive ---
+    saved_assets = p._assets_dir                       # the B.assets from the real save above
+    other = tmp / "C.animproj"
+    other_assets = Project._assets_for(other)
+    p._write_project_file = boom
+    try:
+        p.save_as(other)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate the write failure (copy path)")
+
+    assert p.path == target, "identity restored to the original saved path"
+    assert saved_assets.exists() and (saved_assets / asset.name).exists(), \
+        "original assets untouched (copied, not moved)"
+    assert not other_assets.exists(), "the half-made copy was cleaned up"
+    assert not other.exists(), "no orphan .animproj for the copy path"
+
+    # --- (C) Save As OVER an occupied neighbour: a failed write must NOT wipe its assets ---
+    occupied = tmp / "D.animproj"
+    occ_assets = Project._assets_for(occupied)
+    occ_assets.mkdir(parents=True)
+    (occ_assets / "PRECIOUS.png").write_bytes(b"do not lose me")
+    occupied.write_text("{}", encoding="utf-8")        # a different project already lives here
+    p._write_project_file = boom
+    try:
+        p.save_as(occupied)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate the write failure (occupied target)")
+    assert p.path == target, "identity restored; not swapped onto the occupied target"
+    assert (occ_assets / "PRECIOUS.png").exists(), "neighbour's assets restored, not wiped"
+    assert occupied.read_text(encoding="utf-8") == "{}", "neighbour's .animproj untouched"
+    assert not list(occ_assets.parent.glob("D.assets.*.bak")), "move-aside backup cleaned up"
+    del p._write_project_file
+
+    # --- (a) partial failure: the .animproj write SUCCEEDS but takes.json fails. The orphan
+    #         .animproj at the fresh path must be removed and the moved scratch put back. ---
+    def boom_takes(*_a, **_k):
+        raise PermissionError("simulated lock on takes.json")
+    p2 = Project.new()
+    a2 = p2.import_asset(src)
+    p2.add_shot("punch", model_id="seedance-2.0-std", start_frame=str(a2))
+    scratch2 = p2._assets_dir
+    fresh = tmp / "E.animproj"
+    fresh_assets = Project._assets_for(fresh)
+    p2._write_takes_file = boom_takes                  # project file writes; takes file fails
+    try:
+        p2.save_as(fresh)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate a takes.json write failure")
+    assert p2.path is None and p2._assets_dir == scratch2, "identity rolled back after takes failure"
+    assert scratch2.exists() and (scratch2 / a2.name).exists(), "scratch moved back after takes failure"
+    assert not fresh.exists(), "the .animproj written before the takes failure was removed"
+    assert not fresh_assets.exists(), "no leftover assets dir at the fresh target"
+    print("Project OK: save_as rolls back identity + assets on a failed document write")
+
+
 if __name__ == "__main__":
     test_export()
+    test_extract_frames_wide_padding()
     test_window_builds()
     test_close_dirty_tab_guard()
     test_tab_state_persistence()
     test_tab_state_active_survives_skip()
     test_tab_state_persists_on_close()
+    test_tab_state_blank_tab_preserves_active()
     test_format_generation_settings()
     test_snapshot_includes_framing()
+    test_generate_shot_missing_shot()
     test_take_player_settings_panel()
     test_runner_self_cancel_during_submit()
     test_run_survives_deleted_signals()
+    test_save_as_rollback_on_write_failure()
     print("PHASE 5 SMOKE: PASS")
