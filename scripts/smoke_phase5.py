@@ -191,6 +191,109 @@ def test_close_dirty_tab_guard() -> None:
     print("MainWindow OK: close-dirty-tab guard (clean/Cancel/Discard/Save)")
 
 
+def test_tab_state_persistence() -> None:
+    """Closing/opening tabs is captured into project.ui_state on save and rebuilt on the
+    next open: closed fixed tabs stay closed, open shot tabs reopen, order + active tab are
+    preserved, and a descriptor for a since-deleted shot is skipped (no crash). A project
+    with no saved layout builds the default full fixed-tab set."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "tabs.animproj"
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+    project.save_as(path)
+
+    win = MainWindow(project)
+    assert win.tabs.count() == 5, "default layout shows every fixed tab"
+
+    # Close Assets + Model Library, open the shot tab, focus it, then Save.
+    win._on_tab_close(win.tabs.indexOf(win.assets_tab))
+    win._on_tab_close(win.tabs.indexOf(win.library_tab))
+    win.open_shot(shot.id)
+    shot_tab = win.shot_tabs[shot.id]
+    win.tabs.setCurrentWidget(shot_tab)
+    assert win.save_project(), "titled save succeeds (no dialog)"
+
+    layout = win.project.ui_state["tabs"]
+    keys = [(e["kind"], e.get("key") or e.get("id")) for e in layout]
+    assert keys == [("fixed", "Shots"), ("fixed", "Queue"),
+                    ("fixed", "ComfyUI Status"), ("shot", shot.id)], keys
+    assert win.project.ui_state["active"] == win.tabs.indexOf(shot_tab)
+
+    # Reopen from disk in a fresh window: the layout (closed fixed tabs, reopened shot tab,
+    # order, active) is rebuilt.
+    reopened = Project.load(path)
+    win2 = MainWindow(reopened)
+    titles = [win2.tabs.tabText(i) for i in range(win2.tabs.count())]
+    assert titles == ["Shots", "Queue", "ComfyUI Status", "kick"], titles
+    assert win2.tabs.indexOf(win2.assets_tab) < 0, "closed Assets tab stays closed"
+    assert win2.tabs.indexOf(win2.library_tab) < 0, "closed Model Library tab stays closed"
+    assert shot.id in win2.shot_tabs, "the open shot tab was reopened"
+    assert isinstance(win2.tabs.currentWidget(), ShotTab), "active tab restored to the shot"
+
+    # A descriptor that points at a since-deleted shot is silently skipped (no crash).
+    reopened.delete_shot(shot.id)
+    reopened.save()
+    win3 = MainWindow(Project.load(path))
+    assert shot.id not in win3.shot_tabs, "deleted-shot descriptor produces no tab"
+    titles3 = [win3.tabs.tabText(i) for i in range(win3.tabs.count())]
+    assert titles3 == ["Shots", "Queue", "ComfyUI Status"], titles3
+
+    # A project with no saved ui_state falls back to the full default fixed-tab set.
+    fresh = Project.new()
+    fresh.add_shot("x", model_id="seedance-2.0-std")
+    win4 = MainWindow(fresh)
+    assert win4.tabs.count() == 5 and win4.tabs.tabText(0) == "Shots"
+    print("MainWindow OK: open-tab layout captured on save + restored on open")
+
+
+def test_tab_state_active_survives_skip() -> None:
+    """The saved active tab is restored by identity, not raw tab position, so deleting an
+    earlier tab's shot doesn't drift focus onto the wrong tab. Also exercises the take-tab
+    descriptor round-trip (the 'take' kind, untested by the layout test above)."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.take_player import TakePlayerTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "active.animproj"
+    project = Project.new()
+    a = project.add_shot("aaa", model_id="seedance-2.0-std")
+    b = project.add_shot("bbb", model_id="seedance-2.0-std")
+    take = project.add_take(a.id, status=STATUS_DONE)   # no video -> no decode thread
+    project.save_as(path)
+
+    win = MainWindow(project)
+    win.open_shot(a.id)
+    win.open_shot(b.id)
+    win.open_take(take.id)                 # tab order: ...fixed..., a, b, take
+    win.tabs.setCurrentWidget(win.shot_tabs[b.id])   # active is a NON-last tab
+    assert win.save_project()
+
+    # Reopen everything intact: the take viewer tab round-trips and focus lands on b.
+    w2 = MainWindow(Project.load(path))
+    assert take.id in w2.take_tabs and isinstance(w2.take_tabs[take.id], TakePlayerTab)
+    assert a.id in w2.shot_tabs and b.id in w2.shot_tabs
+    assert w2.tabs.currentWidget() is w2.shot_tabs[b.id], "active restored to shot b"
+
+    # Delete shot a (an EARLIER descriptor than the active one) + its take, then reopen.
+    # Position-based restore would now mis-point or fall back to Shots; identity-based
+    # restore must keep focus on b.
+    reop = Project.load(path)
+    reop.delete_shot(a.id)
+    reop.save()
+    w3 = MainWindow(Project.load(path))
+    assert a.id not in w3.shot_tabs, "deleted shot a is not reopened"
+    assert take.id not in w3.take_tabs, "take orphaned by the shot delete is dropped"
+    assert w3.tabs.currentWidget() is w3.shot_tabs[b.id], "focus stayed on b despite the skip"
+    print("MainWindow OK: active tab restored by identity across a skipped earlier tab")
+
+
 def test_format_generation_settings() -> None:
     """The take-viewer settings formatter renders a full snapshot and degrades cleanly."""
     from store.models import Take
@@ -424,6 +527,8 @@ if __name__ == "__main__":
     test_export()
     test_window_builds()
     test_close_dirty_tab_guard()
+    test_tab_state_persistence()
+    test_tab_state_active_survives_skip()
     test_format_generation_settings()
     test_snapshot_includes_framing()
     test_take_player_settings_panel()
