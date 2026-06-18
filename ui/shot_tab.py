@@ -320,6 +320,14 @@ class ShotTab(QWidget):
             self._takes_view.load()
         self._refresh_fps_label()   # a new take's measured fps may now be available
 
+    def update_take(self, take_id: str) -> None:
+        """Incremental sibling of refresh_takes for a single take's status signal: update just
+        that take's tile in place instead of a full model rebuild + every-thumbnail reload
+        (card #75). Still refreshes the fps label, which a just-finished take can change."""
+        if self._takes_view is not None:
+            self._takes_view.update_take(take_id)
+        self._refresh_fps_label()
+
     # ---- aspect / canvas ------------------------------------------------
     def _is_local(self) -> bool:
         m = self._current_model()

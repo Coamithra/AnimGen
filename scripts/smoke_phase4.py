@@ -23,7 +23,9 @@ import paths  # noqa: E402
 paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
 
 from store.project import Project  # noqa: E402
-from store.models import STATUS_DONE, STATUS_GENERATING  # noqa: E402
+from store.models import (  # noqa: E402
+    STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
+)
 
 
 def _png(path: Path, color=(0, 200, 0)) -> None:
@@ -475,9 +477,75 @@ def test_param_enum_preserves_out_of_schema_value() -> None:
     print("shot-tab enum param OK: out-of-schema value preserved + flagged, valid re-pick clears flag")
 
 
+def test_takes_view_incremental_update() -> None:
+    """A take's status signal updates just that take's tile in place (same QStandardItem, cached
+    icon, no full model rebuild), and only falls back to a full load when the take's membership
+    in the current view actually changed - card #75."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.takes_view import TakesView, _STAR_ROLE
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    t1 = project.add_take(shot.id, status=STATUS_PENDING)
+    t2 = project.add_take(shot.id, status=STATUS_GENERATING)
+    tv = TakesView(project, shot.id)
+    assert tv.model.rowCount() == 2
+
+    # The QIcon cache hands back the SAME object for an unchanged take (no disk re-decode) ...
+    td = project.add_take(shot.id, status=STATUS_PENDING)
+    tv.load()
+    icon_pending = tv._icon_for(project.get_take(td.id))
+    assert tv._icon_for(project.get_take(td.id)) is icon_pending
+    # ... but INVALIDATES when the content signature changes (here the status placeholder), so a
+    # frozen cache key (e.g. dropping the mtime/status from it) would be caught.
+    project.update_take(td.id, status=STATUS_FAILED)
+    assert tv._icon_for(project.get_take(td.id)) is not icon_pending
+
+    # A status transition updates the existing item IN PLACE - same object, no model.clear().
+    item1 = tv._items[t1.id]
+    project.update_take(t1.id, status=STATUS_GENERATING)
+    tv.update_take(t1.id)
+    assert tv._items[t1.id] is item1                 # not rebuilt
+    assert "generating" in tv._items[t1.id].text()    # label reflects the new status
+    assert tv.model.rowCount() == 3                   # membership unchanged - no reload
+
+    # A star flip is reflected on the existing item's star role, still no reload.
+    item2 = tv._items[t2.id]
+    project.set_starred(t2.id, True)
+    tv.update_take(t2.id)
+    assert tv._items[t2.id] is item2
+    assert tv._items[t2.id].data(_STAR_ROLE) is True
+
+    # A take not yet in the grid (added after the last load) falls back to a full load so it shows.
+    t4 = project.add_take(shot.id, status=STATUS_PENDING)
+    tv.update_take(t4.id)
+    assert tv.model.rowCount() == 4 and t4.id in tv._items
+
+    # Under the Favorites filter, a status change to a NON-starred take is a correct no-op: it
+    # isn't shown and shouldn't be, so no spurious reload (which would reset running animations).
+    tv.filter.setCurrentText("Favorites")            # load(): only t2 is starred
+    assert tv.model.rowCount() == 1 and t2.id in tv._items
+    shown = tv._items[t2.id]
+    project.update_take(t1.id, status=STATUS_DONE)    # t1 isn't starred -> not in this view
+    tv.update_take(t1.id)
+    assert tv.model.rowCount() == 1                   # no new row, no reload
+    assert tv._items[t2.id] is shown                  # the visible starred take is untouched
+
+    # The inverse boundary cross: a SHOWN starred take that becomes unstarred under Favorites must
+    # fall back to load() and drop from the view (the most regression-prone branch).
+    project.set_starred(t2.id, False)
+    tv.update_take(t2.id)
+    assert tv.model.rowCount() == 0 and t2.id not in tv._items
+    print("TakesView incremental OK: in-place tile update, icon cache, membership fallback")
+
+
 if __name__ == "__main__":
     test_bin_restore()
     test_takes_view()
+    test_takes_view_incremental_update()
     test_take_star_badge()
     test_take_progress_label()
     test_assets_view()
