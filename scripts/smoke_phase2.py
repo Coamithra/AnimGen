@@ -246,6 +246,17 @@ def test_comfy_prepare() -> None:
         "declared end_image role must sever the end conditioning with a single LoadImage"
     assert wf_role["3"]["inputs"]["start_image"] == ["1", 0], "start link must survive"
 
+    # A genuine I2V template (single LoadImage, no end-image conditioning at all) must
+    # still no-op on a no-end-frame render — not raise. Guards against _has_end_image_-
+    # conditioning becoming over-broad and breaking the common open-ended path.
+    i2v_one_load = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "start.png"}},
+        "2": {"class_type": "WanImageToVideo", "inputs": {"start_image": ["1", 0]}},
+    }
+    wf_i2v = comfy_client.prepare_workflow(copy.deepcopy(i2v_one_load), end_img=None)
+    assert wf_i2v["2"]["inputs"]["start_image"] == ["1", 0], \
+        "genuine I2V template must be left intact when no end frame is given"
+
     # text_encoder_cpu pins CLIP-loader nodes to the CPU (frees ~6GB VRAM on the 12GB card);
     # default leaves the template's device untouched. Node 3 is the CLIPLoader.
     assert wf["3"]["inputs"]["device"] == "default", "default run must not force CPU"

@@ -584,22 +584,22 @@ def prepare_workflow(template: dict, *, start_img: Optional[str] = None,
         if nid is None:
             raise ComfyError("no LoadImage node for start image")
         set_input(nid, "image", copy_input_image(start_img))
+    # The end-image node: the declared end_image role, else a 2nd LoadImage. Resolved once
+    # so setting the end frame and severing it for an open-ended render stay in lockstep.
+    end_node = roles.get("end_image") or (loads[1] if len(loads) > 1 else None)
     if end_img is not None:
-        nid = roles.get("end_image") or (loads[1] if len(loads) > 1 else None)
-        if nid is None:
+        if end_node is None:
             raise ComfyError("no second LoadImage node for end image")
-        set_input(nid, "image", copy_input_image(end_img))
+        set_input(end_node, "image", copy_input_image(end_img))
     else:
         # No end frame -> run open-ended: sever the end-image conditioning so an FLF
         # workflow degrades to I2V instead of reusing the template's baked end frame.
         # Drive this off the declared end_image role (the authoritative FLF signal), not
         # a LoadImage-count heuristic: a single-LoadImage FLF template whose end frame is
         # fed by a non-LoadImage node would otherwise slip past len(loads) > 1 and keep its
-        # baked end keyframe. A 2nd LoadImage is a back-compat fallback for templates that
-        # don't declare the role. If the workflow still carries end-image conditioning we
-        # can't pin to a node, fail loudly rather than render against a stale baked frame
+        # baked end keyframe. If the workflow still carries end-image conditioning we can't
+        # pin to a node, fail loudly rather than render against a stale baked frame
         # (mirrors the "no second LoadImage node for end image" guard above).
-        end_node = roles.get("end_image") or (loads[1] if len(loads) > 1 else None)
         if end_node is not None:
             _disconnect_consumers(wf, end_node)
         elif _has_end_image_conditioning(wf):
