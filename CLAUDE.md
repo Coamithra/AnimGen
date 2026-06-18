@@ -177,7 +177,14 @@ Full mechanism + invariants in **Hard-won rule #13**.
 - **Paths:** managed media + assets serialize **relative to `assets_dir`**; external
   references (seeded `../Fighter/out/*.gif`/`.mp4` takes) stay **absolute**. Untitled
   projects keep assets in `data/_scratch/<id>/` until the first **Save As**, which
-  relocates them next to the chosen file.
+  relocates them next to the chosen file. **`save_as` is atomic against a failed document
+  write:** it moves scratch (untitled) / copies assets (saved) + remaps in-memory paths +
+  swaps identity (`path`/`name`/`_assets_dir`) and only commits once `save()` succeeds; if
+  the write raises (e.g. `_atomic_write_json` exhausts its Windows AV/indexer retries) it
+  rolls everything back — identity restored, remap reversed, the moved scratch moved back
+  (so untitled work is never lost), the copy/partial `.animproj` dropped — so a failed
+  Save-As leaves the project exactly as it was. Smoke-tested in
+  `smoke_phase5.test_save_as_rollback_on_write_failure`.
 - **Generate** saves the project first (untitled → Save As prompt) so a take never
   references an unsaved shot.
 
