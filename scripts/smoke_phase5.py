@@ -391,6 +391,51 @@ def test_tab_state_persists_on_close() -> None:
     print("MainWindow OK: clean-close persists layout; no-change/untitled/Discard write nothing")
 
 
+def test_tab_state_blank_tab_preserves_active() -> None:
+    """Focusing a pristine unsaved blank shot tab (+ New Shot -> new_shot, never registered
+    in shot_tabs so it maps to no descriptor) must not wipe the remembered active tab.
+    _compute_tab_state re-points active at the prior descriptor, so a clean close keeps the
+    on-disk active (Assets) instead of downgrading it to None/Shots (card #65)."""
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "blank.animproj"
+    project = Project.new()
+    project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+    project.save_as(path)
+
+    # Save with Assets active so the remembered active is a non-default (non-Shots) tab.
+    win = MainWindow(project)
+    win.tabs.setCurrentWidget(win.assets_tab)
+    assert win.save_project()
+    assets_idx = next(i for i, e in enumerate(win.project.ui_state["tabs"])
+                      if e == {"kind": "fixed", "key": "Assets"})
+    assert win.project.ui_state["active"] == assets_idx, "sanity: Assets recorded active"
+
+    # Reopen (restores Assets active), then open a blank shot tab -> it takes focus but is
+    # unregistered, so _compute_tab_state can't represent it as a descriptor.
+    w2 = MainWindow(Project.load(path))
+    assert w2.tabs.currentWidget() is w2.assets_tab, "restored on Assets"
+    w2.new_shot()
+    blank = w2.tabs.currentWidget()
+    assert isinstance(blank, ShotTab) and blank not in w2.shot_tabs.values(), \
+        "+ New Shot focuses a pristine, unregistered blank shot tab"
+    assert not w2._has_unsaved_edits(), "a pristine blank tab is not an unsaved edit"
+    state = w2._compute_tab_state()
+    assert state["active"] is not None, "blank-tab focus must not null the active"
+    assert state["tabs"][state["active"]] == {"kind": "fixed", "key": "Assets"}, state
+
+    # A clean close persists that preserved active, so reopening lands on Assets, not Shots.
+    w2.closeEvent(QCloseEvent())
+    w3 = MainWindow(Project.load(path))
+    assert w3.tabs.currentWidget() is w3.assets_tab, "reopens on Assets, not Shots (regression)"
+    print("MainWindow OK: focusing a pristine blank shot tab preserves the remembered active")
+
+
 def test_format_generation_settings() -> None:
     """The take-viewer settings formatter renders a full snapshot and degrades cleanly."""
     from store.models import Take
@@ -678,6 +723,7 @@ if __name__ == "__main__":
     test_tab_state_persistence()
     test_tab_state_active_survives_skip()
     test_tab_state_persists_on_close()
+    test_tab_state_blank_tab_preserves_active()
     test_format_generation_settings()
     test_snapshot_includes_framing()
     test_generate_shot_missing_shot()

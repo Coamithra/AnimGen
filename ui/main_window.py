@@ -1331,7 +1331,10 @@ class MainWindow(QMainWindow):
         Window metadata, not authoring data - written on save, never sets dirty. Pristine
         unsaved blank shot tabs (no id yet, not in shot_tabs) are skipped; commit them
         first via Save. `active` is the index into the captured descriptor list (not a raw
-        tab position) so it survives a later tab being skipped on restore."""
+        tab position) so it survives a later tab being skipped on restore. When the active
+        tab is itself a skipped blank shot tab (it maps to no descriptor), `active` is
+        re-pointed at the previously-recorded active descriptor rather than left None - else
+        focusing such a tab at save/close would silently wipe the remembered active (#65)."""
         fixed_titles = {w: title for w, title in self._fixed_tabs}
         shot_id_by_tab = {t: sid for sid, t in self.shot_tabs.items()}
         active_widget = self.tabs.currentWidget()
@@ -1353,7 +1356,24 @@ class MainWindow(QMainWindow):
             if w is active_widget:
                 active = len(entries)
             entries.append(entry)
+        if active is None and active_widget is not None:
+            active = self._prior_active_index(entries)
         return {"tabs": entries, "active": active}
+
+    def _prior_active_index(self, entries: list[dict]) -> Optional[int]:
+        """Resolve the previously-recorded active descriptor to its position in `entries`.
+        Used when the live active tab can't be represented (a pristine unsaved blank shot
+        tab) so re-capturing the layout preserves the remembered active instead of nulling
+        it. Returns None when that descriptor is no longer open - then active falls back to
+        the Shots tab on restore, the same as having no remembered active. `prior` is the
+        last *persisted* active (ui_state is only re-captured on save/close), not the live
+        focus, so closing the recorded-active tab before this fires also yields the fallback."""
+        prior = self.project.ui_state or self._default_tab_state()
+        tabs = prior.get("tabs") or []
+        idx = prior.get("active")
+        if isinstance(idx, int) and 0 <= idx < len(tabs) and tabs[idx] in entries:
+            return entries.index(tabs[idx])
+        return None
 
     def _default_tab_state(self) -> dict:
         """The layout an empty ui_state restores to: every fixed tab in order, Shots active
