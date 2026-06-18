@@ -375,6 +375,38 @@ def test_cost_summary() -> None:
     print("cost_confirm build_summary OK: totals, spend flag, free-only")
 
 
+def test_launch_label() -> None:
+    from ui.cost_confirm import build_summary, launch_button_label
+
+    # All-unknown-cost batch: build_summary -> total=0, has_spend=True. The launch
+    # button must NOT read "free" (rule #1: the gate must not contradict its own
+    # "MAY spend money" header).
+    unknown_items = [
+        {"name": "a", "model_display": "Mystery v1", "est_cost": None, "params": {}},
+        {"name": "b", "model_display": "Mystery v2", "est_cost": None, "params": {}},
+    ]
+    _, total_u, has_spend_u = build_summary(unknown_items)
+    assert total_u == 0.0 and has_spend_u is True
+    label_u = launch_button_label(total_u, has_spend_u)
+    assert label_u != "Launch (spend ~free)"
+    assert label_u == "Launch (cost unknown)"
+
+    # No-spend (local $0) batch keeps "Launch (free)".
+    assert launch_button_label(0.0, False) == "Launch (free)"
+
+    # Known hosted cost keeps the dollar amount.
+    assert launch_button_label(2.0, True) == "Launch (spend ~$2.00)"
+
+    # Mixed known + unknown (total>0, has_spend) still shows the known total.
+    mixed_items = [
+        {"name": "a", "model_display": "Seedance", "est_cost": 0.72, "params": {}},
+        {"name": "b", "model_display": "Mystery", "est_cost": None, "params": {}},
+    ]
+    _, total_m, has_spend_m = build_summary(mixed_items)
+    assert launch_button_label(total_m, has_spend_m) == "Launch (spend ~$0.72)"
+    print("cost_confirm launch_button_label OK: unknown-not-free, free, known, mixed")
+
+
 def test_job_manager() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -1946,6 +1978,7 @@ if __name__ == "__main__":
     test_stop_handler_nonbatch()
     test_total_price()
     test_cost_summary()
+    test_launch_label()
     test_cancel_pending()
     test_cancel_shot_takes()
     test_inflight_stop_maps_to_cancelled()
