@@ -178,6 +178,14 @@ class MainWindow(QMainWindow):
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
 
+        edit_menu = bar.addMenu("&Edit")
+        self.purge_cancelled_act = QAction("Remove cancelled takes", self)
+        self.purge_cancelled_act.setToolTip(
+            "Permanently delete every cancelled take in this project, across all shots "
+            "(ignores the view filters). This can't be undone.")
+        self.purge_cancelled_act.triggered.connect(self.remove_cancelled_takes)
+        edit_menu.addAction(self.purge_cancelled_act)
+
         view_menu = bar.addMenu("&View")
         for widget, name in self._fixed_tabs:
             act = QAction(name, self)
@@ -465,6 +473,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{shown} shots shown · {len(shots)} total")
         self._refresh_total_price(shots)
         self._refresh_restart_action()   # a freshly-opened project may already hold cancelled takes
+        self._refresh_purge_cancelled_action()
         self._update_title()
 
     def _refresh_total_price(self, shots) -> None:
@@ -865,6 +874,54 @@ class MainWindow(QMainWindow):
     def _interrupted_take_count(self) -> int:
         return sum(1 for t in self.project.list_takes(include_deleted=False)
                    if t.interrupted and t.status in (STATUS_CANCELLED, STATUS_FAILED))
+
+    # ---- remove cancelled takes (Edit menu) ----------------------------
+    def _cancelled_take_count(self) -> int:
+        # include_deleted: a binned cancelled take is still cancelled and should be purgeable.
+        return sum(1 for t in self.project.list_takes(include_deleted=True)
+                   if t.status == STATUS_CANCELLED)
+
+    def _refresh_purge_cancelled_action(self) -> None:
+        self.purge_cancelled_act.setEnabled(self._cancelled_take_count() > 0)
+
+    def _close_take_tabs(self, take_ids) -> None:
+        """Close any open take-viewer tabs for the given takes, so a tab can't dangle on a take
+        that's about to be removed. Mirrors _on_tab_close's disposal (stop playback, drop tab)."""
+        for tid in take_ids:
+            tab = self.take_tabs.pop(tid, None)
+            if tab is None:
+                continue
+            idx = self.tabs.indexOf(tab)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            tab.close_player()
+            tab.deleteLater()
+
+    def remove_cancelled_takes(self) -> None:
+        """Edit menu: permanently remove every cancelled take in the project, across all shots
+        (ignores the view filters, like Cancel pending / Restart interrupted). Drops their records
+        and best-effort unlinks any managed media (a stopped-mid-render or binned take may carry
+        some; external refs are left in place). Irreversible, so confirm first - defaults to No."""
+        cancelled = [t for t in self.project.list_takes(include_deleted=True)
+                     if t.status == STATUS_CANCELLED]
+        if not cancelled:
+            QMessageBox.information(self, "Remove cancelled takes",
+                                    "There are no cancelled takes to remove.")
+            return
+        n = len(cancelled)
+        if QMessageBox.question(
+                self, "Remove cancelled takes",
+                f"Permanently remove {n} cancelled take{'' if n == 1 else 's'} from this "
+                f"project, across all shots?\n\nThis can't be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        ids = [t.id for t in cancelled]
+        self._close_take_tabs(ids)           # a purged take must not leave a dangling viewer tab
+        removed = self.project.purge_takes(ids)
+        self._log(f"removed {removed} cancelled take(s)")
+        self.reload()             # rebuilds cards + refreshes the purge/restart action states
+        self.queue_tab.refresh()  # drop the purged takes from the Queue tab
 
     # ---- restart interrupted takes -------------------------------------
     def restart_cancelled_takes(self) -> None:
