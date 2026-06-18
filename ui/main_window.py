@@ -1339,9 +1339,10 @@ class MainWindow(QMainWindow):
         return {"tabs": entries, "active": active}
 
     def _default_tab_state(self) -> dict:
-        """The layout an empty ui_state restores to: every fixed tab in order, Shots active.
-        Used as the effective on-disk state so a no-change close of a default-layout project
-        (older/seeded files carry no ui_state) compares equal and writes nothing."""
+        """The layout an empty ui_state restores to: every fixed tab in order, Shots active
+        (index 0, matching _restore_tab_state's setCurrentIndex(0) fallback). Used as the
+        effective on-disk state so a no-change close of a default-layout project (older/
+        seeded files carry no ui_state) compares equal and writes nothing."""
         return {"tabs": [{"kind": "fixed", "key": t} for _, t in self._fixed_tabs],
                 "active": 0}
 
@@ -1349,8 +1350,11 @@ class MainWindow(QMainWindow):
         """Record a tab-layout change at window close even when the project is otherwise
         clean (a tab rearrange doesn't set dirty, so _maybe_save_changes wouldn't write it).
         Gated on the layout actually differing from what's on disk, so an unchanged session
-        never touches the .animproj mtime. Only called on the genuinely-clean close path
-        (titled project, no unsaved authoring edits) - see closeEvent."""
+        never touches the .animproj mtime. The active-tab index is part of the layout (it's
+        serialized into ui_state and Save captures it too), so switching to a different tab
+        and closing IS a change worth persisting - the restored project reopens on it. Only
+        called on the genuinely-clean close path (titled project, no unsaved authoring
+        edits) - see closeEvent."""
         current = self._compute_tab_state()
         on_disk = self.project.ui_state or self._default_tab_state()
         if current == on_disk:
@@ -1500,8 +1504,10 @@ class MainWindow(QMainWindow):
                            "user/OS closed the window" if spontaneous else "programmatic close")
         # A tab rearrange on an otherwise-clean project doesn't set dirty, so _maybe_save_changes
         # didn't persist it. Record it now - but only on the genuinely-clean path: if there WERE
-        # edits, the user either Saved (already wrote ui_state) or Discarded (must not write the
-        # discarded shots back to disk). Untitled has nowhere to write without a Save-As prompt.
+        # edits, the user either Saved (save_project's _capture_tab_state already wrote ui_state)
+        # or Discarded (must not write the discarded shots back to disk). Skipping on had_edits is
+        # safe precisely because the Save branch captures the layout itself. Untitled has nowhere
+        # to write without a Save-As prompt.
         if not had_edits and not self.project.is_untitled:
             self._persist_layout_on_close()
         if self._remote is not None:

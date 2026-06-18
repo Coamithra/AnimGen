@@ -297,7 +297,10 @@ def test_tab_state_active_survives_skip() -> None:
 def test_tab_state_persists_on_close() -> None:
     """A tab rearrange on an otherwise-clean titled project is persisted at window close
     (no Save needed), gated on the layout actually changing so an unchanged close writes
-    nothing, and suppressed when the project is untitled or the user Discards real edits."""
+    nothing, and suppressed when the project is untitled or the user Discards real edits.
+    Also covers an active-tab-only switch (part of the layout) and confirms a no-op close
+    skips the write. NB the Discard case asserts 'closeEvent wrote nothing' via mtime, not
+    the real modal Discard wiring - headless can't drive the QMessageBox."""
     from PySide6.QtGui import QCloseEvent
     from PySide6.QtWidgets import QApplication
 
@@ -331,6 +334,15 @@ def test_tab_state_persists_on_close() -> None:
     win3 = MainWindow(Project.load(path))
     win3.closeEvent(QCloseEvent())
     assert path.stat().st_mtime_ns == mtime_after, "no-change close must not rewrite the file"
+
+    # An active-tab-only switch is part of the layout: closing on it persists, and reopening
+    # restores that tab as active.
+    win5 = MainWindow(Project.load(path))
+    win5.tabs.setCurrentWidget(win5.queue_tab)        # was Shots; switch to Queue, change nothing else
+    assert not win5._has_unsaved_edits()
+    win5.closeEvent(QCloseEvent())
+    win6 = MainWindow(Project.load(path))
+    assert win6.tabs.currentWidget() is win6.queue_tab, "reopens on the last-active tab"
 
     # Untitled project: nothing to write, no crash.
     untitled = MainWindow(Project.new())
