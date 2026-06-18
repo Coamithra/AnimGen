@@ -638,6 +638,13 @@ class MainWindow(QMainWindow):
 
     def generate_shot(self, shot_id: str) -> None:
         shot = self.project.get_shot(shot_id)
+        if not shot:
+            # generate_requested is a queued signal; the shot can be deleted between the
+            # emit and this slot running (benign double-click / stale-tab race). Guard the
+            # deref like open_shot/toggle_shot_star/delete_shot do, plus a log line since a
+            # silently-dropped Generate is the confusing case (the siblings stay silent).
+            self._log("generate ignored: shot no longer exists")
+            return
         model = library.get_model(shot.model_id)
         if not model:
             QMessageBox.warning(self, "Generate", f"Unknown model: {shot.model_id}")
@@ -657,6 +664,9 @@ class MainWindow(QMainWindow):
                 return
             self.project.update_shot(shot.id, start_frame=str(self.project.import_asset(start)))
             shot = self.project.get_shot(shot_id)
+            if not shot:
+                self._log("generate ignored: shot deleted while picking a keyframe")
+                return
 
         settings = {**model.get("default_params", {}), **shot.settings}
         est = library.estimate_cost(shot.model_id, settings)
