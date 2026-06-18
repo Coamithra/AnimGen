@@ -10,9 +10,12 @@ on that one serialized worker - so "requeue the rest" is automatic, nothing is r
 
 A failure with the server still UP is a genuine workflow error (bad node, OOM that returns an
 execution_error, ...), NOT a crash: it propagates unchanged so only that take fails and the
-next one proceeds - we never restart-loop on a legitimately broken workflow. A take that
-crashes MAX_ATTEMPTS times raises QueueAbandoned so the caller pauses the whole local queue
-(the GPU / server is legitimately broken - don't restart forever).
+next one proceeds - we never restart-loop on a legitimately broken workflow. On the final
+strike we try ONE last restart + responsiveness probe before giving up: a take crashes
+MAX_ATTEMPTS times and the server still can't be brought back -> QueueAbandoned so the caller
+pauses the whole local queue (the GPU / server is legitimately broken - don't restart
+forever); but if that final restart recovers the server, only this take fails (the GPU was
+only transiently down, so don't waste the rest of an overnight batch).
 
 run_with_crash_recovery is dependency-injected (render / server_running / restart_server /
 note / on_abandon / clock) so it's unit-tested headless with fakes - no real ComfyUI, no GPU,
@@ -92,8 +95,10 @@ def run_with_crash_recovery(
                        restart or abandon. Default never-abort preserves the old behaviour.
 
     Returns render()'s result on success. Re-raises render()'s exception verbatim for a
-    genuine workflow error (server still up) or a deliberate user stop. Raises QueueAbandoned
-    after `max_attempts` crashes, or if a restart fails.
+    genuine workflow error (server still up), a deliberate user stop, or the final crash strike
+    when one last restart brings ComfyUI back (only this take fails; the queue keeps running).
+    Raises QueueAbandoned only when a restart fails or the server stays unreachable - so the
+    last strike is decided on the server's actual state, not on the raw attempt count alone.
     """
     for attempt in range(1, max_attempts + 1):
         t0 = clock()
@@ -106,15 +111,33 @@ def run_with_crash_recovery(
                 raise                      # server alive -> genuine workflow error, not a crash
             elapsed = format_elapsed(int(clock() - t0))
             if attempt >= max_attempts:
-                # on_abandon cancels the still-PENDING siblings; THIS take is still
-                # GENERATING so it's untouched there and instead fails normally when the
-                # QueueAbandoned below propagates to the worker's except handler.
-                reason = (f"ComfyUI crashed {max_attempts}x on this take (last after "
-                          f"{elapsed}); pausing the local queue. Check the GPU / ComfyUI "
-                          "before re-Generating.")
-                note(reason)
-                on_abandon(reason)
-                raise QueueAbandoned(reason) from exc
+                # Last strike. Don't condemn the whole local queue on attempt count alone:
+                # the GPU may have only transiently dropped, and one more restart can bring
+                # ComfyUI back. Try exactly one final restart + responsiveness probe; abandon
+                # the queue ONLY if that restart fails or the server stays unreachable. If it
+                # recovers, fail just THIS take (re-raise) and let the rest of the local queue
+                # keep rendering - it would otherwise be a wasted overnight run on a GPU that
+                # was only briefly down. on_abandon cancels the still-PENDING siblings; a
+                # re-raised render error instead fails only this GENERATING take in the worker.
+                note(f"comfy crashed {max_attempts}x on this take (last after {elapsed}); "
+                     "attempting a final ComfyUI restart before pausing the local queue.")
+                try:
+                    restart_server()
+                except Exception as rexc:  # noqa: BLE001 - couldn't bring it back -> abandon
+                    reason = f"ComfyUI restart failed ({rexc}); pausing the local queue."
+                    note(reason)
+                    on_abandon(reason)
+                    raise QueueAbandoned(reason) from rexc
+                if _looks_crashed(server_running, crash_probes):
+                    reason = (f"ComfyUI still unreachable after a final restart (crashed "
+                              f"{max_attempts}x on this take); pausing the local queue. "
+                              "Check the GPU / ComfyUI before re-Generating.")
+                    note(reason)
+                    on_abandon(reason)
+                    raise QueueAbandoned(reason) from exc
+                note("ComfyUI recovered after a final restart; failing this take but "
+                     "keeping the local queue running.")
+                raise
             note(f"comfy crashed - failed in {elapsed}, retrying "
                  f"(attempt {attempt + 1}/{max_attempts})")
             try:
