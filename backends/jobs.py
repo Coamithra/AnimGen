@@ -97,7 +97,8 @@ class GenerationJob(QRunnable):
     def _run(self) -> None:
         tid = self.take_id
         if tid in self.cancelled:    # cancelled while queued - never invoke the backend
-            self.project.update_take(tid, status=STATUS_CANCELLED, error="cancelled before start")
+            self.project.update_take(tid, status=STATUS_CANCELLED, error="cancelled before start",
+                                     interrupted=False)   # user cancel, not a crash
             self._emit("status_changed", tid, STATUS_CANCELLED)
             self.done_cb(tid, STATUS_CANCELLED)
             return
@@ -147,13 +148,13 @@ class GenerationJob(QRunnable):
                 # The backend error is here because we asked it to stop (shot deleted /
                 # cancelled mid-render), not because the render failed - record CANCELLED.
                 self.project.update_take(tid, status=STATUS_CANCELLED,
-                                         error="stopped by user")
+                                         error="stopped by user", interrupted=False)   # deliberate stop
                 self.project.update_job(job.id, state="cancelled",
                                         log="\n".join(log_lines + [err]))
                 self._emit("status_changed", tid, STATUS_CANCELLED)
                 final = STATUS_CANCELLED
             else:
-                self.project.update_take(tid, status=STATUS_FAILED, error=err)
+                self.project.update_take(tid, status=STATUS_FAILED, error=err, interrupted=False)
                 self.project.update_job(job.id, state="failed", log="\n".join(log_lines + [err]))
                 self._emit("status_changed", tid, STATUS_FAILED)
                 self._emit("failed", tid, err)
@@ -252,7 +253,8 @@ class JobManager(QObject):
             return False
         self._cancelled.add(take_id)
         self._runners.pop(take_id, None)
-        self.project.update_take(take_id, status=STATUS_CANCELLED, error="cancelled by user")
+        self.project.update_take(take_id, status=STATUS_CANCELLED, error="cancelled by user",
+                                 interrupted=False)
         self._signals.status_changed.emit(take_id, STATUS_CANCELLED)
         return True
 
@@ -270,7 +272,7 @@ class JobManager(QObject):
                 self._cancelled.add(t.id)
                 self._runners.pop(t.id, None)
                 self.project.update_take(t.id, status=STATUS_CANCELLED,
-                                         error="cancelled by user (shot deleted)")
+                                         error="cancelled by user (shot deleted)", interrupted=False)
                 self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
                 n += 1
         return n
@@ -334,7 +336,8 @@ class JobManager(QObject):
         for t in pending:
             self._cancelled.add(t.id)
             self._runners.pop(t.id, None)
-            self.project.update_take(t.id, status=STATUS_CANCELLED, error="cancelled by user")
+            self.project.update_take(t.id, status=STATUS_CANCELLED, error="cancelled by user",
+                                     interrupted=False)
             self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
         return len(pending)
 
@@ -439,7 +442,8 @@ class JobManager(QObject):
         for t in pending:
             self._cancelled.add(t.id)
             self._runners.pop(t.id, None)
-            self.project.update_take(t.id, status=STATUS_CANCELLED, error=reason)
+            self.project.update_take(t.id, status=STATUS_CANCELLED, error=reason,
+                                     interrupted=True)   # GPU-crash abandon, not a user cancel
             self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
         self._signals.queue_abandoned.emit(reason)
         return len(pending)

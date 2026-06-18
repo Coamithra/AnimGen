@@ -1571,23 +1571,25 @@ def test_restart_plan() -> None:
               "settings": {"seed": 7, "duration": 4}, "canvas": [1254, 1254], "crop": {}}
     ok = _take(framed)
     ok_with_end = _take({**framed, "end_frame": "b.png"})   # present end frame -> still restartable
+    failed_ok = _take(framed, status=STATUS_FAILED)         # interrupted FAILED orphan -> restartable too
     unknown_model = _take({**framed, "model_id": "gone"})
     missing_frame = _take({**framed, "start_frame": "deleted.png"})
     missing_end = _take({**framed, "end_frame": "deleted_end.png"})  # end frame gone -> can't replay exactly
     old_snapshot = _take({"model_id": "good", "backend": "replicate",  # pre-2026-06-17: no canvas/crop
                           "start_frame": "a.png", "settings": {"seed": 1}})
-    not_cancelled = _take(framed, status=STATUS_DONE)  # filtered out entirely
+    not_terminal = _take(framed, status=STATUS_DONE)  # not CANCELLED/FAILED -> filtered out entirely
 
     models = {"good": {"display_name": "Good", "backend": "replicate"}}
     plan = restart.plan_restart(
-        [ok, ok_with_end, unknown_model, missing_frame, missing_end, old_snapshot, not_cancelled],
+        [ok, ok_with_end, failed_ok, unknown_model, missing_frame, missing_end, old_snapshot,
+         not_terminal],
         model_of_id=lambda mid: models.get(mid),
         est_of=lambda mid, s: 0.5,
         path_exists=lambda p: p in ("a.png", "b.png"),
         name_of=lambda t: t.id)
 
-    assert plan.restartable == [ok, ok_with_end], plan.restartable
-    assert len(plan.items) == 2
+    assert plan.restartable == [ok, ok_with_end, failed_ok], plan.restartable
+    assert len(plan.items) == 3
     it = plan.items[0]
     assert set(it) >= {"name", "model_display", "backend", "est_cost", "params"}
     assert it["est_cost"] == 0.5 and it["params"]["seed"] == 7
@@ -1598,7 +1600,7 @@ def test_restart_plan() -> None:
     assert "start keyframe" in reasons[missing_frame.id]
     assert "end keyframe" in reasons[missing_end.id]
     assert "predates framing" in reasons[old_snapshot.id]
-    print("restart plan OK: restartable filter + per-take unrestartable reasons")
+    print("restart plan OK: cancelled+failed restartable filter + per-take unrestartable reasons")
 
 
 def test_restart_take() -> None:
@@ -1652,9 +1654,18 @@ def test_restart_from_snapshot() -> None:
                 "start_frame": str(start_png), "end_frame": None,
                 "settings": {"seed": 4242, "duration": 4},
                 "canvas": [1254, 1254], "crop": {"aspect": "1:1"}, "prompt": "p", "negative_prompt": "n"}
-        good = project.add_take(shot.id, status=STATUS_CANCELLED, settings_snapshot=snap)
-        old = project.add_take(shot.id, status=STATUS_CANCELLED,  # pre-framing snapshot -> fail
+        good = project.add_take(shot.id, status=STATUS_CANCELLED, interrupted=True,
+                                settings_snapshot=snap)
+        old = project.add_take(shot.id, status=STATUS_CANCELLED, interrupted=True,  # pre-framing -> fail
                                settings_snapshot={"model_id": "seedance-2.0-std", "backend": "replicate"})
+        # A take the USER cancelled (not interrupted) is restartable by snapshot but the bulk action
+        # must SKIP it - it's only for crash/death-interrupted takes.
+        user_cancelled = project.add_take(shot.id, status=STATUS_CANCELLED, interrupted=False,
+                                          settings_snapshot=snap)
+        # An interrupted FAILED take (in-flight render lost to the restart) IS picked up by the bulk
+        # action alongside the cancelled ones.
+        failed_orphan = project.add_take(shot.id, status=STATUS_FAILED, interrupted=True,
+                                         settings_snapshot=snap)
 
         win = MainWindow(project)
         # Capture the runner build instead of firing a real backend; assert it gets the snapshot's
@@ -1676,8 +1687,9 @@ def test_restart_from_snapshot() -> None:
         finally:
             mw.confirm_launch = orig_confirm
 
-        assert enqueued == [good.id], enqueued
+        assert enqueued == [good.id, failed_orphan.id], enqueued
         assert project.get_take(good.id).status == STATUS_PENDING
+        assert project.get_take(failed_orphan.id).status == STATUS_PENDING, "failed orphan not restarted"
         cap = captured[good.id]
         assert cap["settings"]["seed"] == 4242
         assert cap["shot"].canvas_w == 1254 and cap["shot"].crop == {"aspect": "1:1"}
@@ -1685,6 +1697,9 @@ def test_restart_from_snapshot() -> None:
         # The unrestartable old take is failed with a reason.
         failed = project.get_take(old.id)
         assert failed.status == STATUS_FAILED and "cannot restart" in (failed.error or "")
+        # The user-cancelled take is left untouched - not enqueued, not failed.
+        assert project.get_take(user_cancelled.id).status == STATUS_CANCELLED, "user cancel restarted!"
+        assert user_cancelled.id not in enqueued
 
         # Context menu: a cancelled take gets a Restart entry, built without exec().
         project.update_take(good.id, status=STATUS_CANCELLED)   # the restart above flipped it to PENDING
@@ -1702,6 +1717,72 @@ def test_restart_from_snapshot() -> None:
     finally:
         QMessageBox.information = orig_info
     print("restart from snapshot OK: in-place replay, unrestartable->failed, headless menu entry")
+
+
+def test_interrupted_flag() -> None:
+    """The `interrupted` flag separates crash/death-cancelled takes (the only ones the bulk Restart
+    re-runs) from user-cancelled ones: it survives the takes.json round-trip, backfills on legacy
+    load, and is set True by the auto paths (orphan recovery / abandon_local) but False by a manual
+    cancel."""
+    from PySide6.QtWidgets import QApplication
+    from backends import recovery
+    from backends.jobs import JobManager
+    from store.models import STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_PENDING, Take
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+
+    # Round-trip: interrupted survives _take_to_dict -> _take_from_dict.
+    rt = Take(id="rt", shot_id="s", status=STATUS_CANCELLED, interrupted=True)
+    assert project._take_from_dict(project._take_to_dict(rt)).interrupted is True
+
+    # Migration backfill: a legacy cancelled/failed take (no `interrupted` key) infers it from the
+    # orphan-recovery reason markers in `error`.
+    def backfill(status, error):
+        return project._take_from_dict(
+            {"id": "m" + str(abs(hash(error)))[:6], "shot_id": "s", "status": status, "error": error}
+        ).interrupted
+    # Crash/death reasons -> True (each distinct recovery marker).
+    assert backfill(STATUS_CANCELLED, "not submitted before restart; re-Generate to run it") is True
+    assert backfill(STATUS_FAILED, "ComfyUI was unreachable at restart; render could not be recovered.") is True
+    assert backfill(STATUS_FAILED, "no matching ComfyUI render found (lost to app restart)") is True
+    assert backfill(STATUS_CANCELLED, "ComfyUI restart failed; pausing the local queue.") is True
+    # User/genuine reasons -> False (crucially, a "cannot restart:" mark must NOT read as interrupted).
+    assert backfill(STATUS_CANCELLED, "cancelled by user") is False
+    assert backfill(STATUS_FAILED, "workflow error: bad node") is False
+    assert backfill(STATUS_FAILED, "cannot restart: snapshot predates framing-in-snapshot") is False
+    assert project._take_from_dict({"id": "c", "shot_id": "s", "status": STATUS_DONE}).interrupted is False
+
+    # Manual cancel_take -> interrupted False.
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    manual = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot={"backend": "replicate"})
+    jm = JobManager(project)
+    jm.cancel_take(manual.id)
+    assert project.get_take(manual.id).interrupted is False, "manual cancel must NOT be interrupted"
+
+    # abandon_local (3-strike GPU crash) -> interrupted True.
+    local = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot={"backend": "comfyui"})
+    jm.abandon_local("ComfyUI crashed; pausing.")
+    assert project.get_take(local.id).interrupted is True, "crash abandon must be interrupted"
+
+    # Orphan recovery sets interrupted=True for BOTH its terminal actions, via _execute_plans:
+    # CANCEL (a pending take never submitted) and FAIL (an in-flight render lost to the restart).
+    from ui.main_window import MainWindow
+    proj2 = Project.new()
+    sh2 = proj2.add_shot("k", model_id="seedance-2.0-std")
+    win = MainWindow(proj2)                 # built before any orphan exists -> no off-thread reconciler
+    o_cancel = proj2.add_take(sh2.id, status=STATUS_PENDING, settings_snapshot={"backend": "comfyui"})
+    o_fail = proj2.add_take(sh2.id, status=STATUS_GENERATING, settings_snapshot={"backend": "comfyui"})
+    win._execute_plans([
+        recovery.RecoveryPlan(o_cancel.id, sh2.id, recovery.CANCEL,
+                              reason="queued but not submitted before restart"),
+        recovery.RecoveryPlan(o_fail.id, sh2.id, recovery.FAIL,
+                              reason="no matching ComfyUI render found (lost to app restart)"),
+    ])
+    gc, gf = proj2.get_take(o_cancel.id), proj2.get_take(o_fail.id)
+    assert gc.interrupted is True and gc.status == STATUS_CANCELLED, (gc.interrupted, gc.status)
+    assert gf.interrupted is True and gf.status == STATUS_FAILED, (gf.interrupted, gf.status)
+    print("interrupted flag OK: round-trip, migration backfill, manual=False, recovery(cancel+fail)/abandon=True")
 
 
 def test_done_elapsed() -> None:
@@ -1816,4 +1897,5 @@ if __name__ == "__main__":
     test_restart_plan()
     test_restart_take()
     test_restart_from_snapshot()
+    test_interrupted_flag()
     print("PHASE 2 SMOKE: PASS")

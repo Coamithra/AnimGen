@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Optional
 
 import paths
-from store.models import Job, Shot, Take
+from store.models import STATUS_CANCELLED, STATUS_FAILED, Job, Shot, Take
 
 FORMAT = "animgen-project"
 VERSION = 1
@@ -52,6 +52,17 @@ VERSION = 1
 # Dataclass path fields that may point into assets_dir (and so get relativized on save).
 _SHOT_PATHS = ("start_frame", "end_frame")
 _TAKE_PATHS = ("video_path", "preview_gif", "thumbnail")
+
+# Reason-text markers (lowercase) that identify a take cancelled/failed by a crash or
+# ComfyUI/app death (orphan recovery or the 3-strike abandon) rather than by the user. Used
+# ONLY to backfill the `interrupted` flag on legacy takes written before the flag existed;
+# new takes set it explicitly at the cancel/fail site (see backends/recovery.py, jobs.py).
+_INTERRUPTED_REASON_MARKERS = (
+    "before restart",          # orphan recovery CANCEL (pending take never submitted)
+    "unreachable at restart",  # offline recovery FAIL (in-flight render lost, ComfyUI down)
+    "lost to app restart",     # online recovery FAIL (in-flight render not found on server)
+    "pausing the local queue", # 3-strike crash abandon
+)
 
 # Keyframe assets are image files kept flat in the .assets/ root.
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
@@ -326,6 +337,15 @@ class Project:
         d = dict(d)
         for f in _TAKE_PATHS:
             d[f] = self._abs(d.get(f))
+        # Migration: pre-2026-06-18 cancelled/failed takes carry no `interrupted` flag. Backfill it
+        # from the orphan-recovery reason markers in `error` so an existing crash-interrupted batch is
+        # recognised (not user-cancelled / not a genuine failure) by the bulk Restart. Matches the
+        # exact recovery phrases rather than a bare "restart" substring, so a "cannot restart: ..."
+        # unrestartable mark is NOT misread as interrupted. New takes always serialize the field, so
+        # this only runs for legacy files (once, then the value is persisted).
+        if "interrupted" not in d and d.get("status") in (STATUS_CANCELLED, STATUS_FAILED):
+            err = (d.get("error") or "").lower()
+            d["interrupted"] = any(m in err for m in _INTERRUPTED_REASON_MARKERS)
         return Take(**d)
 
     # ---- shots (authoring; set dirty, no immediate persist) -------------

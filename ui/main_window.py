@@ -151,10 +151,11 @@ class MainWindow(QMainWindow):
         self.cancel_act.triggered.connect(self.cancel_pending)
         self.cancel_act.setEnabled(False)
         tb.addAction(self.cancel_act)
-        self.restart_act = QAction("Restart cancelled takes", self)
-        self.restart_act.setToolTip("Re-run every cancelled take from its frozen settings "
-                                    "(same seed + framing). Takes that can't be replayed exactly "
-                                    "are marked failed with a reason")
+        self.restart_act = QAction("Restart interrupted takes", self)
+        self.restart_act.setToolTip("Re-run takes that were cancelled by a crash or by ComfyUI/the "
+                                    "app dying (not ones you cancelled yourself), from their frozen "
+                                    "settings (same seed + framing). Takes that can't be replayed "
+                                    "exactly are marked failed with a reason")
         self.restart_act.triggered.connect(self.restart_cancelled_takes)
         self.restart_act.setEnabled(False)
         tb.addAction(self.restart_act)
@@ -834,20 +835,22 @@ class MainWindow(QMainWindow):
         self._refresh_restart_action()
 
     def _refresh_restart_action(self) -> None:
-        self.restart_act.setEnabled(self._cancelled_take_count() > 0)
+        self.restart_act.setEnabled(self._interrupted_take_count() > 0)
 
-    def _cancelled_take_count(self) -> int:
+    def _interrupted_take_count(self) -> int:
         return sum(1 for t in self.project.list_takes(include_deleted=False)
-                   if t.status == STATUS_CANCELLED)
+                   if t.interrupted and t.status in (STATUS_CANCELLED, STATUS_FAILED))
 
-    # ---- restart cancelled takes ---------------------------------------
+    # ---- restart interrupted takes -------------------------------------
     def restart_cancelled_takes(self) -> None:
-        """Re-run every cancelled take in the project (ignoring the view filters, like Cancel
-        pending). Exact-restartable takes replay in place from their snapshot; the rest are
-        marked failed with a reason."""
-        cancelled = [t for t in self.project.list_takes(include_deleted=False)
-                     if t.status == STATUS_CANCELLED]
-        self._restart_takes(cancelled)
+        """Re-run every INTERRUPTED take in the project (ignoring the view filters, like Cancel
+        pending). These are takes a crash / ComfyUI-or-app death cut short - cancelled before they
+        ran, or failed because their in-flight render was lost to the restart. Ones the user
+        deliberately cancelled, and genuine render failures, are left alone. Exact-restartable
+        takes replay in place from their snapshot; the rest are marked failed with a reason."""
+        interrupted = [t for t in self.project.list_takes(include_deleted=False)
+                       if t.interrupted and t.status in (STATUS_CANCELLED, STATUS_FAILED)]
+        self._restart_takes(interrupted)
 
     def _restart_takes_by_ids(self, ids: list) -> None:
         """Restart just the given takes (the takes-grid context-menu entry). Non-cancelled ids
@@ -858,7 +861,7 @@ class MainWindow(QMainWindow):
 
     def _restart_takes(self, takes: list) -> None:
         if not takes:
-            QMessageBox.information(self, "Restart", "No cancelled takes to restart.")
+            QMessageBox.information(self, "Restart", "No interrupted takes to restart.")
             return
         plan = restart.plan_restart(
             takes, model_of_id=library.get_model, est_of=library.estimate_cost,
@@ -880,14 +883,14 @@ class MainWindow(QMainWindow):
             # exactly. Confirm before flipping CANCELLED->FAILED so the click stays backable-out.
             if QMessageBox.question(
                     self, "Restart",
-                    f"None of the {len(plan.unrestartable)} cancelled take(s) can be restarted "
+                    f"None of the {len(plan.unrestartable)} interrupted take(s) can be restarted "
                     f"exactly:\n\n{detail}\n\nMark them failed?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                 return
         for take, reason in plan.unrestartable:
             self.project.update_take(take.id, status=STATUS_FAILED,
-                                     error=f"cannot restart: {reason}")
+                                     error=f"cannot restart: {reason}", interrupted=False)
             self._refresh_shot_for_take(take.id)
         self._log(f"restart: {len(plan.restartable)} re-queued, "
                   f"{len(plan.unrestartable)} marked failed")
@@ -911,7 +914,8 @@ class MainWindow(QMainWindow):
         synth = self._shot_from_snapshot(take.shot_id, snap)
         self.project.update_take(
             take.id, status=STATUS_PENDING, error=None, started=None, completed=None,
-            video_path=None, thumbnail=None, preview_gif=None, cost_actual=None)
+            video_path=None, thumbnail=None, preview_gif=None, cost_actual=None,
+            interrupted=False)   # re-queued fresh; no longer an interruption
         self.jobs.restart_take(take.id, model["backend"],
                                self._make_runner(model, synth, settings, take.id))
         self._log(f"restarting {take.id[:8]} ({self._take_label(take)})")
@@ -1180,9 +1184,11 @@ class MainWindow(QMainWindow):
             counts: Counter = Counter()           # and no worker is live, so clear every orphan
             for p in recovery.plan_offline_recovery(orphans):
                 if p.action == recovery.CANCEL:
-                    proj.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason)
+                    proj.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason,
+                                     interrupted=True)   # crash/app-death, not a user cancel
                 else:                             # FAIL - generating take lost to the restart
-                    proj.update_take(p.take_id, status=STATUS_FAILED, error=p.reason)
+                    proj.update_take(p.take_id, status=STATUS_FAILED, error=p.reason,
+                                     interrupted=True)   # lost render, restartable from snapshot
                 counts[p.action] += 1
                 self._refresh_shot(p.shot_id)
             parts = []
@@ -1221,9 +1227,11 @@ class MainWindow(QMainWindow):
                 self.jobs.enqueue(p.take_id, "comfyui",
                                   self._make_monitor_runner(p.take_id, p.prompt_id))
             elif p.action == recovery.FAIL:
-                self.project.update_take(p.take_id, status=STATUS_FAILED, error=p.reason)
+                self.project.update_take(p.take_id, status=STATUS_FAILED, error=p.reason,
+                                         interrupted=True)   # render lost to app restart, restartable
             elif p.action == recovery.CANCEL:
-                self.project.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason)
+                self.project.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason,
+                                         interrupted=True)   # crash/app-death, not a user cancel
             counts[p.action] += 1
             self._log(f"orphan {p.take_id[:8]}: {p.reason}")
             self._refresh_shot(p.shot_id)
