@@ -431,20 +431,26 @@ class Project:
 
     def _load_shot_stars(self) -> None:
         """Apply shot stars from the write-through sidecar (authoritative when present).
-        When it's absent, migrate any legacy `starred` flags carried in the .animproj into
-        the sidecar so it becomes the source of truth going forward."""
+        When it's absent - or present but unreadable - migrate any legacy `starred` flags
+        carried in the .animproj into the sidecar so it becomes the source of truth going
+        forward. The unreadable case MUST re-materialize too: _shot_to_dict strips `starred`
+        from the .animproj, so leaving a corrupt sidecar in place would let the next ordinary
+        Save silently drop the legacy stars for good (the in-memory flags are their only copy)."""
         sidecar = self._assets_dir / "shot_stars.json"
+        starred = None
         if sidecar.exists():
             try:
                 doc = json.loads(sidecar.read_text(encoding="utf-8"))
                 starred = set(doc.get("starred", []))
             except (OSError, ValueError):
-                return                              # unreadable -> leave the in-memory flags as
-                                                    # loaded (legacy .animproj stars, if any)
+                starred = None                      # present but unreadable -> fall through to
+                                                    # the migration branch below
+        if starred is not None:
             for shot in self._shots.values():
                 shot.starred = shot.id in starred
         elif any(s.starred for s in self._shots.values()):
-            self._write_shot_stars_file()           # legacy .animproj stars -> migrate
+            self._write_shot_stars_file()           # legacy .animproj stars OR an unreadable
+                                                    # sidecar -> (re)materialize from in-memory flags
 
     def used_model_ids(self) -> list[str]:
         """Distinct model_ids across shots - powers the 'filter by model' dropdown."""
