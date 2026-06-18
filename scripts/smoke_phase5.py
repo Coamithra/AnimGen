@@ -24,12 +24,12 @@ import paths  # noqa: E402
 
 paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
 
-from pipeline import export  # noqa: E402
+from pipeline import export, extract  # noqa: E402
 from store.project import Project  # noqa: E402
 from store.models import STATUS_DONE, STATUS_FAILED, STATUS_PENDING  # noqa: E402
 
 
-def _make_mp4(path: Path, n: int = 5) -> None:
+def _make_mp4(path: Path, n: int = 5) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     codec = "mpeg4"
     container = av.open(str(path), mode="w")
@@ -43,6 +43,7 @@ def _make_mp4(path: Path, n: int = 5) -> None:
     for pkt in stream.encode():
         container.mux(pkt)
     container.close()
+    return path
 
 
 def test_export() -> None:
@@ -80,6 +81,28 @@ def test_export() -> None:
     res3 = export.export_takes(project, [r3.id], dest_root=dest)
     assert res3["parent"] is None and r3.id in res3["skipped"]
     print("export OK: single(flat)/multi(subfolders)/skipped, settings.txt snapshot")
+
+
+def test_extract_frames_wide_padding() -> None:
+    """Frame filenames zero-pad to a width derived from the true decoded frame count, so a
+    lexicographic sort always equals frame order. A flat {i:03d} pad scrambled takes past
+    999 frames (frame_1000 sorting before frame_999); a take whose top index reaches 1000
+    now widens to 4 digits, while a short take keeps the historic 3-digit floor."""
+    tmp = Path(tempfile.mkdtemp())
+
+    # Short take: the 3-digit floor is preserved (frame_000.png, the historic look).
+    short_names = [p.name for p in extract.extract_frames(_make_mp4(tmp / "short.mp4", 5),
+                                                           tmp / "short_frames")]
+    assert short_names[0] == "frame_000.png", short_names[0]
+
+    # A take whose top index reaches 1000 widens to 4 digits so the sort holds.
+    paths = extract.extract_frames(_make_mp4(tmp / "long.mp4", 1001), tmp / "long_frames")
+    assert len(paths) == 1001, len(paths)
+    names = [p.name for p in paths]             # returned in frame order (0..1000)
+    assert names[0] == "frame_0000.png" and names[-1] == "frame_1000.png", (names[0], names[-1])
+    assert len({len(n) for n in names}) == 1, "padding must be fixed-width across all frames"
+    assert names == sorted(names), "lexicographic sort must equal frame order"
+    print("extract_frames OK: pad width tracks frame count (3-digit floor, 4 digits past 999)")
 
 
 def test_window_builds() -> None:
@@ -368,6 +391,51 @@ def test_tab_state_persists_on_close() -> None:
     print("MainWindow OK: clean-close persists layout; no-change/untitled/Discard write nothing")
 
 
+def test_tab_state_blank_tab_preserves_active() -> None:
+    """Focusing a pristine unsaved blank shot tab (+ New Shot -> new_shot, never registered
+    in shot_tabs so it maps to no descriptor) must not wipe the remembered active tab.
+    _compute_tab_state re-points active at the prior descriptor, so a clean close keeps the
+    on-disk active (Assets) instead of downgrading it to None/Shots (card #65)."""
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "blank.animproj"
+    project = Project.new()
+    project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+    project.save_as(path)
+
+    # Save with Assets active so the remembered active is a non-default (non-Shots) tab.
+    win = MainWindow(project)
+    win.tabs.setCurrentWidget(win.assets_tab)
+    assert win.save_project()
+    assets_idx = next(i for i, e in enumerate(win.project.ui_state["tabs"])
+                      if e == {"kind": "fixed", "key": "Assets"})
+    assert win.project.ui_state["active"] == assets_idx, "sanity: Assets recorded active"
+
+    # Reopen (restores Assets active), then open a blank shot tab -> it takes focus but is
+    # unregistered, so _compute_tab_state can't represent it as a descriptor.
+    w2 = MainWindow(Project.load(path))
+    assert w2.tabs.currentWidget() is w2.assets_tab, "restored on Assets"
+    w2.new_shot()
+    blank = w2.tabs.currentWidget()
+    assert isinstance(blank, ShotTab) and blank not in w2.shot_tabs.values(), \
+        "+ New Shot focuses a pristine, unregistered blank shot tab"
+    assert not w2._has_unsaved_edits(), "a pristine blank tab is not an unsaved edit"
+    state = w2._compute_tab_state()
+    assert state["active"] is not None, "blank-tab focus must not null the active"
+    assert state["tabs"][state["active"]] == {"kind": "fixed", "key": "Assets"}, state
+
+    # A clean close persists that preserved active, so reopening lands on Assets, not Shots.
+    w2.closeEvent(QCloseEvent())
+    w3 = MainWindow(Project.load(path))
+    assert w3.tabs.currentWidget() is w3.assets_tab, "reopens on Assets, not Shots (regression)"
+    print("MainWindow OK: focusing a pristine blank shot tab preserves the remembered active")
+
+
 def test_format_generation_settings() -> None:
     """The take-viewer settings formatter renders a full snapshot and degrades cleanly."""
     from store.models import Take
@@ -431,6 +499,56 @@ def test_snapshot_includes_framing() -> None:
     assert snap["canvas"] == [1254, 704], snap.get("canvas")
     assert snap["crop"] == crop, snap.get("crop")
     print("MainWindow OK: snapshot carries canvas + crop framing")
+
+
+def test_generate_shot_missing_shot() -> None:
+    """generate_shot is fed a deleted/unknown shot_id (generate_requested is a queued
+    signal; the shot can vanish between emit and slot). Both guards - the top-level one
+    and the one after the keyframe picker reloads the shot - must bail quietly: no
+    AttributeError, no launch (_queue_take never reached), the cost gate never shown."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui import main_window
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    project.save_as(Path(tempfile.mkdtemp()) / "p.animproj")
+    win = MainWindow(project)
+
+    gate_shown, queued = [], []
+    orig_confirm = main_window.confirm_launch
+    main_window.confirm_launch = lambda *a, **k: gate_shown.append(True) or True
+    win._queue_take = lambda *a, **k: queued.append(True)   # records any launch attempt
+    try:
+        # (a) top guard: an id that never existed, and one deleted between emit and slot.
+        win.generate_shot("never-existed")
+        ghost = project.add_shot("ghost", model_id="seedance-2.0-std", prompt="p")
+        project.delete_shot(ghost.id)
+        win.generate_shot(ghost.id)
+
+        # (b) picker-reload guard: a shot with no start_frame, deleted while the keyframe
+        # picker is open, so the re-fetch after import_asset returns None (line ~665).
+        shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+        orig_qfd, orig_import = main_window.QFileDialog, project.import_asset
+
+        class _PickerThenDelete:
+            @staticmethod
+            def getOpenFileName(*a, **k):
+                project.delete_shot(shot.id)        # vanishes while the dialog is open
+                return ("frame.png", "")
+        main_window.QFileDialog = _PickerThenDelete
+        project.import_asset = lambda src: Path("frame.png")   # no real file needed
+        try:
+            win.generate_shot(shot.id)
+        finally:
+            main_window.QFileDialog, project.import_asset = orig_qfd, orig_import
+    finally:
+        main_window.confirm_launch = orig_confirm
+
+    assert not gate_shown, "cost gate must never be shown for a missing shot"
+    assert not queued, "no launch (_queue_take) for a missing shot"
+    print("MainWindow OK: generate_shot on a missing/deleted shot is a quiet no-op (both guards)")
 
 
 def test_take_player_settings_panel() -> None:
@@ -599,13 +717,16 @@ def test_run_survives_deleted_signals() -> None:
 
 if __name__ == "__main__":
     test_export()
+    test_extract_frames_wide_padding()
     test_window_builds()
     test_close_dirty_tab_guard()
     test_tab_state_persistence()
     test_tab_state_active_survives_skip()
     test_tab_state_persists_on_close()
+    test_tab_state_blank_tab_preserves_active()
     test_format_generation_settings()
     test_snapshot_includes_framing()
+    test_generate_shot_missing_shot()
     test_take_player_settings_panel()
     test_runner_self_cancel_during_submit()
     test_run_survives_deleted_signals()

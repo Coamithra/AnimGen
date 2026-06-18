@@ -129,8 +129,9 @@ def resolve_target(
     object_name: Optional[str] = None,
     text: Optional[str] = None,
 ) -> Optional[QWidget]:
-    """Find a widget by objectName, ref (objectName or ``Class:ordinal``), or visible text
-    (exact first, then case-insensitive substring)."""
+    """Find a widget by objectName, ref (objectName or ``Class:ordinal``), or visible text.
+    The text path prefers visible widgets, then within each visibility group matches exact
+    before case-insensitive substring."""
     if object_name:
         w = window.findChild(QWidget, object_name)
         if w:
@@ -151,12 +152,20 @@ def resolve_target(
         if not want:  # whitespace-only would otherwise substring-match every widget
             return None
         relevant = [w for w in window.findChildren(QWidget) if _is_relevant(w)]
-        for w in relevant:
-            if _widget_text(w).strip() == want:
-                return w
-        for w in relevant:
-            if want.lower() in _widget_text(w).strip().lower():
-                return w
+        # Prefer visible candidates (matching build_snapshot's visibility gate): run the full
+        # exact-then-substring match within the visible widgets before falling back to hidden
+        # ones, so a /click by text lands on the on-screen control rather than a hidden
+        # duplicate on an inactive tab. A hidden match is returned only when no visible widget
+        # matches at all.
+        visible = [w for w in relevant if w.isVisible()]
+        hidden = [w for w in relevant if not w.isVisible()]
+        for group in (visible, hidden):
+            for w in group:
+                if _widget_text(w).strip() == want:
+                    return w
+            for w in group:
+                if want.lower() in _widget_text(w).strip().lower():
+                    return w
     return None
 
 
