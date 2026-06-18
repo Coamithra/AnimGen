@@ -153,8 +153,13 @@ There is no typecheck/build gate (Pyright flags `from store…/from ui…` as un
 16. **Run the headless smoke suite** — all seven phases must pass:
     ```
     for n in 1 2 3 4 5 6 7; do QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
-      .venv/Scripts/python.exe scripts/smoke_phase$n.py; done
+      .venv/Scripts/python.exe scripts/smoke_phase$n.py; rc=$?; \
+      [ $rc -eq 0 ] || { echo "PHASE $n FAILED (exit $rc)"; break; }; done
     ```
+    **Gate on the EXIT CODE, not the "PASS" line.** A teardown segfault *after* a phase prints
+    PASS still exits non-zero (139); the bare loop hides it because it doesn't check `$?` (this
+    is exactly how card #78's phase-5 exit-time segfault slipped through). The `rc=$?` check
+    above catches it.
     (From a worktree, phase 6 needs the real Fighter root — prefix `ANIMGEN_FIGHTER_ROOT=C:/Programming/Fighter`, since the default `../Fighter` resolves under `.trees/` instead.)
     Add or extend a smoke phase for the behaviour you changed. Smoke tests must stay headless — never call a modal's `.exec()`, and override `paths.SCRATCH_DIR` to a tempdir so untitled-project scratch stays out of `data/`
 17. **Manual smoke for UI / pipeline changes** — smoke tests don't cover everything:

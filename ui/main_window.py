@@ -1629,6 +1629,7 @@ class MainWindow(QMainWindow):
         if self._remote is not None:
             self._remote.stop()
         self.comfy_tab.stop_monitoring()
+        self.library_tab.stop_fetch()   # stop the off-thread schema fetch before teardown
         super().closeEvent(event)
 
     # ---- job signal handlers -------------------------------------------
