@@ -26,7 +26,7 @@ paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch ou
 
 from pipeline import export  # noqa: E402
 from store.project import Project  # noqa: E402
-from store.models import STATUS_DONE, STATUS_PENDING  # noqa: E402
+from store.models import STATUS_DONE, STATUS_FAILED, STATUS_PENDING  # noqa: E402
 
 
 def _make_mp4(path: Path, n: int = 5) -> None:
@@ -443,6 +443,86 @@ def test_runner_self_cancel_during_submit() -> None:
     print("runner self-cancel OK: real on_submit cancels during create-POST window")
 
 
+def test_run_survives_deleted_signals() -> None:
+    """A worker that emits after its _JobSignals C++ object was deleted out from under it
+    (project / JobManager churn while a render is mid-flight) must NOT abort the process.
+    GenerationJob._emit guards every emit, so a deleted source degrades to a dropped signal
+    and run() still records the take terminally via write-through. Regression for the
+    RuntimeError('Signal source has been deleted') -> C++ std::terminate crash (card #48)."""
+    import shiboken6
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import GenerationJob, _JobSignals
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_PENDING,
+                            settings_snapshot={"backend": "replicate"})
+
+    signals = _JobSignals()
+    done = []
+
+    def runner(progress):
+        progress("rendering", frac=0.5, label="step")  # emits while the source is still alive
+        shiboken6.delete(signals)                      # tear down the C++ signals mid-render
+        assert not shiboken6.isValid(signals)
+        return {"video_path": "out.mp4"}
+
+    job = GenerationJob(project, take.id, "replicate", runner, signals,
+                        set(), set(), set(), lambda tid, st: done.append((tid, st)))
+    job.run()                                          # the DONE/finished emits hit a dead source
+
+    got = project.get_take(take.id)
+    assert got.status == STATUS_DONE, got.status       # take recorded despite dead signals
+    assert got.video_path == "out.mp4", got.video_path
+    assert done == [(take.id, STATUS_DONE)], done      # finally still ran done_cb
+
+    # Failure path: the runner raises *after* the signals die, so the except-branch emits
+    # (status_changed->FAILED + failed) also hit a dead source and must no-op.
+    take2 = project.add_take(shot.id, status=STATUS_PENDING,
+                             settings_snapshot={"backend": "replicate"})
+    signals2 = _JobSignals()
+    done2 = []
+
+    def failing_runner(progress):
+        shiboken6.delete(signals2)
+        raise RuntimeError("backend boom")
+
+    job2 = GenerationJob(project, take2.id, "replicate", failing_runner, signals2,
+                         set(), set(), set(), lambda tid, st: done2.append((tid, st)))
+    job2.run()
+    got2 = project.get_take(take2.id)
+    assert got2.status == STATUS_FAILED, got2.status   # failure recorded despite dead signals
+    assert done2 == [(take2.id, STATUS_FAILED)], done2
+
+    # Early-transition failure (review finding #1): if the GENERATING-write itself blows up
+    # before the inner try/finally, run()'s wrapper must still fire done_cb so the queue slot
+    # is freed rather than leaked.
+    take3 = project.add_take(shot.id, status=STATUS_PENDING,
+                             settings_snapshot={"backend": "replicate"})
+    done3 = []
+    orig_update = project.update_take
+    calls = {"n": 0}
+
+    def flaky_update(take_id, **fields):
+        if take_id == take3.id and calls["n"] == 0:    # blow up the GENERATING transition
+            calls["n"] += 1
+            raise RuntimeError("disk full")
+        return orig_update(take_id, **fields)
+
+    project.update_take = flaky_update
+    try:
+        job3 = GenerationJob(project, take3.id, "replicate", lambda p: {}, _JobSignals(),
+                             set(), set(), set(), lambda tid, st: done3.append((tid, st)))
+        job3.run()                                     # must not raise; must free the slot
+    finally:
+        project.update_take = orig_update
+    assert done3 == [(take3.id, STATUS_FAILED)], done3  # slot freed despite early crash
+
+    print("run survives deleted _JobSignals OK: emits no-op, take recorded, slot freed on early fail")
+
+
 if __name__ == "__main__":
     test_export()
     test_window_builds()
@@ -453,4 +533,5 @@ if __name__ == "__main__":
     test_snapshot_includes_framing()
     test_take_player_settings_panel()
     test_runner_self_cancel_during_submit()
+    test_run_survives_deleted_signals()
     print("PHASE 5 SMOKE: PASS")
