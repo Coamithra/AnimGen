@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -32,6 +33,15 @@ COMFY_OUTPUT_DIR = COMFY_DIR / "output"
 # A progress callback takes either progress(line) for a milestone log line, or
 # progress(frac=.., label=..) for a 0..1 completion fraction (the WS step progress below).
 ProgressCb = Optional[Callable[..., None]]
+
+# Diagnostics for the best-effort progress WebSocket (suspect in the 2026-06-18 native
+# stack-overflow crash). The listener logs frame telemetry to animgen.log so the tail
+# right before a crash shows what it was doing; ANIMGEN_NO_WS_PROGRESS=1 disables the
+# listener entirely (renders still complete via the /history poll - rule #11) as both a
+# safe escape hatch and a bisection lever (run a batch with it off; if the crash stops,
+# the WS is the culprit).
+_ws_logger = logging.getLogger("animgen.comfy.ws")
+_WS_TELEMETRY_S = 30.0          # how often the listener logs a frame-count summary
 
 
 class ComfyError(RuntimeError):
@@ -692,7 +702,7 @@ def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressC
     Any failure (no websocket-client, server without /ws, dropped socket) is swallowed - the
     /history poll in submit() still drives the render to completion, just without a live bar.
     """
-    if progress_cb is None:
+    if progress_cb is None or os.environ.get("ANIMGEN_NO_WS_PROGRESS"):
         return
     try:
         import websocket  # websocket-client; optional dependency, best-effort
@@ -701,9 +711,16 @@ def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressC
     ws_url = (COMFY_URL.replace("https://", "wss://").replace("http://", "ws://")
               + f"/ws?clientId={client_id}")
     ws = None
+    # Telemetry: if this listener is implicated in a crash, these counts in animgen.log
+    # right before the gap show whether it was flooded (e.g. huge/rapid binary preview
+    # frames) - the kind of load that could blow a native stack. Cheap; logged every
+    # _WS_TELEMETRY_S and once on exit.
+    n_text = n_bin = bytes_total = max_frame = 0
+    last_log = time.time()
     try:
         ws = websocket.create_connection(ws_url, timeout=5)
         ws.settimeout(1.0)
+        _ws_logger.info("ws progress: connected prompt=%s", str(prompt_id)[:8])
         while not stop.is_set():
             try:
                 raw = ws.recv()
@@ -711,21 +728,35 @@ def _ws_progress_listener(client_id: str, prompt_id: str, progress_cb: ProgressC
                 continue             # tick so we can re-check stop
             except Exception:
                 break
+            size = len(raw) if raw is not None else 0
+            bytes_total += size
+            max_frame = max(max_frame, size)
             if not isinstance(raw, str) or not raw:
-                continue             # skip binary frames (preview images in practice)
-            try:
-                msg = json.loads(raw)
-            except (ValueError, TypeError):
-                continue
-            frac, label = progress_fraction(msg, prompt_id, plan)
-            if frac is not None:
+                n_bin += 1           # skip binary frames (preview images in practice)
+            else:
+                n_text += 1
                 try:
-                    progress_cb(frac=frac, label=label)
-                except Exception:
-                    pass
-    except Exception:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    msg = None
+                if msg is not None:
+                    frac, label = progress_fraction(msg, prompt_id, plan)
+                    if frac is not None:
+                        try:
+                            progress_cb(frac=frac, label=label)
+                        except Exception:
+                            pass
+            now = time.time()
+            if now - last_log >= _WS_TELEMETRY_S:
+                _ws_logger.info("ws progress: text=%d bin=%d bytes=%d maxframe=%d",
+                                n_text, n_bin, bytes_total, max_frame)
+                last_log = now
+    except Exception as e:  # noqa: BLE001 - best-effort; never propagate
+        _ws_logger.info("ws progress: listener error %r", e)
         return
     finally:
+        _ws_logger.info("ws progress: done text=%d bin=%d bytes=%d maxframe=%d",
+                        n_text, n_bin, bytes_total, max_frame)
         if ws is not None:
             try:
                 ws.close()
@@ -743,6 +774,9 @@ def _start_progress_ws(client_id: Optional[str], prompt_id: str,
     multi-stage sampler chain onto one continuous step count.
     """
     if progress_cb is None or not client_id:
+        return None, None
+    if os.environ.get("ANIMGEN_NO_WS_PROGRESS"):   # bisection lever / escape hatch (rule #11)
+        _ws_logger.info("ws progress: disabled via ANIMGEN_NO_WS_PROGRESS")
         return None, None
     stop = threading.Event()
     t = threading.Thread(target=_ws_progress_listener,
