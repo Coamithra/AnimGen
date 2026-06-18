@@ -55,10 +55,11 @@ class ShotTab(QWidget):
     restart_requested = Signal(list)   # cancelled take ids -> re-run them
     dirty_changed = Signal()          # this tab's unsaved-edits state flipped
 
-    def __init__(self, project: Project, shot=None, parent=None):
+    def __init__(self, project: Project, shot=None, parent=None, jobs=None):
         super().__init__(parent)
         self.project = project
         self.shot = shot
+        self.jobs = jobs
         self._schema: Optional[dict] = None
         self._param_getters: dict[str, Callable] = {}
         self._takes_view: Optional[TakesView] = None
@@ -308,7 +309,7 @@ class ShotTab(QWidget):
     def _ensure_takes_view(self) -> None:
         if self._takes_view is None and self.shot is not None:
             self._takes_placeholder.hide()
-            self._takes_view = TakesView(self.project, self.shot.id)
+            self._takes_view = TakesView(self.project, self.shot.id, jobs=self.jobs)
             self._takes_view.export_requested.connect(self.export_requested)
             self._takes_view.open_take_requested.connect(self.open_take_requested)
             self._takes_view.restart_requested.connect(self.restart_requested)

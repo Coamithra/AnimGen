@@ -58,6 +58,29 @@ def preview_height(icon_size: int, rows: float = _MAX_PREVIEW_ROWS) -> int:
     return round(grid_h * rows) + round(_VIEW_SPACING * (rows + 1)) + _VIEW_FRAME_PAD
 
 
+def progress_percent(frac: float) -> str:
+    """Compact percentage string for a take's render fraction, e.g. 0.45 -> "45%". Clamped
+    to [0,1] first. Pure so it's unit-testable headlessly."""
+    return f"{round(max(0.0, min(1.0, frac)) * 100)}%"
+
+
+def take_tile_label(status: str, starred: bool, take_id: str, pct: str = "") -> str:
+    """Label under a take's grid tile: an optional star, a status badge, and a tail.
+
+    A still-generating take whose live render fraction is known shows that percent (`pct`,
+    the same number the Queue tab's progress bar reports) in place of the bare "generating"
+    word; everything else is unchanged. Pure so it's unit-testable headlessly."""
+    badge = _BADGE.get(status, "")
+    star = "★ " if starred else ""
+    if status == "generating":
+        tail = f"  {pct}" if pct else f"  {status}"
+    elif status == "done":
+        tail = ""
+    else:
+        tail = f"  {status}"
+    return f"{star}{badge}{tail}".strip() or take_id[:6]
+
+
 def columns_for(viewport_width: int, icon_size: int) -> int:
     """How many grid cells fit across a viewport `viewport_width` px wide. Returns 0 when the
     width isn't known yet (view not laid out / headless), signalling 'can't tell'. Pure."""
@@ -152,10 +175,12 @@ class TakesView(QWidget):
     open_take_requested = Signal(str)  # take_id -> open it in the frame-by-frame viewer tab
     restart_requested = Signal(list)   # list[take_id] -> re-run cancelled takes (MainWindow drives it)
 
-    def __init__(self, project: Project, shot_id: str):
+    def __init__(self, project: Project, shot_id: str, jobs=None):
         super().__init__()
         self.project = project
         self.shot_id = shot_id
+        self.jobs = jobs
+        self._latest_pct: dict[str, float] = {}       # take_id -> live render fraction 0..1
         self._items: dict[str, QStandardItem] = {}    # take_id -> grid item (for live frames)
         self._strips: dict[str, list] = {}            # take_id -> list[QPixmap] (decoded loop)
         self._frame_idx: dict[str, int] = {}          # take_id -> current frame in its strip
@@ -168,6 +193,9 @@ class TakesView(QWidget):
         self._anim_timer.timeout.connect(self._tick)
         self._build()
         self.load()
+        if jobs is not None:
+            # Mirror the Queue tab: surface a local render's live % on the generating tile.
+            jobs.progress_pct.connect(self._on_progress_pct)
 
     def _build(self) -> None:
         self.filter = QComboBox()
@@ -218,6 +246,8 @@ class TakesView(QWidget):
     def load(self) -> None:
         fav = self.filter.currentText() == "Favorites"
         takes = self.project.list_takes(self.shot_id, starred_only=fav)
+        live = {t.id for t in takes}                  # drop cached pcts for evicted takes
+        self._latest_pct = {k: v for k, v in self._latest_pct.items() if k in live}
         self._reset_anim()
         self.model.clear()
         self._items.clear()
@@ -307,10 +337,27 @@ class TakesView(QWidget):
         self._apply_height()
 
     def _label(self, t) -> str:
-        badge = _BADGE.get(t.status, "")
-        star = "★ " if t.starred else ""
-        tail = "" if t.status == "done" else f"  {t.status}"
-        return f"{star}{badge}{tail}".strip() or t.id[:6]
+        pct = ""
+        if t.status == "generating":
+            frac = self._latest_pct.get(t.id)
+            if frac is not None:
+                pct = progress_percent(frac)
+        return take_tile_label(t.status, t.starred, t.id, pct)
+
+    def _on_progress_pct(self, take_id: str, frac: float, label: str) -> None:
+        """Live render fraction for a take: relabel just its tile in place (no reload, which
+        would reset the running thumbnail animation). Ignored unless the take is one of ours and
+        still generating — a documented progress_state tail keeps arriving ~20-30s after a local
+        render completes (rule #11) and must not relabel an already-finished tile. `label` (the
+        Queue tab's "step N/M" text) has no surface here, so only the fraction is kept."""
+        item = self._items.get(take_id)
+        if item is None:
+            return                                    # not in this shot's grid (other shot / filtered out)
+        t = self.project.get_take(take_id)
+        if t is None or t.status != "generating":
+            return
+        self._latest_pct[take_id] = frac
+        item.setText(self._label(t))
 
     def _icon_for(self, t) -> QIcon:
         if t.thumbnail and Path(t.thumbnail).exists():

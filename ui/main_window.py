@@ -105,6 +105,7 @@ class MainWindow(QMainWindow):
         self._build_body()
         self._build_menu()
         self.reload()
+        self._restore_tab_state()   # reopen the tabs this project was last saved with
         self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
         self._maybe_refresh_schemas_on_startup()
         self._remote = None
@@ -340,6 +341,7 @@ class MainWindow(QMainWindow):
         self.assets_tab.set_project(project)
         self.queue_tab.set_project(project)
         self.reload()
+        self._restore_tab_state()   # reopen the tabs this project was last saved with
         self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
 
     def _maybe_save_changes(self) -> bool:
@@ -384,6 +386,7 @@ class MainWindow(QMainWindow):
         if self.project.is_untitled:
             return self.save_project_as()
         self._commit_open_shot_tabs()
+        self._capture_tab_state()
         self.project.save()
         self._remember_last()
         self._update_title()
@@ -397,6 +400,7 @@ class MainWindow(QMainWindow):
         if not path:
             return False
         self._commit_open_shot_tabs()
+        self._capture_tab_state()
         self.project.save_as(path)
         self._remember_last()
         self._update_title()
@@ -435,7 +439,7 @@ class MainWindow(QMainWindow):
                 continue
             if starred_only and not self.project.list_takes(shot.id, starred_only=True):
                 continue
-            card = ShotCard(self.project, shot)
+            card = ShotCard(self.project, shot, jobs=self.jobs)
             card.generate_requested.connect(self.generate_shot)
             card.open_requested.connect(self.open_shot)
             card.duplicate_requested.connect(self.duplicate_shot)
@@ -494,7 +498,7 @@ class MainWindow(QMainWindow):
 
     # ---- shot tabs ------------------------------------------------------
     def new_shot(self) -> None:
-        tab = ShotTab(self.project)
+        tab = ShotTab(self.project, jobs=self.jobs)
         self._wire_shot_tab(tab)
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
 
@@ -505,7 +509,7 @@ class MainWindow(QMainWindow):
         shot = self.project.get_shot(shot_id)
         if not shot:
             return
-        tab = ShotTab(self.project, shot=shot)
+        tab = ShotTab(self.project, shot=shot, jobs=self.jobs)
         self._wire_shot_tab(tab)
         self.shot_tabs[shot_id] = tab
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
@@ -1289,6 +1293,93 @@ class MainWindow(QMainWindow):
         if self.tabs.indexOf(widget) < 0:
             self.tabs.addTab(widget, title)
         self.tabs.setCurrentWidget(widget)
+
+    # ---- tab-layout persistence (stored per project in the .animproj) ----
+    def _capture_tab_state(self) -> None:
+        """Snapshot the live tab bar into project.ui_state so a save records the layout.
+        Window metadata, not authoring data - written on save, never sets dirty. Pristine
+        unsaved blank shot tabs (no id yet, not in shot_tabs) are skipped; commit them
+        first via Save. `active` is the index into the captured descriptor list (not a raw
+        tab position) so it survives a later tab being skipped on restore."""
+        fixed_titles = {w: title for w, title in self._fixed_tabs}
+        shot_id_by_tab = {t: sid for sid, t in self.shot_tabs.items()}
+        active_widget = self.tabs.currentWidget()
+        entries: list[dict] = []
+        active: Optional[int] = None
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            entry: Optional[dict] = None
+            if w in fixed_titles:
+                entry = {"kind": "fixed", "key": fixed_titles[w]}
+            elif isinstance(w, ShotTab):
+                sid = shot_id_by_tab.get(w)
+                if sid:
+                    entry = {"kind": "shot", "id": sid}
+            elif isinstance(w, TakePlayerTab):
+                entry = {"kind": "take", "id": w.take_id}
+            if entry is None:
+                continue
+            if w is active_widget:
+                active = len(entries)
+            entries.append(entry)
+        self.project.ui_state = {"tabs": entries, "active": active}
+
+    def _restore_tab_state(self) -> None:
+        """Rebuild the tab bar from the project's saved layout (or the default full set of
+        fixed tabs when there's none). Detaching first keeps the fixed-tab widgets alive
+        (removeTab doesn't delete them); shot/take tabs are reopened by id, skipping any
+        that no longer exist. Signals are blocked during the rebuild so _on_tab_changed
+        (which toggles comfy polling) fires once at the end against the settled tab bar,
+        not on every intermediate add/remove."""
+        state = self.project.ui_state or {}
+        desc = state.get("tabs")
+        self.tabs.blockSignals(True)
+        try:
+            while self.tabs.count():
+                self.tabs.removeTab(0)
+            built: list = []
+            if isinstance(desc, list):
+                built = self._apply_tab_descriptors(desc)
+            else:
+                for widget, title in self._fixed_tabs:   # default: all fixed tabs, original order
+                    self.tabs.addTab(widget, title)
+            if self.tabs.count() == 0:                    # never leave an empty tab bar: Shots always wins
+                w, t = self._fixed_tabs[0]
+                self.tabs.addTab(w, t)
+            active = state.get("active")
+            target = built[active] if isinstance(active, int) and 0 <= active < len(built) else None
+            if target is not None and self.tabs.indexOf(target) >= 0:
+                self.tabs.setCurrentWidget(target)
+            else:
+                self.tabs.setCurrentIndex(0)
+        finally:
+            self.tabs.blockSignals(False)
+        self._on_tab_changed(self.tabs.currentIndex())   # one settled sync (comfy polling etc.)
+
+    def _apply_tab_descriptors(self, desc: list) -> list:
+        """Re-add tabs in saved order; return the widget built for each descriptor (None
+        where it was skipped) so the caller can map the saved active index back to a widget."""
+        fixed_by_key = {title: w for w, title in self._fixed_tabs}
+        built: list = []
+        for entry in desc:
+            w = None
+            if isinstance(entry, dict):
+                kind = entry.get("kind")
+                if kind == "fixed":
+                    fw = fixed_by_key.get(entry.get("key"))
+                    if fw is not None and self.tabs.indexOf(fw) < 0:
+                        self.tabs.addTab(fw, entry.get("key"))
+                        w = fw
+                elif kind == "shot":
+                    sid = entry.get("id")
+                    self.open_shot(sid)              # no-op on a missing/already-open shot
+                    w = self.shot_tabs.get(sid)
+                elif kind == "take":
+                    tid = entry.get("id")
+                    self.open_take(tid)              # no-op on a missing/already-open take
+                    w = self.take_tabs.get(tid)
+            built.append(w)
+        return built
 
     def _maybe_close_shot_tab(self, tab: ShotTab) -> bool:
         """Confirm before closing a shot tab that has uncommitted editor edits. Returns

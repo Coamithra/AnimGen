@@ -26,7 +26,7 @@ paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch ou
 
 from pipeline import export  # noqa: E402
 from store.project import Project  # noqa: E402
-from store.models import STATUS_DONE, STATUS_PENDING  # noqa: E402
+from store.models import STATUS_DONE, STATUS_FAILED, STATUS_PENDING  # noqa: E402
 
 
 def _make_mp4(path: Path, n: int = 5) -> None:
@@ -191,6 +191,109 @@ def test_close_dirty_tab_guard() -> None:
     print("MainWindow OK: close-dirty-tab guard (clean/Cancel/Discard/Save)")
 
 
+def test_tab_state_persistence() -> None:
+    """Closing/opening tabs is captured into project.ui_state on save and rebuilt on the
+    next open: closed fixed tabs stay closed, open shot tabs reopen, order + active tab are
+    preserved, and a descriptor for a since-deleted shot is skipped (no crash). A project
+    with no saved layout builds the default full fixed-tab set."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "tabs.animproj"
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+    project.save_as(path)
+
+    win = MainWindow(project)
+    assert win.tabs.count() == 5, "default layout shows every fixed tab"
+
+    # Close Assets + Model Library, open the shot tab, focus it, then Save.
+    win._on_tab_close(win.tabs.indexOf(win.assets_tab))
+    win._on_tab_close(win.tabs.indexOf(win.library_tab))
+    win.open_shot(shot.id)
+    shot_tab = win.shot_tabs[shot.id]
+    win.tabs.setCurrentWidget(shot_tab)
+    assert win.save_project(), "titled save succeeds (no dialog)"
+
+    layout = win.project.ui_state["tabs"]
+    keys = [(e["kind"], e.get("key") or e.get("id")) for e in layout]
+    assert keys == [("fixed", "Shots"), ("fixed", "Queue"),
+                    ("fixed", "ComfyUI Status"), ("shot", shot.id)], keys
+    assert win.project.ui_state["active"] == win.tabs.indexOf(shot_tab)
+
+    # Reopen from disk in a fresh window: the layout (closed fixed tabs, reopened shot tab,
+    # order, active) is rebuilt.
+    reopened = Project.load(path)
+    win2 = MainWindow(reopened)
+    titles = [win2.tabs.tabText(i) for i in range(win2.tabs.count())]
+    assert titles == ["Shots", "Queue", "ComfyUI Status", "kick"], titles
+    assert win2.tabs.indexOf(win2.assets_tab) < 0, "closed Assets tab stays closed"
+    assert win2.tabs.indexOf(win2.library_tab) < 0, "closed Model Library tab stays closed"
+    assert shot.id in win2.shot_tabs, "the open shot tab was reopened"
+    assert isinstance(win2.tabs.currentWidget(), ShotTab), "active tab restored to the shot"
+
+    # A descriptor that points at a since-deleted shot is silently skipped (no crash).
+    reopened.delete_shot(shot.id)
+    reopened.save()
+    win3 = MainWindow(Project.load(path))
+    assert shot.id not in win3.shot_tabs, "deleted-shot descriptor produces no tab"
+    titles3 = [win3.tabs.tabText(i) for i in range(win3.tabs.count())]
+    assert titles3 == ["Shots", "Queue", "ComfyUI Status"], titles3
+
+    # A project with no saved ui_state falls back to the full default fixed-tab set.
+    fresh = Project.new()
+    fresh.add_shot("x", model_id="seedance-2.0-std")
+    win4 = MainWindow(fresh)
+    assert win4.tabs.count() == 5 and win4.tabs.tabText(0) == "Shots"
+    print("MainWindow OK: open-tab layout captured on save + restored on open")
+
+
+def test_tab_state_active_survives_skip() -> None:
+    """The saved active tab is restored by identity, not raw tab position, so deleting an
+    earlier tab's shot doesn't drift focus onto the wrong tab. Also exercises the take-tab
+    descriptor round-trip (the 'take' kind, untested by the layout test above)."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.take_player import TakePlayerTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "active.animproj"
+    project = Project.new()
+    a = project.add_shot("aaa", model_id="seedance-2.0-std")
+    b = project.add_shot("bbb", model_id="seedance-2.0-std")
+    take = project.add_take(a.id, status=STATUS_DONE)   # no video -> no decode thread
+    project.save_as(path)
+
+    win = MainWindow(project)
+    win.open_shot(a.id)
+    win.open_shot(b.id)
+    win.open_take(take.id)                 # tab order: ...fixed..., a, b, take
+    win.tabs.setCurrentWidget(win.shot_tabs[b.id])   # active is a NON-last tab
+    assert win.save_project()
+
+    # Reopen everything intact: the take viewer tab round-trips and focus lands on b.
+    w2 = MainWindow(Project.load(path))
+    assert take.id in w2.take_tabs and isinstance(w2.take_tabs[take.id], TakePlayerTab)
+    assert a.id in w2.shot_tabs and b.id in w2.shot_tabs
+    assert w2.tabs.currentWidget() is w2.shot_tabs[b.id], "active restored to shot b"
+
+    # Delete shot a (an EARLIER descriptor than the active one) + its take, then reopen.
+    # Position-based restore would now mis-point or fall back to Shots; identity-based
+    # restore must keep focus on b.
+    reop = Project.load(path)
+    reop.delete_shot(a.id)
+    reop.save()
+    w3 = MainWindow(Project.load(path))
+    assert a.id not in w3.shot_tabs, "deleted shot a is not reopened"
+    assert take.id not in w3.take_tabs, "take orphaned by the shot delete is dropped"
+    assert w3.tabs.currentWidget() is w3.shot_tabs[b.id], "focus stayed on b despite the skip"
+    print("MainWindow OK: active tab restored by identity across a skipped earlier tab")
+
+
 def test_format_generation_settings() -> None:
     """The take-viewer settings formatter renders a full snapshot and degrades cleanly."""
     from store.models import Take
@@ -340,12 +443,95 @@ def test_runner_self_cancel_during_submit() -> None:
     print("runner self-cancel OK: real on_submit cancels during create-POST window")
 
 
+def test_run_survives_deleted_signals() -> None:
+    """A worker that emits after its _JobSignals C++ object was deleted out from under it
+    (project / JobManager churn while a render is mid-flight) must NOT abort the process.
+    GenerationJob._emit guards every emit, so a deleted source degrades to a dropped signal
+    and run() still records the take terminally via write-through. Regression for the
+    RuntimeError('Signal source has been deleted') -> C++ std::terminate crash (card #48)."""
+    import shiboken6
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import GenerationJob, _JobSignals
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_PENDING,
+                            settings_snapshot={"backend": "replicate"})
+
+    signals = _JobSignals()
+    done = []
+
+    def runner(progress):
+        progress("rendering", frac=0.5, label="step")  # emits while the source is still alive
+        shiboken6.delete(signals)                      # tear down the C++ signals mid-render
+        assert not shiboken6.isValid(signals)
+        return {"video_path": "out.mp4"}
+
+    job = GenerationJob(project, take.id, "replicate", runner, signals,
+                        set(), set(), set(), lambda tid, st: done.append((tid, st)))
+    job.run()                                          # the DONE/finished emits hit a dead source
+
+    got = project.get_take(take.id)
+    assert got.status == STATUS_DONE, got.status       # take recorded despite dead signals
+    assert got.video_path == "out.mp4", got.video_path
+    assert done == [(take.id, STATUS_DONE)], done      # finally still ran done_cb
+
+    # Failure path: the runner raises *after* the signals die, so the except-branch emits
+    # (status_changed->FAILED + failed) also hit a dead source and must no-op.
+    take2 = project.add_take(shot.id, status=STATUS_PENDING,
+                             settings_snapshot={"backend": "replicate"})
+    signals2 = _JobSignals()
+    done2 = []
+
+    def failing_runner(progress):
+        shiboken6.delete(signals2)
+        raise RuntimeError("backend boom")
+
+    job2 = GenerationJob(project, take2.id, "replicate", failing_runner, signals2,
+                         set(), set(), set(), lambda tid, st: done2.append((tid, st)))
+    job2.run()
+    got2 = project.get_take(take2.id)
+    assert got2.status == STATUS_FAILED, got2.status   # failure recorded despite dead signals
+    assert done2 == [(take2.id, STATUS_FAILED)], done2
+
+    # Early-transition failure (review finding #1): if the GENERATING-write itself blows up
+    # before the inner try/finally, run()'s wrapper must still fire done_cb so the queue slot
+    # is freed rather than leaked.
+    take3 = project.add_take(shot.id, status=STATUS_PENDING,
+                             settings_snapshot={"backend": "replicate"})
+    done3 = []
+    orig_update = project.update_take
+    calls = {"n": 0}
+
+    def flaky_update(take_id, **fields):
+        if take_id == take3.id and calls["n"] == 0:    # blow up the GENERATING transition
+            calls["n"] += 1
+            raise RuntimeError("disk full")
+        return orig_update(take_id, **fields)
+
+    project.update_take = flaky_update
+    try:
+        job3 = GenerationJob(project, take3.id, "replicate", lambda p: {}, _JobSignals(),
+                             set(), set(), set(), lambda tid, st: done3.append((tid, st)))
+        job3.run()                                     # must not raise; must free the slot
+    finally:
+        project.update_take = orig_update
+    assert done3 == [(take3.id, STATUS_FAILED)], done3  # slot freed despite early crash
+
+    print("run survives deleted _JobSignals OK: emits no-op, take recorded, slot freed on early fail")
+
+
 if __name__ == "__main__":
     test_export()
     test_window_builds()
     test_close_dirty_tab_guard()
+    test_tab_state_persistence()
+    test_tab_state_active_survives_skip()
     test_format_generation_settings()
     test_snapshot_includes_framing()
     test_take_player_settings_panel()
     test_runner_self_cancel_during_submit()
+    test_run_survives_deleted_signals()
     print("PHASE 5 SMOKE: PASS")
