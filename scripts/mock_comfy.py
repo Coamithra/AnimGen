@@ -383,13 +383,14 @@ def main(argv):
     ap.add_argument("--fail-rate", type=float, default=FAIL_RATE,
                     help="fraction (0..1) of renders that return a workflow error (FAILED take)")
     args = ap.parse_args(argv)
-    if args.fail_rate != min(1.0, max(0.0, args.fail_rate)):
-        print(f"[mock] WARNING: --fail-rate {args.fail_rate} clamped to "
-              f"{min(1.0, max(0.0, args.fail_rate))} (expected a fraction 0..1)", flush=True)
+    clamped = min(1.0, max(0.0, args.fail_rate))   # make_server clamps too; warn if we had to
+    if args.fail_rate != clamped:
+        print(f"[mock] WARNING: --fail-rate {args.fail_rate} clamped to {clamped} "
+              f"(expected a fraction 0..1)", flush=True)
 
     srv = make_server(args.port, render_s=args.delay, jitter_s=args.jitter,
                       preview_bytes=args.preview_bytes, fail_rate=args.fail_rate)
-    canned = _canned_output()      # idempotent: make_server already created it
+    canned = OUTPUT_DIR / MOCK_SUBFOLDER / MOCK_FILENAME   # made by make_server's _canned_output
     print(f"[mock] canned output: {canned} ({canned.stat().st_size} bytes)", flush=True)
     print(f"[mock] COMFY output dir: {OUTPUT_DIR}", flush=True)
     print(f"[mock] render={RENDER_S}s +/-{JITTER_S}s  preview_bytes={WS_PREVIEW_BYTES}  "

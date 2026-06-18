@@ -60,7 +60,11 @@ def test_mock_comfy_take_end_to_end() -> None:
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
+    # submit()/_api()/the WS URL all derive from COMFY_URL alone; COMFY_PORT is only read by
+    # the server-lifecycle/stop helpers this test never calls. We still repoint it for symmetry
+    # so it can't dangle at the real 8188 if some future submit-path code starts reading it.
     saved_url, saved_port = comfy_client.COMFY_URL, comfy_client.COMFY_PORT
+    saved_fail_rate = mock_comfy.FAIL_RATE
     comfy_client.COMFY_URL = f"http://127.0.0.1:{port}"
     comfy_client.COMFY_PORT = port
     out_dir = Path(tempfile.mkdtemp(prefix="animgen_takes_"))
@@ -112,7 +116,7 @@ def test_mock_comfy_take_end_to_end() -> None:
 
         # --- failure take: FAILED + interrupted=False. The mock returns a status_str=="error"
         # /history entry with the server still UP, so it's a genuine workflow error (not a crash).
-        mock_comfy.FAIL_RATE = 1.0
+        mock_comfy.FAIL_RATE = 1.0   # every render now fails (restored in the finally below)
         bad = project.add_take(shot.id, status=STATUS_PENDING,
                                settings_snapshot={"backend": "comfyui"})
         bad_runner, _ = make_comfy_runner(bad.id)
@@ -122,11 +126,19 @@ def test_mock_comfy_take_end_to_end() -> None:
 
         got_bad = project.get_take(bad.id)
         assert got_bad.status == STATUS_FAILED, got_bad.status
+        # "workflow error" proves it came from the status_str=="error" branch (not some other
+        # failure); "MockInjectedFailure" ties it to the mock's injected execution_error.
         assert "workflow error" in (got_bad.error or ""), got_bad.error
+        assert "MockInjectedFailure" in (got_bad.error or ""), got_bad.error
         assert got_bad.interrupted is False, "server-up failure is a genuine error, not a crash"
         assert any(tid == bad.id for tid, _ in failed), "failed signal must fire for the FAILED take"
     finally:
         comfy_client.COMFY_URL, comfy_client.COMFY_PORT = saved_url, saved_port
+        mock_comfy.FAIL_RATE = saved_fail_rate
+        # ThreadingHTTPServer leaves in-flight handler threads running; the mock's WS handler
+        # holds its socket open ~30s after the render. They're daemon threads and submit()'s
+        # finally already stopped the client side, so a one-shot phase exits cleanly without
+        # joining them (don't reuse `srv` across many cases or they'd accumulate).
         srv.shutdown()
         srv.server_close()
     print("mock_comfy end-to-end OK: real submit->/history->claim drives a take to DONE "
