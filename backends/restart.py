@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from store.models import STATUS_CANCELLED
+from store.models import STATUS_CANCELLED, STATUS_FAILED
 
 
 @dataclass
@@ -41,15 +41,17 @@ def plan_restart(takes, *, model_of_id: Callable[[Optional[str]], Optional[dict]
                  est_of: Callable[[Optional[str], dict], Optional[float]],
                  path_exists: Callable[[Optional[str]], bool],
                  name_of: Callable[[object], str]) -> RestartPlan:
-    """Split cancelled takes into exact-restartable vs unrestartable(+reason).
+    """Split interrupted takes into exact-restartable vs unrestartable(+reason).
 
-    A take is restartable iff its snapshot is new-format (has framing), its model is still
-    in the roster, and its start keyframe still exists. The injected callables keep this free
-    of library/project imports at call time so it's unit-testable headless.
+    Considers takes left in a terminal CANCELLED or FAILED state (a crash/app-death cancels a
+    queued take, or fails an in-flight one whose render was lost) - the caller passes only the
+    interrupted ones. A take is restartable iff its snapshot is new-format (has framing), its
+    model is still in the roster, and its start keyframe still exists. The injected callables
+    keep this free of library/project imports at call time so it's unit-testable headless.
     """
     plan = RestartPlan()
     for take in takes:
-        if take.status != STATUS_CANCELLED:
+        if take.status not in (STATUS_CANCELLED, STATUS_FAILED):
             continue
         snap = take.settings_snapshot or {}
         label = name_of(take)

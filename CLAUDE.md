@@ -416,15 +416,23 @@ Full mechanism + invariants in **Hard-won rule #13**.
     take** entry in the takes-grid context menu (`takes_view._build_context_menu`, no `exec()`, bubbles
     `restart_requested` up). Cancelling the gate fails nothing; only the unrestartable takes are failed,
     and only after a confirmed (or no-spend) restart.
-    **`Take.interrupted` flag (2026-06-18):** "cancelled" conflated two things — takes the user
-    *deliberately* cancelled vs takes auto-cancelled when ComfyUI/the app *died* (orphan recovery's
-    CANCEL, or the 3-strike `abandon_local`). The `interrupted: bool` field on `Take` records the
-    difference: the **auto/death paths set it True**, every **manual cancel sets it False** (set
-    explicitly at each site, so a take crash-cancelled → restarted → user-cancelled doesn't keep a
-    stale True). The **bulk** "Restart interrupted takes" only re-runs `status==CANCELLED and
-    interrupted` ones (`main_window._interrupted_take_count` gates the action's enabled state); the
-    **per-take** "Restart take" still restarts *any* cancelled take (an explicit user override).
-    Additive/back-compat: `_take_from_dict` **backfills** a legacy cancelled take's flag from its
-    `error` reason text ("...restart..." → True) so a pre-existing crashed batch is recognised on
-    load. Smoke-tested in `smoke_phase2` (`test_restart_plan`, `test_restart_take`,
-    `test_restart_from_snapshot`, `test_interrupted_flag`).
+    **`Take.interrupted` flag (2026-06-18):** "cancelled" / "failed" conflated user intent with
+    crash damage — takes the user *deliberately* cancelled, and genuine render *failures*, vs takes
+    a crash / ComfyUI-or-app *death* cut short: orphan recovery's CANCEL (a queued take never
+    submitted) **and its FAIL** (an in-flight render lost to the restart — `generating`→FAILED when
+    ComfyUI is unreachable, card from PR #52), plus the 3-strike `abandon_local`. The
+    `interrupted: bool` field on `Take` records the difference: the **crash/death paths set it
+    True** (both recovery CANCEL and FAIL, abandon_local), every **manual cancel AND every genuine
+    render failure set it False** — set explicitly at each terminal site, so a take crash-cancelled
+    → restarted → user-cancelled (or genuinely failed) doesn't keep a stale True; `_restart_in_place`
+    clears it too, and marking a take unrestartable-FAILED clears it (drops it from the set so it
+    isn't retried forever). The **bulk** "Restart interrupted takes" re-runs every take with
+    `interrupted and status in (CANCELLED, FAILED)` — so a lost in-flight render is restarted
+    alongside the cancelled queue (`plan_restart` accepts both statuses;
+    `main_window._interrupted_take_count` gates the action's enabled state). The **per-take**
+    "Restart take" still restarts *any* cancelled take (an explicit user override). Additive/
+    back-compat: `_take_from_dict` **backfills** a legacy take's flag from its `error` against
+    `_INTERRUPTED_REASON_MARKERS` (the exact orphan-recovery/abandon phrases, NOT a bare "restart"
+    substring — so a "cannot restart: …" unrestartable mark is not misread) so a pre-existing
+    crashed batch is recognised on load. Smoke-tested in `smoke_phase2` (`test_restart_plan`,
+    `test_restart_take`, `test_restart_from_snapshot`, `test_interrupted_flag`).

@@ -32,7 +32,6 @@ RECLAIM = "reclaim"      # finished render found -> copy in + mark done
 REATTACH = "reattach"    # still on the server -> re-poll to completion
 FAIL = "fail"            # generating take with no server trace -> mark failed
 CANCEL = "cancel"        # pending take never submitted -> mark cancelled
-LEAVE = "leave"          # unreachable server + a submitted render -> keep generating, reclaim later
 
 
 @dataclass
@@ -126,23 +125,20 @@ def plan_comfy_recovery(orphans: list, history: list[dict],
 def plan_offline_recovery(orphans: list) -> list[RecoveryPlan]:
     """Reconcile orphans when ComfyUI is UNREACHABLE (history/queue can't be fetched). Pure.
 
-    With no server view we can't tell a finished render from a lost one, so a take that
-    WAS submitted (`backend_job_id` recorded) is LEFT generating - the server may just be
-    temporarily down and we can reclaim its .mp4 on a later launch. But a take never
-    confirmed-submitted has nothing on the server to wait for (and seed-matching can never
-    hit once it's back), so it's cleared now rather than left a permanent 'generating'
-    zombie: a `generating` take with no prompt id -> FAIL, a `pending` one -> CANCEL.
+    With no server view we can't verify any render, and there are no live workers, so an
+    orphan can't be making progress - a `generating` take is mislabeled "running" forever
+    if it's left as-is and the server never comes back this session. So everything is
+    cleared now rather than left a permanent zombie: a `generating` take -> FAIL (a render
+    that was in flight when the app/server died and can't be confirmed), a `pending` one ->
+    CANCEL (never reached the server). Re-Generate to run it again.
     """
     plans: list[RecoveryPlan] = []
     for o in orphans:
-        if o.status == STATUS_GENERATING and o.backend_job_id:
-            plans.append(RecoveryPlan(
-                o.id, o.shot_id, LEAVE, o.backend_job_id, None,
-                "unfinished; ComfyUI unreachable - will reattach when it returns"))
-        elif o.status == STATUS_GENERATING:
+        if o.status == STATUS_GENERATING:
             plans.append(RecoveryPlan(
                 o.id, o.shot_id, FAIL, None, None,
-                "never submitted before restart (no render to recover); re-Generate to run it"))
+                "ComfyUI was unreachable at restart; render could not be recovered. "
+                "Re-Generate to run it again."))
         else:  # pending - never reached the server
             plans.append(RecoveryPlan(
                 o.id, o.shot_id, CANCEL, None, None,

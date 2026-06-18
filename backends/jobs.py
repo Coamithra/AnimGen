@@ -154,7 +154,7 @@ class GenerationJob(QRunnable):
                 self._emit("status_changed", tid, STATUS_CANCELLED)
                 final = STATUS_CANCELLED
             else:
-                self.project.update_take(tid, status=STATUS_FAILED, error=err)
+                self.project.update_take(tid, status=STATUS_FAILED, error=err, interrupted=False)
                 self.project.update_job(job.id, state="failed", log="\n".join(log_lines + [err]))
                 self._emit("status_changed", tid, STATUS_FAILED)
                 self._emit("failed", tid, err)

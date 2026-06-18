@@ -542,7 +542,15 @@ class MainWindow(QMainWindow):
         if not shot:
             return
         self.project.set_shot_starred(shot_id, not shot.starred)   # write-through, no dirty
-        self.reload()               # reflect the star + re-apply the "Starred shots" filter
+        # A full reload rebuilds every shot card (and its thumbnail grid) - 1-2s with many
+        # shots. Only the "Starred shots" filter changes which cards are visible on a star
+        # toggle, so reload only then; otherwise just repaint the one card's star button.
+        if self.starred_shots_filter.isChecked():
+            self.reload()
+        else:
+            card = self.cards.get(shot_id)
+            if card:
+                card._refresh_star_btn()
 
     def delete_shot(self, shot_id: str) -> None:
         shot = self.project.get_shot(shot_id)
@@ -831,16 +839,17 @@ class MainWindow(QMainWindow):
 
     def _interrupted_take_count(self) -> int:
         return sum(1 for t in self.project.list_takes(include_deleted=False)
-                   if t.status == STATUS_CANCELLED and t.interrupted)
+                   if t.interrupted and t.status in (STATUS_CANCELLED, STATUS_FAILED))
 
     # ---- restart interrupted takes -------------------------------------
     def restart_cancelled_takes(self) -> None:
-        """Re-run every INTERRUPTED cancelled take in the project (ignoring the view filters, like
-        Cancel pending). Only takes cancelled by a crash / ComfyUI-or-app death are restarted -
-        ones the user deliberately cancelled are left alone. Exact-restartable takes replay in
-        place from their snapshot; the rest are marked failed with a reason."""
+        """Re-run every INTERRUPTED take in the project (ignoring the view filters, like Cancel
+        pending). These are takes a crash / ComfyUI-or-app death cut short - cancelled before they
+        ran, or failed because their in-flight render was lost to the restart. Ones the user
+        deliberately cancelled, and genuine render failures, are left alone. Exact-restartable
+        takes replay in place from their snapshot; the rest are marked failed with a reason."""
         interrupted = [t for t in self.project.list_takes(include_deleted=False)
-                       if t.status == STATUS_CANCELLED and t.interrupted]
+                       if t.interrupted and t.status in (STATUS_CANCELLED, STATUS_FAILED)]
         self._restart_takes(interrupted)
 
     def _restart_takes_by_ids(self, ids: list) -> None:
@@ -852,7 +861,7 @@ class MainWindow(QMainWindow):
 
     def _restart_takes(self, takes: list) -> None:
         if not takes:
-            QMessageBox.information(self, "Restart", "No cancelled takes to restart.")
+            QMessageBox.information(self, "Restart", "No interrupted takes to restart.")
             return
         plan = restart.plan_restart(
             takes, model_of_id=library.get_model, est_of=library.estimate_cost,
@@ -874,14 +883,14 @@ class MainWindow(QMainWindow):
             # exactly. Confirm before flipping CANCELLED->FAILED so the click stays backable-out.
             if QMessageBox.question(
                     self, "Restart",
-                    f"None of the {len(plan.unrestartable)} cancelled take(s) can be restarted "
+                    f"None of the {len(plan.unrestartable)} interrupted take(s) can be restarted "
                     f"exactly:\n\n{detail}\n\nMark them failed?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                 return
         for take, reason in plan.unrestartable:
             self.project.update_take(take.id, status=STATUS_FAILED,
-                                     error=f"cannot restart: {reason}")
+                                     error=f"cannot restart: {reason}", interrupted=False)
             self._refresh_shot_for_take(take.id)
         self._log(f"restart: {len(plan.restartable)} re-queued, "
                   f"{len(plan.unrestartable)} marked failed")
@@ -1171,26 +1180,22 @@ class MainWindow(QMainWindow):
         orphans = recovery.comfy_orphans(proj)
         if not orphans:
             return
-        if history is None:                       # ComfyUI unreachable - can't tell finished from
-            counts: Counter = Counter()           # lost; clear never-submitted, leave submitted
+        if history is None:                       # ComfyUI unreachable - nothing can be verified
+            counts: Counter = Counter()           # and no worker is live, so clear every orphan
             for p in recovery.plan_offline_recovery(orphans):
                 if p.action == recovery.CANCEL:
                     proj.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason,
                                      interrupted=True)   # crash/app-death, not a user cancel
-                elif p.action == recovery.FAIL:
-                    proj.update_take(p.take_id, status=STATUS_FAILED, error=p.reason)
-                else:                             # LEAVE - keep generating; reclaim on a later launch
-                    counts[recovery.LEAVE] += 1
-                    continue
+                else:                             # FAIL - generating take lost to the restart
+                    proj.update_take(p.take_id, status=STATUS_FAILED, error=p.reason,
+                                     interrupted=True)   # lost render, restartable from snapshot
                 counts[p.action] += 1
                 self._refresh_shot(p.shot_id)
             parts = []
+            if counts[recovery.FAIL]:
+                parts.append(f"failed {counts[recovery.FAIL]} unrecoverable (ComfyUI unreachable)")
             if counts[recovery.CANCEL]:
                 parts.append(f"cancelled {counts[recovery.CANCEL]} un-submitted")
-            if counts[recovery.FAIL]:
-                parts.append(f"failed {counts[recovery.FAIL]} un-submitted")
-            if counts[recovery.LEAVE]:
-                parts.append(f"left {counts[recovery.LEAVE]} unfinished (ComfyUI unreachable)")
             if parts:
                 self._log("orphan recovery: " + "; ".join(parts))
             self._refresh_cancel_action()
@@ -1222,7 +1227,8 @@ class MainWindow(QMainWindow):
                 self.jobs.enqueue(p.take_id, "comfyui",
                                   self._make_monitor_runner(p.take_id, p.prompt_id))
             elif p.action == recovery.FAIL:
-                self.project.update_take(p.take_id, status=STATUS_FAILED, error=p.reason)
+                self.project.update_take(p.take_id, status=STATUS_FAILED, error=p.reason,
+                                         interrupted=True)   # render lost to app restart, restartable
             elif p.action == recovery.CANCEL:
                 self.project.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason,
                                          interrupted=True)   # crash/app-death, not a user cancel

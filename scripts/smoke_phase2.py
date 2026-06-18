@@ -782,20 +782,20 @@ def test_orphan_recovery() -> None:
     assert plans["dup1"].action == recovery.RECLAIM and plans["dup2"].action == recovery.FAIL, \
         "a finished render must be claimed by exactly one take"
 
-    # plan_offline_recovery: ComfyUI unreachable (no history/queue). A submitted take (has a
-    # prompt id) is LEFT generating to reclaim later; a never-submitted generating take (no
-    # prompt id) -> FAIL rather than a permanent zombie; a pending take -> CANCEL.
+    # plan_offline_recovery: ComfyUI unreachable (no history/queue). Nothing can be verified
+    # and no worker is live, so every orphan is cleared rather than left a permanent "running"
+    # zombie: any generating take (submitted or not) -> FAIL; a pending take -> CANCEL.
     offline = [
-        t("submitted",  STATUS_GENERATING, seed=10, job="Plive"),  # has prompt id -> LEAVE
+        t("submitted",  STATUS_GENERATING, seed=10, job="Plive"),  # had prompt id -> FAIL
         t("zombie",     STATUS_GENERATING, seed=20),               # no prompt id  -> FAIL
         t("queued",     STATUS_PENDING,    seed=30),               # never ran     -> CANCEL
     ]
     off = {p.take_id: p for p in recovery.plan_offline_recovery(offline)}
-    assert off["submitted"].action == recovery.LEAVE and off["submitted"].prompt_id == "Plive"
+    assert off["submitted"].action == recovery.FAIL, "submitted-but-unverifiable take must fail, not linger"
     assert off["zombie"].action == recovery.FAIL, "generating-without-prompt-id must not be left"
     assert off["queued"].action == recovery.CANCEL
     print("orphan recovery OK: select + reclaim/reattach/fail/cancel + prompt-id + seed dedup "
-          "+ offline leave/fail/cancel")
+          "+ offline fail/cancel")
 
 
 def test_crash_recovery() -> None:
@@ -1571,23 +1571,25 @@ def test_restart_plan() -> None:
               "settings": {"seed": 7, "duration": 4}, "canvas": [1254, 1254], "crop": {}}
     ok = _take(framed)
     ok_with_end = _take({**framed, "end_frame": "b.png"})   # present end frame -> still restartable
+    failed_ok = _take(framed, status=STATUS_FAILED)         # interrupted FAILED orphan -> restartable too
     unknown_model = _take({**framed, "model_id": "gone"})
     missing_frame = _take({**framed, "start_frame": "deleted.png"})
     missing_end = _take({**framed, "end_frame": "deleted_end.png"})  # end frame gone -> can't replay exactly
     old_snapshot = _take({"model_id": "good", "backend": "replicate",  # pre-2026-06-17: no canvas/crop
                           "start_frame": "a.png", "settings": {"seed": 1}})
-    not_cancelled = _take(framed, status=STATUS_DONE)  # filtered out entirely
+    not_terminal = _take(framed, status=STATUS_DONE)  # not CANCELLED/FAILED -> filtered out entirely
 
     models = {"good": {"display_name": "Good", "backend": "replicate"}}
     plan = restart.plan_restart(
-        [ok, ok_with_end, unknown_model, missing_frame, missing_end, old_snapshot, not_cancelled],
+        [ok, ok_with_end, failed_ok, unknown_model, missing_frame, missing_end, old_snapshot,
+         not_terminal],
         model_of_id=lambda mid: models.get(mid),
         est_of=lambda mid, s: 0.5,
         path_exists=lambda p: p in ("a.png", "b.png"),
         name_of=lambda t: t.id)
 
-    assert plan.restartable == [ok, ok_with_end], plan.restartable
-    assert len(plan.items) == 2
+    assert plan.restartable == [ok, ok_with_end, failed_ok], plan.restartable
+    assert len(plan.items) == 3
     it = plan.items[0]
     assert set(it) >= {"name", "model_display", "backend", "est_cost", "params"}
     assert it["est_cost"] == 0.5 and it["params"]["seed"] == 7
@@ -1598,7 +1600,7 @@ def test_restart_plan() -> None:
     assert "start keyframe" in reasons[missing_frame.id]
     assert "end keyframe" in reasons[missing_end.id]
     assert "predates framing" in reasons[old_snapshot.id]
-    print("restart plan OK: restartable filter + per-take unrestartable reasons")
+    print("restart plan OK: cancelled+failed restartable filter + per-take unrestartable reasons")
 
 
 def test_restart_take() -> None:
@@ -1660,6 +1662,10 @@ def test_restart_from_snapshot() -> None:
         # must SKIP it - it's only for crash/death-interrupted takes.
         user_cancelled = project.add_take(shot.id, status=STATUS_CANCELLED, interrupted=False,
                                           settings_snapshot=snap)
+        # An interrupted FAILED take (in-flight render lost to the restart) IS picked up by the bulk
+        # action alongside the cancelled ones.
+        failed_orphan = project.add_take(shot.id, status=STATUS_FAILED, interrupted=True,
+                                         settings_snapshot=snap)
 
         win = MainWindow(project)
         # Capture the runner build instead of firing a real backend; assert it gets the snapshot's
@@ -1681,8 +1687,9 @@ def test_restart_from_snapshot() -> None:
         finally:
             mw.confirm_launch = orig_confirm
 
-        assert enqueued == [good.id], enqueued
+        assert enqueued == [good.id, failed_orphan.id], enqueued
         assert project.get_take(good.id).status == STATUS_PENDING
+        assert project.get_take(failed_orphan.id).status == STATUS_PENDING, "failed orphan not restarted"
         cap = captured[good.id]
         assert cap["settings"]["seed"] == 4242
         assert cap["shot"].canvas_w == 1254 and cap["shot"].crop == {"aspect": "1:1"}
@@ -1720,7 +1727,7 @@ def test_interrupted_flag() -> None:
     from PySide6.QtWidgets import QApplication
     from backends import recovery
     from backends.jobs import JobManager
-    from store.models import STATUS_CANCELLED, STATUS_DONE, STATUS_PENDING, Take
+    from store.models import STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_PENDING, Take
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
     project = Project.new()
@@ -1729,16 +1736,22 @@ def test_interrupted_flag() -> None:
     rt = Take(id="rt", shot_id="s", status=STATUS_CANCELLED, interrupted=True)
     assert project._take_from_dict(project._take_to_dict(rt)).interrupted is True
 
-    # Migration backfill: a legacy cancelled take (no `interrupted` key) infers it from `error`.
-    crash = project._take_from_dict(
-        {"id": "a", "shot_id": "s", "status": STATUS_CANCELLED,
-         "error": "not submitted before restart; re-Generate to run it"})
-    user = project._take_from_dict(
-        {"id": "b", "shot_id": "s", "status": STATUS_CANCELLED, "error": "cancelled by user"})
-    done = project._take_from_dict({"id": "c", "shot_id": "s", "status": STATUS_DONE})
-    assert crash.interrupted is True, "crash-reason legacy take must backfill interrupted=True"
-    assert user.interrupted is False, "user-cancel legacy take must stay interrupted=False"
-    assert done.interrupted is False, "non-cancelled take is never flagged"
+    # Migration backfill: a legacy cancelled/failed take (no `interrupted` key) infers it from the
+    # orphan-recovery reason markers in `error`.
+    def backfill(status, error):
+        return project._take_from_dict(
+            {"id": "m" + str(abs(hash(error)))[:6], "shot_id": "s", "status": status, "error": error}
+        ).interrupted
+    # Crash/death reasons -> True (each distinct recovery marker).
+    assert backfill(STATUS_CANCELLED, "not submitted before restart; re-Generate to run it") is True
+    assert backfill(STATUS_FAILED, "ComfyUI was unreachable at restart; render could not be recovered.") is True
+    assert backfill(STATUS_FAILED, "no matching ComfyUI render found (lost to app restart)") is True
+    assert backfill(STATUS_CANCELLED, "ComfyUI restart failed; pausing the local queue.") is True
+    # User/genuine reasons -> False (crucially, a "cannot restart:" mark must NOT read as interrupted).
+    assert backfill(STATUS_CANCELLED, "cancelled by user") is False
+    assert backfill(STATUS_FAILED, "workflow error: bad node") is False
+    assert backfill(STATUS_FAILED, "cannot restart: snapshot predates framing-in-snapshot") is False
+    assert project._take_from_dict({"id": "c", "shot_id": "s", "status": STATUS_DONE}).interrupted is False
 
     # Manual cancel_take -> interrupted False.
     shot = project.add_shot("kick", model_id="seedance-2.0-std")
@@ -1752,17 +1765,24 @@ def test_interrupted_flag() -> None:
     jm.abandon_local("ComfyUI crashed; pausing.")
     assert project.get_take(local.id).interrupted is True, "crash abandon must be interrupted"
 
-    # Orphan-recovery CANCEL (the crash/app-death scenario) -> interrupted True, via _execute_plans.
+    # Orphan recovery sets interrupted=True for BOTH its terminal actions, via _execute_plans:
+    # CANCEL (a pending take never submitted) and FAIL (an in-flight render lost to the restart).
     from ui.main_window import MainWindow
     proj2 = Project.new()
     sh2 = proj2.add_shot("k", model_id="seedance-2.0-std")
     win = MainWindow(proj2)                 # built before any orphan exists -> no off-thread reconciler
-    orphan = proj2.add_take(sh2.id, status=STATUS_PENDING, settings_snapshot={"backend": "comfyui"})
-    win._execute_plans([recovery.RecoveryPlan(orphan.id, sh2.id, recovery.CANCEL,
-                                              reason="queued but not submitted before restart")])
-    got = proj2.get_take(orphan.id)
-    assert got.interrupted is True and got.status == STATUS_CANCELLED, (got.interrupted, got.status)
-    print("interrupted flag OK: round-trip, migration backfill, manual=False, recovery/abandon=True")
+    o_cancel = proj2.add_take(sh2.id, status=STATUS_PENDING, settings_snapshot={"backend": "comfyui"})
+    o_fail = proj2.add_take(sh2.id, status=STATUS_GENERATING, settings_snapshot={"backend": "comfyui"})
+    win._execute_plans([
+        recovery.RecoveryPlan(o_cancel.id, sh2.id, recovery.CANCEL,
+                              reason="queued but not submitted before restart"),
+        recovery.RecoveryPlan(o_fail.id, sh2.id, recovery.FAIL,
+                              reason="no matching ComfyUI render found (lost to app restart)"),
+    ])
+    gc, gf = proj2.get_take(o_cancel.id), proj2.get_take(o_fail.id)
+    assert gc.interrupted is True and gc.status == STATUS_CANCELLED, (gc.interrupted, gc.status)
+    assert gf.interrupted is True and gf.status == STATUS_FAILED, (gf.interrupted, gf.status)
+    print("interrupted flag OK: round-trip, migration backfill, manual=False, recovery(cancel+fail)/abandon=True")
 
 
 def test_done_elapsed() -> None:
