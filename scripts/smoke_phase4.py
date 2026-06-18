@@ -341,14 +341,16 @@ def test_runner_uses_snapshot_not_live_shot() -> None:
         settings = {**model.get("default_params", {}), **shot.settings}
 
         captured: dict = {}
-        win.jobs.enqueue = lambda tid, backend, runner: captured.update(runner=runner)
+        win.jobs.enqueue = lambda take_id, backend, runner: captured.update(runner=runner)
         take_id = win._queue_take(shot, model, settings, est=0.0)
         snap = project.get_take(take_id).settings_snapshot
 
-        # Edit the live shot AFTER queueing — the runner must ignore every one of these.
+        # Edit the live shot AFTER queueing — the runner must ignore every one of these
+        # (settings.length is read by the comfy path off the snapshot's resolved settings).
         project.update_shot(shot.id, prompt="kick", negative_prompt="grainy",
                             canvas_w=512, canvas_h=512,
-                            crop={"aspect": "1:1", "start": {"scale": 0.1, "cx": 0.1, "cy": 0.1}})
+                            crop={"aspect": "1:1", "start": {"scale": 0.1, "cx": 0.1, "cy": 0.1}},
+                            settings={"seed": 7, "length": 99})
 
         seen: dict = {}
         orig = (framing.render_keyposes, replicate_client.generate,
@@ -376,7 +378,9 @@ def test_runner_uses_snapshot_not_live_shot() -> None:
     assert framed.start_frame == snap["start_frame"]
 
     # Local (ComfyUI): same fields through the crash-recovery-wrapped attempt(); size_sets
-    # is derived from the snapshot canvas, not the mutated live shot's 512x512.
+    # is derived from the snapshot's frozen canvas + resolved length, not the edited live
+    # shot (512x512, length 99). length comes from default_params (17), proving it's read
+    # off the snapshot's resolved settings, not the live shot's raw settings.
     snap, seen = queue_and_capture("local-flf-wan14b")
     framed = seen["framed"]
     assert seen["prompt"] == snap["prompt"] == "punch"
@@ -385,6 +389,7 @@ def test_runner_uses_snapshot_not_live_shot() -> None:
     assert framed.crop == snap["crop"] and framed.crop["aspect"] == "16:9"
     sizes = set(seen["sets"].values())
     assert 1254 in sizes and 706 in sizes and 512 not in sizes
+    assert snap["settings"]["length"] == 17 and 17 in sizes and 99 not in sizes
     print("runner snapshot freeze OK: both backends render the frozen snapshot, not the edited shot")
 
 
