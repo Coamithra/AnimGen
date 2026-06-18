@@ -13,15 +13,16 @@ frames in memory is cheap and gives instant scrubbing in both directions.
 """
 from __future__ import annotations
 
+import tempfile
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QMimeData, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
-    QDockWidget, QHBoxLayout, QLabel, QMainWindow, QMenu, QPushButton, QSlider,
-    QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QDockWidget, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenu,
+    QMessageBox, QPushButton, QSlider, QTextEdit, QVBoxLayout, QWidget,
 )
 
 import library
@@ -146,6 +147,29 @@ class _FrameLoader(QObject):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class _GifExporter(QObject):
+    """Encodes a take's video to an animated GIF on a daemon thread (decode is PyAV-bound, so
+    keep it off the GUI thread), then reports the output path back on the GUI thread."""
+    done = Signal(str)         # output gif path
+    failed = Signal(str)
+
+    def __init__(self, source: str, out_path: str):
+        super().__init__()
+        self._source = source
+        self._out = out_path
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            from pipeline import gif_export
+            path = gif_export.take_to_gif(self._source, self._out)
+            self.done.emit(str(path))
+        except Exception as e:  # noqa: BLE001 - surface any encode failure in a dialog
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 class TakePlayerTab(QWidget):
     def __init__(self, project: Project, take_id: str, parent=None):
         super().__init__(parent)
@@ -156,6 +180,7 @@ class TakePlayerTab(QWidget):
         self._idx = 0
         self._fps = _DEFAULT_FPS
         self._loader: Optional[_FrameLoader] = None
+        self._gif_worker: Optional[_GifExporter] = None   # kept alive across the export
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
         self._build()
@@ -267,11 +292,88 @@ class TakePlayerTab(QWidget):
     def _build_context_menu(self) -> QMenu:
         """The video's right-click menu (split out so it's testable without exec())."""
         menu = QMenu(self)
+        has_source = self._gif_source() is not None
+        save_gif = menu.addAction("Save as GIF…")
+        save_gif.triggered.connect(self._save_gif)
+        save_gif.setEnabled(has_source)
+        copy_gif = menu.addAction("Copy GIF to clipboard")
+        copy_gif.triggered.connect(self._copy_gif)
+        copy_gif.setEnabled(has_source)
+        menu.addSeparator()
         menu.addAction("Show generation settings").triggered.connect(self.show_settings)
         return menu
 
     def _on_canvas_menu(self, pos) -> None:
         self._build_context_menu().exec(self.canvas.mapToGlobal(pos))
+
+    # ---- GIF export -----------------------------------------------------
+    def _gif_source(self) -> Optional[str]:
+        """The take's playable file, or None — gates the GIF menu entries."""
+        take = self.project.get_take(self.take_id)
+        return take_source(take) if take else None
+
+    def _default_gif_name(self) -> str:
+        """A friendly default filename: <shot-name>_<short-take-id>.gif."""
+        take = self.project.get_take(self.take_id)
+        shot = self.project.get_shot(take.shot_id) if take else None
+        base = (shot.name if shot else "") or "take"
+        safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in base).strip("_") or "take"
+        return f"{safe}_{self.take_id[:8]}.gif"
+
+    def _save_gif(self) -> None:
+        source = self._gif_source()
+        if not source:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save take as GIF", self._default_gif_name(), "Animated GIF (*.gif)")
+        if not path:
+            return
+        if not path.lower().endswith(".gif"):
+            path += ".gif"
+        self.canvas.setToolTip("Encoding GIF…")
+        self._start_gif_export(source, path, self._on_gif_saved)
+
+    def _copy_gif(self) -> None:
+        source = self._gif_source()
+        if not source:
+            return
+        # The temp file must outlive the copy (paste happens later), so it's written under a
+        # stable per-take path and reused on repeat copies rather than auto-deleted.
+        tmp_dir = Path(tempfile.gettempdir()) / "animgen_gif_clip"
+        tmp = tmp_dir / f"{self.take_id}.gif"
+        self.canvas.setToolTip("Encoding GIF…")
+        self._start_gif_export(source, str(tmp), self._on_gif_copied)
+
+    def _start_gif_export(self, source: str, out_path: str,
+                          on_done: Callable[[str], None]) -> None:
+        self._gif_worker = _GifExporter(source, out_path)   # kept on self so it isn't GC'd
+        self._gif_worker.done.connect(on_done)
+        self._gif_worker.failed.connect(self._on_gif_failed)
+        self._gif_worker.start()
+
+    def _on_gif_saved(self, path: str) -> None:
+        self.canvas.setToolTip("")
+        QMessageBox.information(self, "GIF saved", f"Saved animated GIF to:\n{path}")
+
+    def _on_gif_copied(self, path: str) -> None:
+        self.canvas.setToolTip("")
+        self._set_clipboard_gif(path)
+        QMessageBox.information(
+            self, "GIF copied",
+            "Copied the animated GIF to the clipboard.\n"
+            "Paste it into a chat, email, or file manager.")
+
+    def _on_gif_failed(self, msg: str) -> None:
+        self.canvas.setToolTip("")
+        QMessageBox.warning(self, "GIF export failed", f"Could not create the GIF:\n{msg}")
+
+    @staticmethod
+    def _set_clipboard_gif(path: str) -> None:
+        """Put the on-disk GIF on the clipboard as a file reference (CF_HDROP on Windows), so
+        pasting into a chat / email / file manager carries the *animated* file."""
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(path))])
+        QApplication.clipboard().setMimeData(mime)
 
     # ---- load -----------------------------------------------------------
     def _load(self) -> None:

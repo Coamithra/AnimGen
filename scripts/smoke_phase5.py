@@ -820,6 +820,94 @@ def test_save_as_rollback_on_write_failure() -> None:
     print("Project OK: save_as rolls back identity + assets on a failed document write")
 
 
+def test_gif_export() -> None:
+    """The pure GIF encoder writes a valid animated GIF; take_to_gif round-trips a real mp4."""
+    from PIL import Image
+
+    from pipeline import gif_export
+
+    tmp = Path(tempfile.mkdtemp())
+
+    # encode_gif: synthetic frames -> animated GIF with the right count, loop, per-frame ms.
+    frames = [Image.new("RGB", (32, 24), (i * 60 % 256, 0, 0)) for i in range(4)]
+    out = gif_export.encode_gif(frames, tmp / "synthetic.gif", fps=10.0)
+    with Image.open(out) as g:
+        assert g.is_animated and g.n_frames == 4, g.n_frames
+        assert g.info.get("loop") == 0                       # infinite loop
+        assert g.info.get("duration") == 100                 # 1000 / 10fps = 100ms
+
+    # max_side downscales the longest edge.
+    big = [Image.new("RGB", (200, 100), (0, i * 80 % 256, 0)) for i in range(3)]
+    small = gif_export.encode_gif(big, tmp / "scaled.gif", fps=12.0, max_side=50)
+    with Image.open(small) as g:
+        assert max(g.size) <= 50, g.size
+
+    # take_to_gif: decode a real mp4 and re-encode; frame count survives the round-trip.
+    mp4 = _make_mp4(tmp / "clip.mp4", n=5)
+    src_count = sum(1 for _ in extract.iter_frames(mp4))
+    gif = gif_export.take_to_gif(mp4, tmp / "clip.gif")
+    with Image.open(gif) as g:
+        assert g.is_animated and g.n_frames == src_count, (g.n_frames, src_count)
+
+    # An empty frame list is a clean error, not a crash.
+    try:
+        gif_export.encode_gif([], tmp / "x.gif", fps=12.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("encode_gif([]) must raise ValueError")
+    print("gif_export OK: encode_gif + take_to_gif (count, loop, duration, scale, empty)")
+
+
+def test_take_player_gif_export() -> None:
+    """The viewer's right-click menu exposes Save as GIF / Copy GIF, gated on a playable
+    source; the encode + clipboard-file-URL paths work headless. No modal .exec()."""
+    from PIL import Image
+    from PySide6.QtWidgets import QApplication
+
+    from pipeline import gif_export
+    from ui.take_player import TakePlayerTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    tmp = Path(tempfile.mkdtemp())
+    project = Project.new()
+    shot = project.add_shot("round kick", model_id="seedance-2.0-std", prompt="x")
+    take = project.add_take(shot.id, status=STATUS_DONE,
+                            settings_snapshot={"model_id": "seedance-2.0-std"})
+    tab = TakePlayerTab(project, take.id)               # no video -> no decode thread spawned
+
+    # No playable source yet -> both entries present but disabled.
+    menu = tab._build_context_menu()
+    save = next(a for a in menu.actions() if a.text().startswith("Save as GIF"))
+    copy = next(a for a in menu.actions() if a.text().startswith("Copy GIF"))
+    assert not save.isEnabled() and not copy.isEnabled(), "GIF entries gated off without a source"
+
+    # Point the take at a real mp4 -> entries enabled; default name derives from the shot.
+    mp4 = _make_mp4(tmp / "clip.mp4", n=4)
+    project.update_take(take.id, video_path=str(mp4))
+    menu = tab._build_context_menu()
+    save = next(a for a in menu.actions() if a.text().startswith("Save as GIF"))
+    copy = next(a for a in menu.actions() if a.text().startswith("Copy GIF"))
+    assert save.isEnabled() and copy.isEnabled(), "GIF entries enabled once a source exists"
+    name = tab._default_gif_name()
+    assert name.startswith("round_kick_") and name.endswith(".gif"), name
+
+    # The tab's source feeds the encoder (the worker just wraps this) and writes a valid GIF.
+    out = tmp / "manual.gif"
+    gif_export.take_to_gif(tab._gif_source(), out)
+    with Image.open(out) as g:
+        assert g.is_animated
+
+    # Clipboard path: a file URL goes on the clipboard and reads back (offscreen works).
+    tab._set_clipboard_gif(str(out))
+    urls = QApplication.clipboard().mimeData().urls()
+    assert urls and Path(urls[0].toLocalFile()).name == "manual.gif", \
+        [u.toString() for u in urls]
+
+    tab.close_player()
+    print("TakePlayerTab OK: GIF menu (source-gated), default name, encode + clipboard URL")
+
+
 if __name__ == "__main__":
     test_export()
     test_extract_frames_wide_padding()
@@ -833,6 +921,8 @@ if __name__ == "__main__":
     test_snapshot_includes_framing()
     test_generate_shot_missing_shot()
     test_take_player_settings_panel()
+    test_gif_export()
+    test_take_player_gif_export()
     test_runner_self_cancel_during_submit()
     test_run_survives_deleted_signals()
     test_save_as_rollback_on_write_failure()
