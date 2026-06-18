@@ -194,6 +194,83 @@ REQUIRED_FLAGS = ["--disable-dynamic-vram", "--disable-async-offload", "--cache-
 _DEFAULT_FLAGS = [("--listen", "127.0.0.1"), ("--port", str(COMFY_PORT))]  # (flag, value)
 _server_proc: "Optional[subprocess.Popen]" = None  # the ComfyUI we launched, if any
 
+# --- Isolated GPU (CUDA JIT kernel) cache -------------------------------------------------
+# ComfyUI/PyTorch JIT-compile CUDA kernels (PTX -> SASS) and cache them on disk. By default
+# they land in the GLOBAL, shared %APPDATA%/NVIDIA/ComputeCache (or ~/.nv/ComputeCache),
+# mixed in with every other CUDA app and not cleanly identifiable as "videogen's". We point a
+# launched ComfyUI's CUDA_CACHE_PATH at a project-local, gitignored folder (data/gpu_cache)
+# and cap it (CUDA_CACHE_MAXSIZE), so videogen owns a single, identifiable, bounded,
+# one-command-wipeable shader cache (clear_gpu_cache() / scripts/clear_gpu_cache.py). This is
+# the CUDA *compute* cache ONLY - it is unrelated to the DirectX DXCache (a desktop/browser/
+# Electron cache; AnimGen forces software GL, rule #15, so its own UI writes neither).
+GPU_CACHE_DIR = DATA_DIR / "gpu_cache"
+GPU_CACHE_MAXSIZE_BYTES = 2 * 1024 ** 3   # 2 GiB ceiling; CUDA evicts oldest past this (max 4 GiB)
+
+
+def _legacy_compute_caches() -> "list[Path]":
+    """The default (pre-isolation) global CUDA compute-cache locations, if derivable."""
+    out: "list[Path]" = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        out.append(Path(appdata) / "NVIDIA" / "ComputeCache")
+    out.append(Path.home() / ".nv" / "ComputeCache")
+    return out
+
+
+def launch_env() -> "dict[str, str]":
+    """Environment for a launched ComfyUI: the inherited env plus an isolated, capped CUDA
+    kernel-cache location (GPU_CACHE_DIR) so videogen's GPU shader cache is identifiable and
+    wipeable instead of accumulating in the global ComputeCache. A CUDA_CACHE_PATH /
+    CUDA_CACHE_MAXSIZE already set in the environment is respected (setdefault)."""
+    env = dict(os.environ)
+    try:
+        GPU_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass  # if we can't create it, fall through - CUDA uses its default location
+    env.setdefault("CUDA_CACHE_PATH", str(GPU_CACHE_DIR))
+    env.setdefault("CUDA_CACHE_MAXSIZE", str(GPU_CACHE_MAXSIZE_BYTES))
+    return env
+
+
+def gpu_cache_size_mb(include_legacy: bool = False) -> float:
+    """Total size (MB) of videogen's isolated GPU cache; with include_legacy, also the global
+    pre-isolation ComputeCache(s). Cheap stat walk for the confirm dialog / reporting."""
+    dirs = [GPU_CACHE_DIR] + (_legacy_compute_caches() if include_legacy else [])
+    total = 0
+    for d in dirs:
+        if not d.exists():
+            continue
+        for p in d.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    return total / (1024 * 1024)
+
+
+def clear_gpu_cache(include_legacy: bool = False) -> dict:
+    """Delete videogen's isolated CUDA kernel cache (GPU_CACHE_DIR). Best-effort: a file the
+    running server holds open is skipped, not fatal (CUDA recompiles it on demand). With
+    include_legacy, also clears the global pre-isolation ComputeCache(s). Returns the
+    {files, bytes} actually removed."""
+    dirs = [GPU_CACHE_DIR] + (_legacy_compute_caches() if include_legacy else [])
+    files = 0
+    freed = 0
+    for d in dirs:
+        if not d.exists():
+            continue
+        for p in d.rglob("*"):
+            if p.is_file():
+                try:
+                    sz = p.stat().st_size
+                    p.unlink()
+                    files += 1
+                    freed += sz
+                except OSError:
+                    pass  # locked / in use - skip (best-effort)
+    return {"files": files, "bytes": freed}
+
 
 def comfy_python() -> Path:
     """The ComfyUI venv interpreter, falling back to the current interpreter."""
@@ -250,6 +327,7 @@ def launch_server(extra: Optional[list[str]] = None) -> "subprocess.Popen":
     try:
         proc = subprocess.Popen(cmd, cwd=str(COMFY_DIR), stdout=logfile,
                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                env=launch_env(),  # isolated, capped CUDA kernel cache
                                 creationflags=flags, close_fds=True)
     finally:
         logfile.close()  # the child keeps its own inherited handle

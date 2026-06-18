@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -364,6 +365,42 @@ def test_comfy_launch_helpers() -> None:
         assert snap == {"running": False}
     assert isinstance(comfy_client.list_models(timeout=1), dict)
     print("comfy launch helpers OK: command flags + non-raising status/monitor probes")
+
+
+def test_comfy_gpu_cache() -> None:
+    # videogen's CUDA kernel cache is isolated into data/gpu_cache + capped (not the global
+    # ComputeCache), and wipeable in one call. Redirect GPU_CACHE_DIR to a tempdir so the test
+    # never touches the real cache.
+    saved_dir = comfy_client.GPU_CACHE_DIR
+    saved_path = os.environ.pop("CUDA_CACHE_PATH", None)
+    saved_max = os.environ.pop("CUDA_CACHE_MAXSIZE", None)  # clean baseline, then test override
+    tmp = Path(tempfile.mkdtemp(prefix="animgen_gpucache_"))
+    comfy_client.GPU_CACHE_DIR = tmp
+    try:
+        env = comfy_client.launch_env()
+        assert env["CUDA_CACHE_PATH"] == str(tmp), "launch redirects the CUDA kernel cache"
+        assert env["CUDA_CACHE_MAXSIZE"] == str(comfy_client.GPU_CACHE_MAXSIZE_BYTES), "and caps it"
+        # a seeded fake kernel is measured then removed; reporting is well-shaped
+        (tmp / "kernel.bin").write_bytes(b"x" * 2048)
+        assert comfy_client.gpu_cache_size_mb() > 0
+        res = comfy_client.clear_gpu_cache()
+        assert res == {"files": 1, "bytes": 2048}
+        assert comfy_client.gpu_cache_size_mb() == 0
+        # clearing an absent cache is non-raising and reports nothing removed
+        shutil.rmtree(tmp, ignore_errors=True)
+        assert comfy_client.clear_gpu_cache() == {"files": 0, "bytes": 0}
+        # an explicit CUDA_CACHE_PATH in the environment is respected (setdefault, not clobbered)
+        os.environ["CUDA_CACHE_PATH"] = "X:/custom/cache"
+        assert comfy_client.launch_env()["CUDA_CACHE_PATH"] == "X:/custom/cache"
+    finally:
+        comfy_client.GPU_CACHE_DIR = saved_dir
+        for k, v in (("CUDA_CACHE_PATH", saved_path), ("CUDA_CACHE_MAXSIZE", saved_max)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("comfy GPU cache OK: isolated CUDA_CACHE_PATH + cap + best-effort clear")
 
 
 def test_comfy_stop_helpers() -> None:
@@ -2228,6 +2265,7 @@ if __name__ == "__main__":
     test_dynamic_vram_gate()
     test_preflight_gate()
     test_comfy_launch_helpers()
+    test_comfy_gpu_cache()
     test_comfy_stop_helpers()
     test_comfy_views()
     test_orphan_recovery()
