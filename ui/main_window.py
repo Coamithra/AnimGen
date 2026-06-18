@@ -905,7 +905,8 @@ class MainWindow(QMainWindow):
         synth = self._shot_from_snapshot(take.shot_id, snap)
         self.project.update_take(
             take.id, status=STATUS_PENDING, error=None, started=None, completed=None,
-            video_path=None, thumbnail=None, preview_gif=None, cost_actual=None)
+            video_path=None, thumbnail=None, preview_gif=None, cost_actual=None,
+            interrupted=False)   # re-queued fresh; no longer an interruption
         self.jobs.restart_take(take.id, model["backend"],
                                self._make_runner(model, synth, settings, take.id))
         self._log(f"restarting {take.id[:8]} ({self._take_label(take)})")

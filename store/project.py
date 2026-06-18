@@ -329,7 +329,9 @@ class Project:
         # Migration: pre-2026-06-18 cancelled takes carry no `interrupted` flag. Backfill it from
         # the recovery reason text in `error` ("...not submitted before restart...") so an existing
         # crash/restart-cancelled batch is still recognised as interrupted (not user-cancelled) by
-        # the bulk Restart action. New takes always serialize the field, so this only fires once.
+        # the bulk Restart action. Coupled to the reason strings: the orphan-recovery CANCEL reasons
+        # contain "restart", the manual ones ("cancelled by user") don't. New takes always serialize
+        # the field, so this heuristic only runs for legacy files (once, then the value is persisted).
         if "interrupted" not in d and d.get("status") == STATUS_CANCELLED:
             d["interrupted"] = "restart" in (d.get("error") or "").lower()
         return Take(**d)
