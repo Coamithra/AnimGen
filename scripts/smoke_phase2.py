@@ -1466,6 +1466,17 @@ def test_batch() -> None:
     assert batch.plan_batch([shots[0]], takes_per_shot=0, model_of=model_of,
                             aspects_of=aspects_of, est_of=est_of).take_count == 1
 
+    # queue_order: round-major (one take of every eligible shot per round, repeated N),
+    # NOT shot-major (all N of shot 1 then all N of shot 2). eligible items are
+    # (shot, model, settings, est); check the shot-name sequence.
+    order = [shot.name for shot, _m, _s, _e in batch.queue_order(plan.eligible, 3)]
+    assert order == ["ok1", "ok2", "ok1", "ok2", "ok1", "ok2"], order
+    assert [s.name for s, *_ in batch.queue_order(plan.eligible, 1)] == ["ok1", "ok2"]
+    # n<1 floors at one round
+    floored = batch.queue_order(plan.eligible, 0)
+    assert [s.name for s, *_ in floored] == ["ok1", "ok2"], floored
+    assert batch.queue_order([], 5) == []                         # empty eligible -> empty
+
     # BatchRun completion: terminal-only, complete when all takes drained
     run = batch.BatchRun(take_ids={"a", "b"}, power_action=batch.POWER_NONE, started="t0")
     assert not run.complete
@@ -1488,7 +1499,8 @@ def test_batch() -> None:
 
     cmd = batch.sleep_command()
     assert cmd and isinstance(cmd, list)
-    print("batch OK: plan eligibility/N-per-shot, BatchRun completion, report, sleep cmd")
+    print("batch OK: plan eligibility/N-per-shot, round-major queue_order, "
+          "BatchRun completion, report, sleep cmd")
 
 
 def test_batch_finalize() -> None:
@@ -1785,6 +1797,31 @@ def test_interrupted_flag() -> None:
     print("interrupted flag OK: round-trip, migration backfill, manual=False, recovery(cancel+fail)/abandon=True")
 
 
+def test_ws_progress_diagnostics() -> None:
+    """Crash-investigation diagnostics: ANIMGEN_NO_WS_PROGRESS disables the best-effort progress
+    WS (bisection lever / escape hatch so it can't be implicated), and applog._max_stack_depth
+    reports a positive depth + thread name (the watchdog's native-vs-Python overflow signal)."""
+    import os as _os
+
+    import applog
+    from backends import comfy_client
+
+    prev = _os.environ.get("ANIMGEN_NO_WS_PROGRESS")
+    _os.environ["ANIMGEN_NO_WS_PROGRESS"] = "1"
+    try:
+        t, stop = comfy_client._start_progress_ws("cid", "pid", lambda **k: None)
+        assert t is None and stop is None, (t, stop)
+    finally:
+        if prev is None:
+            _os.environ.pop("ANIMGEN_NO_WS_PROGRESS", None)
+        else:
+            _os.environ["ANIMGEN_NO_WS_PROGRESS"] = prev
+
+    depth, who = applog._max_stack_depth()
+    assert isinstance(depth, int) and depth > 0 and isinstance(who, str), (depth, who)
+    print("ws diagnostics OK: NO_WS_PROGRESS disables listener; stack-depth probe reports")
+
+
 def test_done_elapsed() -> None:
     from ui.queue_view import done_elapsed
     from store.models import Take
@@ -1898,4 +1935,5 @@ if __name__ == "__main__":
     test_restart_take()
     test_restart_from_snapshot()
     test_interrupted_flag()
+    test_ws_progress_diagnostics()
     print("PHASE 2 SMOKE: PASS")

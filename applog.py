@@ -107,6 +107,26 @@ def _proc_stats() -> str:
            (f" os_threads={osn}" if osn is not None else "")
 
 
+def _max_stack_depth() -> tuple[int, str]:
+    """Deepest Python call stack across all live threads, as (frames, thread_name).
+
+    Diagnostic for the 2026-06-18 native stack-overflow crash: a native (C/C++) overflow
+    leaves SHALLOW Python frames, so if this stays flat across watchdog ticks right up to the
+    death, the overflow is in Qt/C++, not Python recursion; a CLIMBING value would instead
+    finger runaway Python recursion (and name the thread). Cheap - one sys._current_frames()
+    walk per watchdog tick."""
+    names = {t.ident: t.name for t in threading.enumerate()}
+    best, who = 0, "?"
+    for ident, frame in sys._current_frames().items():
+        depth, f = 0, frame
+        while f is not None:
+            depth += 1
+            f = f.f_back
+        if depth > best:
+            best, who = depth, names.get(ident, str(ident))
+    return best, who
+
+
 # ---- setup --------------------------------------------------------------------
 def setup() -> logging.Logger:
     """Install file+stderr logging, faulthandler, uncaught-exception hooks (main + worker
@@ -255,8 +275,9 @@ def start_watchdog() -> None:
         while True:
             time.sleep(WATCHDOG_S)
             age = (time.monotonic() - _last_gui_beat) if _last_gui_beat else None
-            logger.info("watchdog  %s  gui_beat_age=%s", _proc_stats(),
-                        f"{age:.0f}s" if age is not None else "n/a")
+            depth, who = _max_stack_depth()
+            logger.info("watchdog  %s  gui_beat_age=%s  max_pydepth=%d(%s)", _proc_stats(),
+                        f"{age:.0f}s" if age is not None else "n/a", depth, who)
             if age is not None and age > HEARTBEAT_S * 3:
                 if not hung:
                     logger.warning("GUI UNRESPONSIVE for %.0fs (possible hang/freeze) - "
