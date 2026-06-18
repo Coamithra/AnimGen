@@ -339,6 +339,38 @@ def test_keypose_migration_persist_failure() -> None:
     print("keypose migration failure OK: sources kept + dirty on failed persist, reload recovers")
 
 
+def test_output_url_parsing() -> None:
+    """run_prediction's output->url resolution must never AttributeError on an unexpected
+    output shape: a list whose first element is neither str nor dict ([None], a nested
+    list, a number, ...) falls through to a clean ReplicateError quoting the raw output,
+    while well-formed shapes still resolve to the URL."""
+    from backends.replicate_client import ReplicateError, _output_video_url
+
+    # Well-formed shapes still resolve to the video URL.
+    assert _output_video_url("https://x/v.mp4") == "https://x/v.mp4"
+    assert _output_video_url(["https://x/a.mp4", "https://x/b.mp4"]) == "https://x/a.mp4"
+    assert _output_video_url([{"url": "https://x/c.mp4"}]) == "https://x/c.mp4"
+    assert _output_video_url({"url": "https://x/d.mp4"}) == "https://x/d.mp4"
+    assert _output_video_url({"video": "https://x/e.mp4"}) == "https://x/e.mp4"
+
+    # Bad shapes raise ReplicateError (NEVER AttributeError/TypeError) and quote the raw
+    # output. The nested list [[...]] has a list (not str/dict) first element, and the
+    # nested-value dicts have a non-str url/video, so all fall through to no usable URL.
+    bad_outputs = ([None], [[{"url": "https://x/n.mp4"}]], [42], [True], [], {}, None, "",
+                   {"foo": "bar"}, {"url": {"nested": "x"}}, {"video": ["https://x/v.mp4"]})
+    for bad in bad_outputs:
+        try:
+            _output_video_url(bad)
+        except ReplicateError as e:
+            assert "No video URL in output" in str(e), str(e)
+        except Exception as e:  # AttributeError (the bug) or anything else
+            raise AssertionError(
+                f"expected ReplicateError for {bad!r}, got {type(e).__name__}: {e}")
+        else:
+            raise AssertionError(f"expected ReplicateError for {bad!r}, got no exception")
+    print("output url parsing OK: bad shapes -> ReplicateError (no AttributeError), good resolve")
+
+
 def test_gui_build() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -363,5 +395,6 @@ if __name__ == "__main__":
     test_shot_star_write_through()
     test_keypose_migration_persist()
     test_keypose_migration_persist_failure()
+    test_output_url_parsing()
     test_gui_build()
     print("PHASE 1 SMOKE: PASS")
