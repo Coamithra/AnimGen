@@ -138,7 +138,7 @@ def test_monitor_poller_supersede() -> None:
     lock = threading.Lock()
     probes: list[int] = []  # idents of threads that called monitor_snapshot
 
-    def fake_snapshot(timeout: float = 2.0):
+    def fake_snapshot(timeout: int = 2):
         with lock:
             probes.append(threading.get_ident())
         time.sleep(0.05)  # simulate the blocking socket probe so a supersede can race it
@@ -164,11 +164,16 @@ def test_monitor_poller_supersede() -> None:
         assert not t2.is_alive(), "second poller thread did not exit when superseded"
         assert t3.is_alive(), "the latest poller thread should still be running"
 
+        # t1/t2 are confirmed dead, so only the survivor can probe from here. Poll until it
+        # has probed at least once (robust to a slow/loaded scheduler), then assert it alone.
         with lock:
             probes.clear()
-        time.sleep(0.25)  # several poll intervals - only the survivor should probe
-        with lock:
-            seen = set(probes)
+        deadline = time.time() + 3.0
+        seen: set[int] = set()
+        while time.time() < deadline and not seen:
+            time.sleep(0.02)
+            with lock:
+                seen = set(probes)
         assert seen == {t3.ident}, f"expected only the live poller to probe, got {seen}"
 
         poller.stop()
