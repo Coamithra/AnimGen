@@ -9,6 +9,7 @@ pending -> generating -> done and the failure path.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -219,6 +220,43 @@ def test_comfy_prepare() -> None:
                    for n in wf3.values() for v in n.get("inputs", {}).values()), \
         "end-image node should have no consumers when no end frame is given"
 
+    # A single-LoadImage FLF template whose end image comes from a NON-LoadImage node:
+    # node 3 (WanFirstLastFrameToVideo) is fed end_image from node 2, and there is only
+    # one LoadImage (node 1, the start). With no declared end_image role an open-ended
+    # render can't pin the end node, so it must fail loudly rather than silently reuse the
+    # baked end conditioning (the old len(loads) > 1 gate left it connected).
+    flf_one_load = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "start.png"}},
+        "2": {"class_type": "ImageScale", "inputs": {"image": "start.png"}},
+        "3": {"class_type": "WanFirstLastFrameToVideo",
+              "inputs": {"start_image": ["1", 0], "end_image": ["2", 0]}},
+    }
+    try:
+        comfy_client.prepare_workflow(copy.deepcopy(flf_one_load), end_img=None)
+    except comfy_client.ComfyError:
+        pass
+    else:
+        raise AssertionError("single-LoadImage FLF + no role + no end frame must raise")
+
+    # Regression: a declared end_image role severs even when len(loads) == 1 — the role,
+    # not the LoadImage count, drives the disconnect.
+    wf_role = comfy_client.prepare_workflow(
+        copy.deepcopy(flf_one_load), end_img=None, node_roles={"end_image": "2"})
+    assert "end_image" not in wf_role["3"]["inputs"], \
+        "declared end_image role must sever the end conditioning with a single LoadImage"
+    assert wf_role["3"]["inputs"]["start_image"] == ["1", 0], "start link must survive"
+
+    # A genuine I2V template (single LoadImage, no end-image conditioning at all) must
+    # still no-op on a no-end-frame render — not raise. Guards against _has_end_image_-
+    # conditioning becoming over-broad and breaking the common open-ended path.
+    i2v_one_load = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "start.png"}},
+        "2": {"class_type": "WanImageToVideo", "inputs": {"start_image": ["1", 0]}},
+    }
+    wf_i2v = comfy_client.prepare_workflow(copy.deepcopy(i2v_one_load), end_img=None)
+    assert wf_i2v["2"]["inputs"]["start_image"] == ["1", 0], \
+        "genuine I2V template must be left intact when no end frame is given"
+
     # text_encoder_cpu pins CLIP-loader nodes to the CPU (frees ~6GB VRAM on the 12GB card);
     # default leaves the template's device untouched. Node 3 is the CLIPLoader.
     assert wf["3"]["inputs"]["device"] == "default", "default run must not force CPU"
@@ -229,7 +267,8 @@ def test_comfy_prepare() -> None:
     # _force_text_encoder_cpu only touches CLIP-loader class types, nothing else.
     assert comfy_client._force_text_encoder_cpu({"x": {"class_type": "KSamplerAdvanced",
                                                        "inputs": {}}}) == 0
-    print("comfy prepare_workflow OK: node-role map + heuristic fallback + --set + open-ended sever + cpu-text-enc")
+    print("comfy prepare_workflow OK: node-role map + heuristic fallback + --set + open-ended sever "
+          "(role-driven; single-load FLF raises; declared role severs at len(loads)==1) + cpu-text-enc")
 
 
 def test_dynamic_vram_gate() -> None:

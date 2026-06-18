@@ -507,6 +507,26 @@ def _disconnect_consumers(wf: dict, src_id: str) -> None:
             del inputs[field]
 
 
+# Input field names that carry end-image conditioning on an FLF video node
+# (Wan's WanFirstLastFrameToVideo names it `end_image`). Their presence as a node
+# *link* is the structural "this template is FLF-shaped" signal — robust to node ids
+# and LoadImage count, unlike the old len(loads) > 1 heuristic.
+_END_IMAGE_INPUT_FIELDS = frozenset({"end_image"})
+
+
+def _has_end_image_conditioning(wf: dict) -> bool:
+    """True if any node consumes an end-image link, i.e. the template is FLF-shaped."""
+    for node in wf.values():
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(inputs, dict):
+            continue
+        for field in _END_IMAGE_INPUT_FIELDS:
+            v = inputs.get(field)
+            if isinstance(v, list) and v:
+                return True
+    return False
+
+
 # Core ComfyUI CLIP-loader node types that expose the optional `device` input
 # (["default","cpu"]); the GGUF/custom loaders aren't guaranteed to, so we don't touch them.
 _CLIP_LOADER_TYPES = frozenset({
@@ -564,15 +584,28 @@ def prepare_workflow(template: dict, *, start_img: Optional[str] = None,
         if nid is None:
             raise ComfyError("no LoadImage node for start image")
         set_input(nid, "image", copy_input_image(start_img))
+    # The end-image node: the declared end_image role, else a 2nd LoadImage. Resolved once
+    # so setting the end frame and severing it for an open-ended render stay in lockstep.
+    end_node = roles.get("end_image") or (loads[1] if len(loads) > 1 else None)
     if end_img is not None:
-        nid = roles.get("end_image") or (loads[1] if len(loads) > 1 else None)
-        if nid is None:
+        if end_node is None:
             raise ComfyError("no second LoadImage node for end image")
-        set_input(nid, "image", copy_input_image(end_img))
-    elif roles.get("end_image") or len(loads) > 1:
+        set_input(end_node, "image", copy_input_image(end_img))
+    else:
         # No end frame -> run open-ended: sever the end-image conditioning so an FLF
         # workflow degrades to I2V instead of reusing the template's baked end frame.
-        _disconnect_consumers(wf, roles.get("end_image") or loads[1])
+        # Drive this off the declared end_image role (the authoritative FLF signal), not
+        # a LoadImage-count heuristic: a single-LoadImage FLF template whose end frame is
+        # fed by a non-LoadImage node would otherwise slip past len(loads) > 1 and keep its
+        # baked end keyframe. If the workflow still carries end-image conditioning we can't
+        # pin to a node, fail loudly rather than render against a stale baked frame
+        # (mirrors the "no second LoadImage node for end image" guard above).
+        if end_node is not None:
+            _disconnect_consumers(wf, end_node)
+        elif _has_end_image_conditioning(wf):
+            raise ComfyError(
+                "workflow has end-image conditioning but no end_image node could be "
+                "identified for an open-ended render; declare comfy_nodes.end_image")
     if prompt is not None:
         nid = roles.get("prompt") or (clips[0] if clips else None)
         if nid is None:
