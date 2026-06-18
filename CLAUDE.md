@@ -100,10 +100,12 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/mock_comfy.py --fail-rat
 then launch the app and fire **Generate batch…**. **`--fail-rate F`** (0..1) makes that fraction
 of renders return a `status_str=="error"` `/history` entry (an `execution_error`, no outputs) so
 the app records a **FAILED** take — the server stays **up**, so it reads as a genuine workflow
-error (not a crash), exercising crash-recovery's "up == not a crash" discrimination (rule #12) and
-the **Restart take** path (rule #17) offline. It does **not** simulate a server-death crash (that
-needs the real ComfyUI lifecycle, since `restart_server` relaunches via `build_launch_command`).
-GPU-free, no spend — but the cost-confirm gate (rule #1) still appears and must be driven.
+error (`interrupted=False`, not a crash), exercising crash-recovery's "up == not a crash"
+discrimination (rule #12) and the FAILED-take / queue-continuation path offline. Because these are
+*genuine* failures (not crash-*interrupted* takes), they do **not** feed the **Restart interrupted
+takes** action (rule #17). It also does **not** simulate a server-death crash (that needs the real
+ComfyUI lifecycle, since `restart_server` relaunches via `build_launch_command`). GPU-free, no
+spend — but the cost-confirm gate (rule #1) still appears and must be driven.
 
 ## Architecture map
 

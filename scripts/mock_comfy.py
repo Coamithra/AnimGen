@@ -22,10 +22,12 @@ PROTOCOL (matches backends/comfy_client.py):
                             --fail-rate, a fraction of renders instead return a status_str=="error"
                             entry (an execution_error message, no outputs) so comfy_client raises
                             ComfyError and the app records a FAILED take -- the server stays UP, so
-                            it reads as a genuine workflow error, exercising crash-recovery's
-                            "up == not a crash" discrimination and the restart-take path offline
+                            it reads as a genuine workflow error (interrupted=False), exercising
+                            crash-recovery's "up == not a crash" discrimination + the FAILED-take
+                            path offline. (Genuine failures, NOT crash-interrupted takes, so they
+                            don't feed the Restart-interrupted action -- rule #17.)
   GET  /queue            -> running/pending buckets (benign; used by orphan recovery)
-  POST /interrupt, /queue(clear), GET /object_info, GET /prompt -> benign
+  POST /interrupt, /queue(clear), /free, /upload/image, GET /object_info, GET /prompt -> benign
   GET  /ws?clientId=...  -> hand-rolled WebSocket streaming `progress` frames (+ optional
                             binary preview frames) then `executing`(null), like real ComfyUI
 
@@ -70,11 +72,29 @@ FAIL_RATE = 0.0           # fraction (0..1) of renders that return a workflow er
 SAFE_ARGV = ["main.py", "--listen", "127.0.0.1", "--port", "8188",
              "--disable-dynamic-vram", "--disable-async-offload", "--cache-none"]
 
+# Drop finished renders this many seconds after they completed so a multi-hour soak doesn't
+# grow the mock's own bookkeeping -- it exists to hunt an AnimGen leak, not add one.
+_DONE_TTL_S = 120.0
+
 _lock = threading.Lock()
 _renders: dict[str, dict] = {}   # pid -> {created, ready_at, done, fail}
 _order: list[str] = []           # submission order (serialized) for WS active-pid lookup
 _counter = 0
 _stats = {"submitted": 0, "completed": 0, "failed": 0, "ws_open": 0, "started": time.time()}
+
+
+def _prune_locked(now: float) -> None:
+    """Evict long-finished renders (caller holds _lock) so _renders/_order stay bounded.
+
+    Only done entries past the TTL are dropped; in-flight pids are kept, so the WS
+    active-pid lookup and /queue (which only look at not-done renders) are unaffected.
+    """
+    drop = {p for p in _order
+            if _renders.get(p, {}).get("done") and now - _renders[p]["ready_at"] > _DONE_TTL_S}
+    if drop:
+        for p in drop:
+            _renders.pop(p, None)
+        _order[:] = [p for p in _order if p not in drop]
 
 
 def _canned_output() -> Path:
@@ -86,6 +106,7 @@ def _canned_output() -> Path:
     takes = sorted((REPO_ROOT / "data").glob("*.assets/takes/*.mp4"),
                    key=lambda p: p.stat().st_size)
     if takes:
+        print(f"[mock] seeding canned clip from {takes[0]}", flush=True)
         shutil.copy2(takes[0], dest)
         return dest
     # fallback: synthesize a tiny clip with PyAV
@@ -198,6 +219,7 @@ class Handler(BaseHTTPRequestHandler):
             _renders[pid] = {"created": now, "ready_at": now + delay, "done": False,
                              "fail": fail}
             _order.append(pid)
+            _prune_locked(now)
             _stats["submitted"] += 1
             sub = _stats["submitted"]
         print(f"[mock] submit #{number} pid={pid[:8]} delay={delay:0.1f}s"
@@ -344,6 +366,9 @@ def main(argv):
     args = ap.parse_args(argv)
     RENDER_S, JITTER_S, WS_PREVIEW_BYTES = args.delay, args.jitter, args.preview_bytes
     FAIL_RATE = min(1.0, max(0.0, args.fail_rate))
+    if FAIL_RATE != args.fail_rate:
+        print(f"[mock] WARNING: --fail-rate {args.fail_rate} clamped to {FAIL_RATE} "
+              f"(expected a fraction 0..1)", flush=True)
 
     canned = _canned_output()
     print(f"[mock] canned output: {canned} ({canned.stat().st_size} bytes)", flush=True)
