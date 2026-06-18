@@ -181,6 +181,12 @@ Full mechanism + invariants in **Hard-won rule #13**.
 - `ANIMGEN_REMOTE` (default off) — when truthy, start the localhost control server that
   lets Claude drive the GUI (see `remote/`). `ANIMGEN_REMOTE_PORT` (default 8765; 0 =
   ephemeral) sets its port. Localhost-only, no auth — a dev/automation aid, not for prod.
+- `ANIMGEN_NO_WS_PROGRESS` (default off) — when truthy, disable the best-effort local-render
+  progress WebSocket (`comfy_client._start_progress_ws`). Renders still complete via the
+  `/history` poll (rule #11); you only lose the live % bar. It's both an escape hatch and a
+  **bisection lever** for the 2026-06-18 native stack-overflow crash investigation (rule #18):
+  run a batch with it off — if the crash stops, the WS is the culprit; if it still crashes, the
+  WS is exonerated and the overflow is in Qt/C++ on the main thread.
 
 ## Hard-won rules / gotchas
 
@@ -440,3 +446,20 @@ Full mechanism + invariants in **Hard-won rule #13**.
     substring — so a "cannot restart: …" unrestartable mark is not misread) so a pre-existing
     crashed batch is recognised on load. Smoke-tested in `smoke_phase2` (`test_restart_plan`,
     `test_restart_take`, `test_restart_from_snapshot`, `test_interrupted_flag`).
+18. **The 2026-06-18 native stack-overflow crash is UNRESOLVED — instrumented, not fixed.** A
+    local batch died with `Windows fatal exception: stack overflow` (in `animgen_faults.log`).
+    It's a **native (C/C++) overflow**, not Python: faulthandler dumped only *shallow* Python
+    frames (the WS recv chain is loop-based, ~10 frames; the main thread sat in `app.exec()`),
+    so the deep recursion was in C++ (Qt) — invisible to Python's stack walker — and being a
+    native fatal exception it can't be caught (no traceback, process just vanishes). It's rare
+    (~1 in 14 launches) and not yet reproduced. An earlier 16MB-stack band-aid on the WS thread
+    was **removed** (it would only mask the symptom). The current posture is **catch it, don't
+    paper over it**: (a) `ANIMGEN_NO_WS_PROGRESS` disables the prime-suspect progress WS as a
+    bisection lever (above); (b) `_ws_progress_listener` logs frame **telemetry** (text/bin
+    counts, bytes, max frame size) to `animgen.log` so the tail before a crash shows WS load;
+    (c) the **watchdog logs `max_pydepth`** (`applog._max_stack_depth`) each tick — a climbing
+    value fingers Python recursion + names the thread, a flat value confirms the overflow is
+    native; (d) `scripts/enable_crashdumps.py` configures **WER LocalDumps** so the OS writes a
+    full minidump (with the C++ call stack — the only way to name the faulting native frames)
+    to `data/crashdumps/` on the next crash. Until a minidump or a clean bisection pins the
+    cause, no targeted fix is possible. Smoke: `smoke_phase2.test_ws_progress_diagnostics`.
