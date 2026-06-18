@@ -224,7 +224,7 @@ class TakesView(QWidget):
     changed = Signal()
     export_requested = Signal(list)   # list[take_id]
     open_take_requested = Signal(str)  # take_id -> open it in the frame-by-frame viewer tab
-    restart_requested = Signal(list)   # list[take_id] -> re-run cancelled takes (MainWindow drives it)
+    restart_requested = Signal(list)   # list[take_id] -> re-run cancelled / crash-interrupted-failed takes (MainWindow drives it)
 
     def __init__(self, project: Project, shot_id: str, jobs=None):
         super().__init__()
