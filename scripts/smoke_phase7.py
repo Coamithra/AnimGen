@@ -74,6 +74,36 @@ def test_snapshot_and_resolve() -> None:
     print("snapshot/resolve OK")
 
 
+def test_resolve_prefers_visible() -> None:
+    """A text-targeted resolve must land on the *visible* duplicate, not an earlier hidden
+    one (e.g. a same-text 'Generate' button on an inactive shot tab) — matching
+    build_snapshot's visibility gate. A hidden match is only returned when none is visible."""
+    app = _app()
+    root = QWidget()
+    root.setObjectName("root2")
+    lay = QVBoxLayout(root)
+    hidden_btn = QPushButton("Generate")  # built/parented first -> earlier in tree order
+    visible_btn = QPushButton("Generate")
+    lay.addWidget(hidden_btn)
+    lay.addWidget(visible_btn)
+    root.show()
+    app.processEvents()
+    hidden_btn.hide()
+    app.processEvents()
+
+    assert not hidden_btn.isVisible() and visible_btn.isVisible(), "setup: one hidden, one shown"
+    # Without the fix, raw tree order returns the hidden button first (it diverged from the
+    # snapshot, which already omits it) -> /click by text then 400s as 'not visible'.
+    assert snap.resolve_target(root, text="Generate") is visible_btn, "exact: must prefer visible"
+    assert snap.resolve_target(root, text="gen") is visible_btn, "substring: must prefer visible"
+
+    visible_btn.hide()  # now no visible match exists -> a hidden one is an acceptable fallback
+    app.processEvents()
+    # hidden group is still searched; exact-first + tree order picks the earlier hidden_btn
+    assert snap.resolve_target(root, text="Generate") is hidden_btn, "hidden fallback"
+    print("resolve prefers visible OK")
+
+
 def test_tab_widget() -> None:
     """A named QTabWidget (like the app's `mainTabs`) reports its tab titles and switches
     via /set value=<title> — the inner unnamed QTabBar is not the only tab handle."""
@@ -264,6 +294,7 @@ def test_server_roundtrip() -> None:
 
 if __name__ == "__main__":
     test_snapshot_and_resolve()
+    test_resolve_prefers_visible()
     test_tab_widget()
     test_actions()
     test_monitor_poller_supersede()
