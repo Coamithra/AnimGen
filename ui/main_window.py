@@ -541,7 +541,15 @@ class MainWindow(QMainWindow):
         if not shot:
             return
         self.project.set_shot_starred(shot_id, not shot.starred)   # write-through, no dirty
-        self.reload()               # reflect the star + re-apply the "Starred shots" filter
+        # A full reload rebuilds every shot card (and its thumbnail grid) - 1-2s with many
+        # shots. Only the "Starred shots" filter changes which cards are visible on a star
+        # toggle, so reload only then; otherwise just repaint the one card's star button.
+        if self.starred_shots_filter.isChecked():
+            self.reload()
+        else:
+            card = self.cards.get(shot_id)
+            if card:
+                card._refresh_star_btn()
 
     def delete_shot(self, shot_id: str) -> None:
         shot = self.project.get_shot(shot_id)
