@@ -1176,25 +1176,20 @@ class MainWindow(QMainWindow):
         orphans = recovery.comfy_orphans(proj)
         if not orphans:
             return
-        if history is None:                       # ComfyUI unreachable - can't tell finished from
-            counts: Counter = Counter()           # lost; clear never-submitted, leave submitted
+        if history is None:                       # ComfyUI unreachable - nothing can be verified
+            counts: Counter = Counter()           # and no worker is live, so clear every orphan
             for p in recovery.plan_offline_recovery(orphans):
                 if p.action == recovery.CANCEL:
                     proj.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason)
-                elif p.action == recovery.FAIL:
+                else:                             # FAIL - generating take lost to the restart
                     proj.update_take(p.take_id, status=STATUS_FAILED, error=p.reason)
-                else:                             # LEAVE - keep generating; reclaim on a later launch
-                    counts[recovery.LEAVE] += 1
-                    continue
                 counts[p.action] += 1
                 self._refresh_shot(p.shot_id)
             parts = []
+            if counts[recovery.FAIL]:
+                parts.append(f"failed {counts[recovery.FAIL]} unrecoverable (ComfyUI unreachable)")
             if counts[recovery.CANCEL]:
                 parts.append(f"cancelled {counts[recovery.CANCEL]} un-submitted")
-            if counts[recovery.FAIL]:
-                parts.append(f"failed {counts[recovery.FAIL]} un-submitted")
-            if counts[recovery.LEAVE]:
-                parts.append(f"left {counts[recovery.LEAVE]} unfinished (ComfyUI unreachable)")
             if parts:
                 self._log("orphan recovery: " + "; ".join(parts))
             self._refresh_cancel_action()
