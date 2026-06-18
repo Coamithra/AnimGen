@@ -1518,9 +1518,18 @@ class MainWindow(QMainWindow):
             self.shot_tabs[shot_id].refresh_takes()
 
     def _refresh_shot_for_take(self, take_id: str) -> None:
+        """A take's status signal (status_changed / finished) - update just that take's tile in
+        the list card and the open detail tab, in place. Unlike _refresh_shot (used for discrete
+        actions like queueing/restart/delete, where a full reload is right), this avoids the
+        O(takes-in-shot) model rebuild + every-thumbnail/strip re-decode on every transition
+        (card #75). A newly-visible / removed take falls back to a full load inside update_take."""
         take = self.project.get_take(take_id)
-        if take:
-            self._refresh_shot(take.shot_id)
+        if not take:
+            return
+        if take.shot_id in self.cards:
+            self.cards[take.shot_id].update_take(take_id)
+        if take.shot_id in self.shot_tabs:
+            self.shot_tabs[take.shot_id].update_take(take_id)
 
     def _monitor_context(self) -> str:
         """Short app-state string for the heartbeat log (project + queue snapshot)."""
