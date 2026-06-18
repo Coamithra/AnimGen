@@ -178,6 +178,14 @@ class MainWindow(QMainWindow):
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
 
+        edit_menu = bar.addMenu("&Edit")
+        self.purge_cancelled_act = QAction("Remove cancelled takes", self)
+        self.purge_cancelled_act.setToolTip(
+            "Permanently delete every cancelled take in this project, across all shots "
+            "(ignores the view filters). This can't be undone.")
+        self.purge_cancelled_act.triggered.connect(self.remove_cancelled_takes)
+        edit_menu.addAction(self.purge_cancelled_act)
+
         view_menu = bar.addMenu("&View")
         for widget, name in self._fixed_tabs:
             act = QAction(name, self)
@@ -465,6 +473,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{shown} shots shown · {len(shots)} total")
         self._refresh_total_price(shots)
         self._refresh_restart_action()   # a freshly-opened project may already hold cancelled takes
+        self._refresh_purge_cancelled_action()
         self._update_title()
 
     def _refresh_total_price(self, shots) -> None:
@@ -865,6 +874,40 @@ class MainWindow(QMainWindow):
     def _interrupted_take_count(self) -> int:
         return sum(1 for t in self.project.list_takes(include_deleted=False)
                    if t.interrupted and t.status in (STATUS_CANCELLED, STATUS_FAILED))
+
+    # ---- remove cancelled takes (Edit menu) ----------------------------
+    def _cancelled_take_count(self) -> int:
+        # include_deleted: a binned cancelled take is still cancelled and should be purgeable.
+        return sum(1 for t in self.project.list_takes(include_deleted=True)
+                   if t.status == STATUS_CANCELLED)
+
+    def _refresh_purge_cancelled_action(self) -> None:
+        self.purge_cancelled_act.setEnabled(self._cancelled_take_count() > 0)
+
+    def remove_cancelled_takes(self) -> None:
+        """Edit menu: permanently remove every cancelled take in the project, across all shots
+        (ignores the view filters, like Cancel pending / Restart interrupted). Cancelled takes
+        never rendered, so this just drops their records (no media to bin); it's irreversible,
+        so confirm first - the dialog defaults to No."""
+        cancelled = [t for t in self.project.list_takes(include_deleted=True)
+                     if t.status == STATUS_CANCELLED]
+        if not cancelled:
+            QMessageBox.information(self, "Remove cancelled takes",
+                                    "There are no cancelled takes to remove.")
+            return
+        n = len(cancelled)
+        if QMessageBox.question(
+                self, "Remove cancelled takes",
+                f"Permanently remove {n} cancelled take{'' if n == 1 else 's'} from this "
+                f"project, across all shots?\n\nThis can't be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        removed = self.project.purge_takes(t.id for t in cancelled)
+        self._log(f"removed {removed} cancelled take(s)")
+        self.reload()                 # rebuild shot cards / takes grids without the purged takes
+        self._refresh_cancel_action()  # also refreshes the Restart action's enabled state
+        self.queue_tab.refresh()
 
     # ---- restart interrupted takes -------------------------------------
     def restart_cancelled_takes(self) -> None:

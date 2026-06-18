@@ -21,7 +21,7 @@ import paths  # noqa: E402
 paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
 
 from store.project import Project  # noqa: E402
-from store.models import STATUS_DONE  # noqa: E402
+from store.models import STATUS_CANCELLED, STATUS_DONE  # noqa: E402
 
 
 def test_library() -> None:
@@ -394,6 +394,72 @@ def test_output_url_parsing() -> None:
     print("output url parsing OK: bad shapes -> ReplicateError (no AttributeError), good resolve")
 
 
+def test_purge_takes() -> None:
+    """Hard-delete: purge_takes drops takes from takes.json entirely (no bin/restore), deletes
+    each take's MANAGED media (files under .assets) but leaves an EXTERNAL ref in place (gotcha
+    #2), counts only what it actually removed, and persists in one write. A binned (soft-deleted)
+    cancelled take is still cancelled, so it's purged too."""
+    proj_path = Path(tempfile.mkdtemp()) / "purge.animproj"
+    p = Project.new()
+    shot = p.add_shot("kick", model_id="local-flf-wan14b")
+    p.save_as(proj_path)
+
+    done = p.add_take(shot.id, status=STATUS_DONE)
+    managed = p.takes_dir / "c1.mp4"           # take media the project OWNS (under .assets)
+    managed.write_bytes(b"managed")
+    canc_managed = p.add_take(shot.id, status=STATUS_CANCELLED, video_path=str(managed))
+    external = Path(tempfile.mkdtemp()) / "ext.mp4"   # an external ref (seeded-style)
+    external.write_bytes(b"external")
+    p.add_take(shot.id, status=STATUS_CANCELLED, video_path=str(external))
+    binned = p.add_take(shot.id, status=STATUS_CANCELLED)
+    p.soft_delete_take(binned.id)              # binned but still cancelled -> still purged
+
+    cancelled = [t for t in p.list_takes(include_deleted=True) if t.status == STATUS_CANCELLED]
+    assert len(cancelled) == 3, len(cancelled)
+    assert p.purge_takes(t.id for t in cancelled) == 3
+
+    # Gone from memory and disk; the done take survives.
+    assert [t.id for t in p.list_takes(include_deleted=True)] == [done.id]
+    assert p.get_take(canc_managed.id) is None
+    on_disk = json.loads((p.assets_dir / "takes.json").read_text(encoding="utf-8"))
+    assert [t["id"] for t in on_disk["takes"]] == [done.id], "only the done take remains on disk"
+
+    # Managed media deleted; the external ref is left exactly where it is.
+    assert not managed.exists(), "managed media under .assets must be deleted"
+    assert external.exists(), "external media ref must NOT be touched (gotcha #2)"
+
+    # No-op safety: purging unknown / already-gone ids removes nothing and skips the write.
+    assert p.purge_takes([canc_managed.id, "nope"]) == 0
+    print("purge takes OK: hard-delete drops records + managed media, keeps external, persists")
+
+
+def test_remove_cancelled_takes_action() -> None:
+    """The Edit menu exposes 'Remove cancelled takes'; its enabled state tracks whether the
+    project holds any cancelled take, and the purge clears them. (The handler's confirm dialog
+    is modal, so we drive the purge directly here -- never call .exec() headless.)"""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    p = Project.new("Untitled")
+    shot = p.add_shot("kick", model_id="local-flf-wan14b")
+    win = MainWindow(p)
+    assert win.purge_cancelled_act.text() == "Remove cancelled takes"
+    assert not win.purge_cancelled_act.isEnabled(), "disabled with no cancelled takes"
+
+    p.add_take(shot.id, status=STATUS_CANCELLED)
+    win.reload()
+    assert win._cancelled_take_count() == 1
+    assert win.purge_cancelled_act.isEnabled(), "enabled once a cancelled take exists"
+
+    win.project.purge_takes(t.id for t in win.project.list_takes(include_deleted=True)
+                            if t.status == STATUS_CANCELLED)
+    win.reload()
+    assert win._cancelled_take_count() == 0 and not win.purge_cancelled_act.isEnabled()
+    print("Edit menu OK: Remove cancelled takes enables on cancelled takes + purges them")
+
+
 def test_gui_build() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -419,5 +485,7 @@ if __name__ == "__main__":
     test_keypose_migration_persist()
     test_keypose_migration_persist_failure()
     test_output_url_parsing()
+    test_purge_takes()
+    test_remove_cancelled_takes_action()
     test_gui_build()
     print("PHASE 1 SMOKE: PASS")

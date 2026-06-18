@@ -552,6 +552,33 @@ class Project:
     def restore_take(self, take_id: str) -> None:
         self.update_take(take_id, deleted=False)
 
+    def purge_takes(self, take_ids) -> int:
+        """Permanently remove takes - drop them from takes.json entirely (no bin, no restore).
+        Best-effort deletes each take's MANAGED media (files under the assets dir); an external
+        ref (e.g. a seeded ../Fighter/out take) is left exactly where it is - this stays purely
+        additive toward anything the project doesn't own (gotcha #2). Returns the count removed.
+        Unlike soft_delete_take this is irreversible. One takes.json write for the whole batch."""
+        removed = 0
+        with self._lock:
+            for tid in list(take_ids):
+                take = self._takes.pop(tid, None)
+                if take is None:
+                    continue
+                removed += 1
+                for field in _TAKE_PATHS:
+                    val = getattr(take, field, None)
+                    if not val:
+                        continue
+                    p = Path(val)
+                    try:
+                        if p.exists() and _under(p, self._assets_dir):
+                            p.unlink()
+                    except OSError:
+                        pass    # best-effort; a locked managed file just lingers as orphan media
+        if removed:
+            self._write_takes_file()
+        return removed
+
     # ---- jobs (in-memory only) -----------------------------------------
     def add_job(self, take_id: str, **kw) -> Job:
         job = Job(id=new_id(), take_id=take_id, created=_now(), updated=_now(), **kw)
