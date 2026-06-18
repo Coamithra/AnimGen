@@ -433,6 +433,36 @@ def test_snapshot_includes_framing() -> None:
     print("MainWindow OK: snapshot carries canvas + crop framing")
 
 
+def test_generate_shot_missing_shot() -> None:
+    """generate_shot is fed a deleted/unknown shot_id (generate_requested is a queued
+    signal; the shot can vanish between emit and slot). It must bail quietly - no
+    AttributeError, no launch, the cost gate never shown - matching the guarded siblings."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui import main_window
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+    project.save_as(Path(tempfile.mkdtemp()) / "p.animproj")
+    win = MainWindow(project)
+
+    gate_shown = []
+    orig_confirm = main_window.confirm_launch
+    main_window.confirm_launch = lambda *a, **k: gate_shown.append(True) or True
+    try:
+        win.generate_shot("does-not-exist")        # never existed
+        project.delete_shot(shot.id)
+        win.generate_shot(shot.id)                  # existed, now deleted (stale signal)
+    finally:
+        main_window.confirm_launch = orig_confirm
+
+    assert not gate_shown, "cost gate must never be shown for a missing shot"
+    assert project.list_takes(shot.id) == [], "no take queued for a missing shot"
+    print("MainWindow OK: generate_shot on a missing/deleted shot is a quiet no-op")
+
+
 def test_take_player_settings_panel() -> None:
     """The viewer's ⚙ button and right-click 'Show generation settings' both reveal the
     docked panel; it's hidden by default and toggles off again. No modal .exec()."""
@@ -606,6 +636,7 @@ if __name__ == "__main__":
     test_tab_state_persists_on_close()
     test_format_generation_settings()
     test_snapshot_includes_framing()
+    test_generate_shot_missing_shot()
     test_take_player_settings_panel()
     test_runner_self_cancel_during_submit()
     test_run_survives_deleted_signals()
