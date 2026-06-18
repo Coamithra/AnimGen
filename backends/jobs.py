@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Callable
 
+import shiboken6
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
 from store.project import Project
@@ -53,17 +54,56 @@ class GenerationJob(QRunnable):
         self.requeue = requeue       # shared; ids whose in-flight render was halted to re-run
         self.done_cb = done_cb       # JobManager._on_job_done(take_id, final_status)
 
+    def _emit(self, name: str, *args) -> None:
+        """Emit a signal on self.signals, degrading to a no-op if its C++ QObject was deleted.
+
+        run() executes on a worker thread; if the _JobSignals object is torn down (project /
+        JobManager churn, GC) while a worker is still mid-render, an unguarded
+        self.signals.<sig>.emit(...) raises RuntimeError('Signal source has been deleted').
+        Because run() is a QRunnable override invoked from C++, that uncaught exception aborts
+        the whole process at the C++ layer (std::terminate) with NO Python traceback - the
+        crash this fix targets. shiboken6.isValid gates the common case; the try/except closes
+        the race between the check and the emit. The take's state is already persisted via
+        write-through (project.update_take), so a dropped signal only costs a UI refresh."""
+        try:
+            if not shiboken6.isValid(self.signals):
+                return
+            getattr(self.signals, name).emit(*args)
+        except RuntimeError:
+            pass
+
     @Slot()
     def run(self) -> None:
+        # Belt-and-braces: a QRunnable::run() override that lets ANY exception escape propagates
+        # into C++ as std::terminate/abort, killing the whole app with no traceback. Swallow
+        # everything (BaseException deliberately - KeyboardInterrupt/SystemExit on a pool worker
+        # would abort just as hard) so a single take's failure can never take the process down.
+        try:
+            self._run()
+        except BaseException:  # noqa: BLE001 - never let anything escape the C++ override
+            # _run's own finally normally records the take and calls done_cb. If it raised
+            # *before* that finally (e.g. the GENERATING-transition update_take/add_job itself
+            # failed), the take would be left non-terminal and its serialized-pool slot leaked -
+            # the same "a take silently vanishes" failure mode this fix targets. Last resort:
+            # record FAILED (best-effort) and fire done_cb so the manager still frees the slot.
+            import traceback
+            traceback.print_exc()
+            try:
+                self.project.update_take(self.take_id, status=STATUS_FAILED, error="worker aborted")
+            except Exception:  # noqa: BLE001 - best-effort; never re-raise out of the override
+                pass
+            self.done_cb(self.take_id, STATUS_FAILED)
+
+    def _run(self) -> None:
         tid = self.take_id
         if tid in self.cancelled:    # cancelled while queued - never invoke the backend
             self.project.update_take(tid, status=STATUS_CANCELLED, error="cancelled before start")
-            self.signals.status_changed.emit(tid, STATUS_CANCELLED)
+            self._emit("status_changed", tid, STATUS_CANCELLED)
             self.done_cb(tid, STATUS_CANCELLED)
             return
         self.project.update_take(tid, status=STATUS_GENERATING,
                                  started=datetime.now().isoformat(timespec="seconds"))
-        self.signals.status_changed.emit(tid, STATUS_GENERATING)
+        self._emit("status_changed", tid, STATUS_GENERATING)
         job = self.project.add_job(tid, backend=self.backend, state="running")
 
         log_lines: list[str] = []
@@ -73,10 +113,10 @@ class GenerationJob(QRunnable):
                      label: str = "") -> None:
             if line is not None:                 # milestone: log line + persist (infrequent)
                 log_lines.append(line)
-                self.signals.progress.emit(tid, line)
+                self._emit("progress", tid, line)
                 self.project.update_job(job.id, log="\n".join(log_lines))
             if frac is not None:                 # per-step fraction: UI bar only, no JSON write
-                self.signals.progress_pct.emit(tid, frac, label)
+                self._emit("progress_pct", tid, frac, label)
 
         try:
             result = self.runner(progress) or {}
@@ -87,8 +127,8 @@ class GenerationJob(QRunnable):
                     fields[k] = result[k]
             self.project.update_take(tid, **fields)
             self.project.update_job(job.id, state="done", ext_id=result.get("prediction_id"))
-            self.signals.status_changed.emit(tid, STATUS_DONE)
-            self.signals.finished.emit(tid)
+            self._emit("status_changed", tid, STATUS_DONE)
+            self._emit("finished", tid)
             final = STATUS_DONE
         except Exception as e:  # noqa: BLE001 - surface any backend failure on the take
             err = f"{type(e).__name__}: {e}"
@@ -101,7 +141,7 @@ class GenerationJob(QRunnable):
                 self.project.update_take(tid, status=STATUS_PENDING, error=None, started=None)
                 self.project.update_job(job.id, state="cancelled",
                                         log="\n".join(log_lines + [err, "re-queued by pause"]))
-                self.signals.status_changed.emit(tid, STATUS_PENDING)
+                self._emit("status_changed", tid, STATUS_PENDING)
                 final = STATUS_PENDING
             elif tid in self.stopping or tid in self.cancelled:
                 # The backend error is here because we asked it to stop (shot deleted /
@@ -110,13 +150,13 @@ class GenerationJob(QRunnable):
                                          error="stopped by user")
                 self.project.update_job(job.id, state="cancelled",
                                         log="\n".join(log_lines + [err]))
-                self.signals.status_changed.emit(tid, STATUS_CANCELLED)
+                self._emit("status_changed", tid, STATUS_CANCELLED)
                 final = STATUS_CANCELLED
             else:
                 self.project.update_take(tid, status=STATUS_FAILED, error=err)
                 self.project.update_job(job.id, state="failed", log="\n".join(log_lines + [err]))
-                self.signals.status_changed.emit(tid, STATUS_FAILED)
-                self.signals.failed.emit(tid, err)
+                self._emit("status_changed", tid, STATUS_FAILED)
+                self._emit("failed", tid, err)
                 final = STATUS_FAILED
         finally:
             self.stopping.discard(tid)
