@@ -104,6 +104,7 @@ class Project:
         self._takes: dict[str, Take] = {}
         self._jobs: dict[str, Job] = {}          # in-memory only, never persisted
         self.dirty = False                       # unsaved *authoring* edits
+        self.ui_state: dict = {}                 # per-project window layout (open tabs); UI-owned
 
     # ---- construction ---------------------------------------------------
     @classmethod
@@ -117,6 +118,7 @@ class Project:
         assets = cls._assets_for(path)
         doc = json.loads(path.read_text(encoding="utf-8"))
         proj = cls(path=path, name=doc.get("name") or path.stem, assets_dir=assets)
+        proj.ui_state = doc.get("ui_state") or {}   # restored open-tab layout (may be absent)
         for sd in doc.get("shots", []):
             shot = proj._shot_from_dict(sd)
             proj._shots[shot.id] = shot
@@ -272,6 +274,8 @@ class Project:
         with self._lock:
             doc = {"format": FORMAT, "version": VERSION, "name": self.name,
                    "shots": [self._shot_to_dict(s) for s in self._ordered(self._shots)]}
+            if self.ui_state:                       # additive: omit when empty (older files stay clean)
+                doc["ui_state"] = self.ui_state
             _atomic_write_json(self.path, doc)
 
     def _write_takes_file(self) -> None:

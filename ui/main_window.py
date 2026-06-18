@@ -21,6 +21,7 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QObject, Signal
@@ -34,13 +35,13 @@ from PySide6.QtWidgets import (
 import applog
 import library
 import paths
-from backends import batch, comfy_client, crash_recovery, recovery, replicate_client
+from backends import batch, comfy_client, crash_recovery, recovery, replicate_client, restart
 from backends.jobs import JobManager
 from pipeline import export, framing
 from store import app_settings
 from store.project import Project
 from store.models import (
-    STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
+    STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING, Shot,
 )
 from ui.assets_view import AssetsView
 from ui.batch_dialog import BatchDialog, SCOPE_VIEW
@@ -104,6 +105,7 @@ class MainWindow(QMainWindow):
         self._build_body()
         self._build_menu()
         self.reload()
+        self._restore_tab_state()   # reopen the tabs this project was last saved with
         self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
         self._maybe_refresh_schemas_on_startup()
         self._remote = None
@@ -149,6 +151,13 @@ class MainWindow(QMainWindow):
         self.cancel_act.triggered.connect(self.cancel_pending)
         self.cancel_act.setEnabled(False)
         tb.addAction(self.cancel_act)
+        self.restart_act = QAction("Restart cancelled takes", self)
+        self.restart_act.setToolTip("Re-run every cancelled take from its frozen settings "
+                                    "(same seed + framing). Takes that can't be replayed exactly "
+                                    "are marked failed with a reason")
+        self.restart_act.triggered.connect(self.restart_cancelled_takes)
+        self.restart_act.setEnabled(False)
+        tb.addAction(self.restart_act)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -332,6 +341,7 @@ class MainWindow(QMainWindow):
         self.assets_tab.set_project(project)
         self.queue_tab.set_project(project)
         self.reload()
+        self._restore_tab_state()   # reopen the tabs this project was last saved with
         self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
 
     def _maybe_save_changes(self) -> bool:
@@ -376,6 +386,7 @@ class MainWindow(QMainWindow):
         if self.project.is_untitled:
             return self.save_project_as()
         self._commit_open_shot_tabs()
+        self._capture_tab_state()
         self.project.save()
         self._remember_last()
         self._update_title()
@@ -389,6 +400,7 @@ class MainWindow(QMainWindow):
         if not path:
             return False
         self._commit_open_shot_tabs()
+        self._capture_tab_state()
         self.project.save_as(path)
         self._remember_last()
         self._update_title()
@@ -427,7 +439,7 @@ class MainWindow(QMainWindow):
                 continue
             if starred_only and not self.project.list_takes(shot.id, starred_only=True):
                 continue
-            card = ShotCard(self.project, shot)
+            card = ShotCard(self.project, shot, jobs=self.jobs)
             card.generate_requested.connect(self.generate_shot)
             card.open_requested.connect(self.open_shot)
             card.duplicate_requested.connect(self.duplicate_shot)
@@ -435,6 +447,7 @@ class MainWindow(QMainWindow):
             card.star_toggled.connect(self.toggle_shot_star)
             card.export_takes_requested.connect(self.export_takes)
             card.open_take_requested.connect(self.open_take)
+            card.restart_requested.connect(self._restart_takes_by_ids)
             if shot.id in expanded:
                 card.expand_btn.setChecked(True)
             self.cards_layout.addWidget(card)
@@ -444,6 +457,7 @@ class MainWindow(QMainWindow):
         self.cards_layout.addWidget(self._make_add_shot_card())
         self.statusBar().showMessage(f"{shown} shots shown · {len(shots)} total")
         self._refresh_total_price(shots)
+        self._refresh_restart_action()   # a freshly-opened project may already hold cancelled takes
         self._update_title()
 
     def _refresh_total_price(self, shots) -> None:
@@ -484,7 +498,7 @@ class MainWindow(QMainWindow):
 
     # ---- shot tabs ------------------------------------------------------
     def new_shot(self) -> None:
-        tab = ShotTab(self.project)
+        tab = ShotTab(self.project, jobs=self.jobs)
         self._wire_shot_tab(tab)
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
 
@@ -495,7 +509,7 @@ class MainWindow(QMainWindow):
         shot = self.project.get_shot(shot_id)
         if not shot:
             return
-        tab = ShotTab(self.project, shot=shot)
+        tab = ShotTab(self.project, shot=shot, jobs=self.jobs)
         self._wire_shot_tab(tab)
         self.shot_tabs[shot_id] = tab
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
@@ -597,6 +611,7 @@ class MainWindow(QMainWindow):
         tab.generate_requested.connect(self.generate_shot)
         tab.export_requested.connect(self.export_takes)
         tab.open_take_requested.connect(self.open_take)
+        tab.restart_requested.connect(self._restart_takes_by_ids)
 
     def _on_shot_saved(self, shot_id: str, tab: ShotTab) -> None:
         # A blank tab just became a real shot (or an existing shot was re-saved): register
@@ -808,6 +823,108 @@ class MainWindow(QMainWindow):
 
     def _refresh_cancel_action(self) -> None:
         self.cancel_act.setEnabled(self.jobs.pending_count() > 0)
+        self._refresh_restart_action()
+
+    def _refresh_restart_action(self) -> None:
+        self.restart_act.setEnabled(self._cancelled_take_count() > 0)
+
+    def _cancelled_take_count(self) -> int:
+        return sum(1 for t in self.project.list_takes(include_deleted=False)
+                   if t.status == STATUS_CANCELLED)
+
+    # ---- restart cancelled takes ---------------------------------------
+    def restart_cancelled_takes(self) -> None:
+        """Re-run every cancelled take in the project (ignoring the view filters, like Cancel
+        pending). Exact-restartable takes replay in place from their snapshot; the rest are
+        marked failed with a reason."""
+        cancelled = [t for t in self.project.list_takes(include_deleted=False)
+                     if t.status == STATUS_CANCELLED]
+        self._restart_takes(cancelled)
+
+    def _restart_takes_by_ids(self, ids: list) -> None:
+        """Restart just the given takes (the takes-grid context-menu entry). Non-cancelled ids
+        are ignored - the menu only offers Restart when a cancelled take is selected."""
+        takes = [t for t in (self.project.get_take(i) for i in ids)
+                 if t and t.status == STATUS_CANCELLED]
+        self._restart_takes(takes)
+
+    def _restart_takes(self, takes: list) -> None:
+        if not takes:
+            QMessageBox.information(self, "Restart", "No cancelled takes to restart.")
+            return
+        plan = restart.plan_restart(
+            takes, model_of_id=library.get_model, est_of=library.estimate_cost,
+            path_exists=lambda p: bool(p) and Path(p).exists(), name_of=self._take_label)
+        detail = "\n".join(f"  • {self._take_label(t)}: {r}" for t, r in plan.unrestartable)
+        if plan.restartable:
+            if not confirm_launch(self, plan.items):
+                self._log("restart cancelled")
+                return
+            # Persist first so a restarted take never references an unsaved shot (untitled ->
+            # Save As prompt). Aborting the save aborts the whole restart - fail nothing.
+            if not self.save_project():
+                self._log("restart cancelled (project not saved)")
+                return
+            for take in plan.restartable:
+                self._restart_in_place(take)
+        elif plan.unrestartable:
+            # Nothing to re-fire (no spend, so no cost gate), but there are takes we can't replay
+            # exactly. Confirm before flipping CANCELLED->FAILED so the click stays backable-out.
+            if QMessageBox.question(
+                    self, "Restart",
+                    f"None of the {len(plan.unrestartable)} cancelled take(s) can be restarted "
+                    f"exactly:\n\n{detail}\n\nMark them failed?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+        for take, reason in plan.unrestartable:
+            self.project.update_take(take.id, status=STATUS_FAILED,
+                                     error=f"cannot restart: {reason}")
+            self._refresh_shot_for_take(take.id)
+        self._log(f"restart: {len(plan.restartable)} re-queued, "
+                  f"{len(plan.unrestartable)} marked failed")
+        if plan.restartable and plan.unrestartable:
+            QMessageBox.information(
+                self, "Restart",
+                f"Re-queued {len(plan.restartable)} take(s).\n\n"
+                f"{len(plan.unrestartable)} take(s) couldn't be restarted exactly and were "
+                f"marked failed:\n\n{detail}")
+        self.reload()
+        self._refresh_cancel_action()
+        self.queue_tab.refresh()
+
+    def _restart_in_place(self, take) -> None:
+        """Flip one cancelled take back to PENDING and re-enqueue a runner built straight from
+        its immutable snapshot (same seed, same framing). The snapshot is never mutated - only
+        the take's status + output/timing fields reset."""
+        snap = take.settings_snapshot or {}
+        model = library.get_model(snap.get("model_id"))
+        settings = snap.get("settings") or {}
+        synth = self._shot_from_snapshot(take.shot_id, snap)
+        self.project.update_take(
+            take.id, status=STATUS_PENDING, error=None, started=None, completed=None,
+            video_path=None, thumbnail=None, preview_gif=None, cost_actual=None)
+        self.jobs.restart_take(take.id, model["backend"],
+                               self._make_runner(model, synth, settings, take.id))
+        self._log(f"restarting {take.id[:8]} ({self._take_label(take)})")
+
+    def _shot_from_snapshot(self, shot_id: str, snap: dict) -> Shot:
+        """A throwaway Shot carrying the snapshot's frozen framing, fed to _make_runner /
+        framing.render_keyposes so the restart reproduces the take exactly (not the shot's
+        possibly-since-edited state). Only the fields those readers touch are populated."""
+        canvas = snap.get("canvas") or [None, None]   # always [w, h] when present (_queue_take)
+        existing = self.project.get_shot(shot_id)
+        return Shot(
+            id=shot_id, name=(existing.name if existing else "(restart)"),
+            start_frame=snap.get("start_frame"), end_frame=snap.get("end_frame"),
+            canvas_w=canvas[0], canvas_h=canvas[1],
+            crop=snap.get("crop") or {}, prompt=snap.get("prompt", ""),
+            negative_prompt=snap.get("negative_prompt", ""),
+            model_id=snap.get("model_id", ""), settings=snap.get("settings") or {})
+
+    def _take_label(self, take) -> str:
+        s = self.project.get_shot(take.shot_id)
+        return s.name if s else take.id[:8]
 
     def _refresh_pause_action(self) -> None:
         """Pause/Resume is only meaningful while a batch is in flight. Reset its label to
@@ -1175,6 +1292,93 @@ class MainWindow(QMainWindow):
         if self.tabs.indexOf(widget) < 0:
             self.tabs.addTab(widget, title)
         self.tabs.setCurrentWidget(widget)
+
+    # ---- tab-layout persistence (stored per project in the .animproj) ----
+    def _capture_tab_state(self) -> None:
+        """Snapshot the live tab bar into project.ui_state so a save records the layout.
+        Window metadata, not authoring data - written on save, never sets dirty. Pristine
+        unsaved blank shot tabs (no id yet, not in shot_tabs) are skipped; commit them
+        first via Save. `active` is the index into the captured descriptor list (not a raw
+        tab position) so it survives a later tab being skipped on restore."""
+        fixed_titles = {w: title for w, title in self._fixed_tabs}
+        shot_id_by_tab = {t: sid for sid, t in self.shot_tabs.items()}
+        active_widget = self.tabs.currentWidget()
+        entries: list[dict] = []
+        active: Optional[int] = None
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            entry: Optional[dict] = None
+            if w in fixed_titles:
+                entry = {"kind": "fixed", "key": fixed_titles[w]}
+            elif isinstance(w, ShotTab):
+                sid = shot_id_by_tab.get(w)
+                if sid:
+                    entry = {"kind": "shot", "id": sid}
+            elif isinstance(w, TakePlayerTab):
+                entry = {"kind": "take", "id": w.take_id}
+            if entry is None:
+                continue
+            if w is active_widget:
+                active = len(entries)
+            entries.append(entry)
+        self.project.ui_state = {"tabs": entries, "active": active}
+
+    def _restore_tab_state(self) -> None:
+        """Rebuild the tab bar from the project's saved layout (or the default full set of
+        fixed tabs when there's none). Detaching first keeps the fixed-tab widgets alive
+        (removeTab doesn't delete them); shot/take tabs are reopened by id, skipping any
+        that no longer exist. Signals are blocked during the rebuild so _on_tab_changed
+        (which toggles comfy polling) fires once at the end against the settled tab bar,
+        not on every intermediate add/remove."""
+        state = self.project.ui_state or {}
+        desc = state.get("tabs")
+        self.tabs.blockSignals(True)
+        try:
+            while self.tabs.count():
+                self.tabs.removeTab(0)
+            built: list = []
+            if isinstance(desc, list):
+                built = self._apply_tab_descriptors(desc)
+            else:
+                for widget, title in self._fixed_tabs:   # default: all fixed tabs, original order
+                    self.tabs.addTab(widget, title)
+            if self.tabs.count() == 0:                    # never leave an empty tab bar: Shots always wins
+                w, t = self._fixed_tabs[0]
+                self.tabs.addTab(w, t)
+            active = state.get("active")
+            target = built[active] if isinstance(active, int) and 0 <= active < len(built) else None
+            if target is not None and self.tabs.indexOf(target) >= 0:
+                self.tabs.setCurrentWidget(target)
+            else:
+                self.tabs.setCurrentIndex(0)
+        finally:
+            self.tabs.blockSignals(False)
+        self._on_tab_changed(self.tabs.currentIndex())   # one settled sync (comfy polling etc.)
+
+    def _apply_tab_descriptors(self, desc: list) -> list:
+        """Re-add tabs in saved order; return the widget built for each descriptor (None
+        where it was skipped) so the caller can map the saved active index back to a widget."""
+        fixed_by_key = {title: w for w, title in self._fixed_tabs}
+        built: list = []
+        for entry in desc:
+            w = None
+            if isinstance(entry, dict):
+                kind = entry.get("kind")
+                if kind == "fixed":
+                    fw = fixed_by_key.get(entry.get("key"))
+                    if fw is not None and self.tabs.indexOf(fw) < 0:
+                        self.tabs.addTab(fw, entry.get("key"))
+                        w = fw
+                elif kind == "shot":
+                    sid = entry.get("id")
+                    self.open_shot(sid)              # no-op on a missing/already-open shot
+                    w = self.shot_tabs.get(sid)
+                elif kind == "take":
+                    tid = entry.get("id")
+                    self.open_take(tid)              # no-op on a missing/already-open take
+                    w = self.take_tabs.get(tid)
+            built.append(w)
+        return built
 
     def _maybe_close_shot_tab(self, tab: ShotTab) -> bool:
         """Confirm before closing a shot tab that has uncommitted editor edits. Returns

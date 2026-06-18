@@ -76,12 +76,14 @@ class ShotCard(QFrame):
     star_toggled = Signal(str)              # toggle the shot's own star
     export_takes_requested = Signal(list)   # take ids (row obeys its view filter)
     open_take_requested = Signal(str)       # take id -> open in the frame-by-frame viewer
+    restart_requested = Signal(list)        # cancelled take ids -> re-run them
     changed = Signal()
 
-    def __init__(self, project: Project, shot):
+    def __init__(self, project: Project, shot, jobs=None):
         super().__init__()
         self.project = project
         self.shot = shot
+        self.jobs = jobs
         self.takes_view: Optional[TakesView] = None
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet("ShotCard { border:1px solid #3a3f4b; border-radius:6px; }")
@@ -182,10 +184,11 @@ class ShotCard(QFrame):
     def _on_toggle(self, on: bool) -> None:
         self.expand_btn.setArrowType(Qt.ArrowType.DownArrow if on else Qt.ArrowType.RightArrow)
         if on and self.takes_view is None:
-            self.takes_view = TakesView(self.project, self.shot.id)
+            self.takes_view = TakesView(self.project, self.shot.id, jobs=self.jobs)
             self.takes_view.changed.connect(self._on_takes_changed)
             self.takes_view.export_requested.connect(self.export_takes_requested)
             self.takes_view.open_take_requested.connect(self.open_take_requested)
+            self.takes_view.restart_requested.connect(self.restart_requested)
             self.body.layout().addWidget(self.takes_view)
         self.body.setVisible(on)
         if self.takes_view is not None:
