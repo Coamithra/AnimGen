@@ -275,6 +275,93 @@ def test_shot_star_write_through() -> None:
     print("shot star write-through OK: sidecar persist, reload, unstar, legacy migration, corrupt-sidecar rescue")
 
 
+def test_keypose_migration_persist() -> None:
+    """A legacy keypose-baked project re-points its shots to imported copies on load and
+    PERSISTS that re-point immediately -- BEFORE deleting the keyposes source tree -- so a
+    Discard at the next save-prompt (i.e. a no-save reload) can't strand a half-applied,
+    source-deleted migration (card #56). The freshly-loaded project also stays clean (no
+    phantom '*')."""
+    tmp = Path(tempfile.mkdtemp())
+    proj_path = tmp / "legacy.animproj"
+    assets = tmp / "legacy.assets"
+    # The baked keypose the legacy shot points at, plus the external original it was framed
+    # from (kept outside the project, as a real seeded source would be).
+    kp_dir = assets / "keyposes" / "s1"
+    kp_dir.mkdir(parents=True)
+    (kp_dir / "start.png").write_bytes(b"baked-keypose")
+    source = tmp / "orig_start.png"
+    source.write_bytes(b"original-source")
+
+    legacy_doc = {"format": "animgen-project", "version": 1, "name": "legacy",
+                  "shots": [{"id": "s1", "name": "kick", "model_id": "local-flf-wan14b",
+                             "start_frame": "keyposes/s1/start.png", "end_frame": None,
+                             "crop": {"source_start": str(source)},
+                             "settings": {}, "created": "", "updated": ""}]}
+    proj_path.write_text(json.dumps(legacy_doc), encoding="utf-8")
+
+    p = Project.load(proj_path)
+    s = p.get_shot("s1")
+    # Re-pointed off the keyposes tree to an imported copy in the .assets/ root.
+    assert s.start_frame and "keyposes" not in Path(s.start_frame).parts, s.start_frame
+    assert Path(s.start_frame).exists(), "imported copy must exist"
+    # Persisted immediately: the re-point is on disk, and the project is clean (no phantom *).
+    assert not p.dirty, "a persisted migration must NOT leave the project dirty"
+    on_disk = json.loads(proj_path.read_text(encoding="utf-8"))
+    assert "keyposes" not in (on_disk["shots"][0]["start_frame"] or ""), \
+        "the re-point must be written to the .animproj on load, not just held in memory"
+    # The stale keyposes source tree is removed -- only after the durable persist.
+    assert not (assets / "keyposes" / "s1").exists(), "stale keypose source should be removed"
+
+    # Discard-equivalent: reload with no explicit save. The re-pointed frame must survive.
+    q = Project.load(proj_path)
+    qs = q.get_shot("s1")
+    assert qs.start_frame and "keyposes" not in Path(qs.start_frame).parts
+    assert Path(qs.start_frame).exists(), "no data loss after a discard-equivalent reload"
+    print("keypose migration OK: re-point persisted before source deletion, clean reload")
+
+
+def test_keypose_migration_persist_failure() -> None:
+    """When persisting the re-point fails, the migration must NOT delete the keyposes sources
+    -- it keeps them and falls back to dirty=True so a later Save (or reload) retries (card
+    #56). This is the headline safety property: no source is deleted before the re-point is
+    durable on disk."""
+    tmp = Path(tempfile.mkdtemp())
+    proj_path = tmp / "legacy.animproj"
+    assets = tmp / "legacy.assets"
+    kp_dir = assets / "keyposes" / "s1"
+    kp_dir.mkdir(parents=True)
+    (kp_dir / "start.png").write_bytes(b"baked-keypose")
+    source = tmp / "orig_start.png"
+    source.write_bytes(b"original-source")
+    legacy_doc = {"format": "animgen-project", "version": 1, "name": "legacy",
+                  "shots": [{"id": "s1", "name": "kick", "model_id": "local-flf-wan14b",
+                             "start_frame": "keyposes/s1/start.png", "end_frame": None,
+                             "crop": {"source_start": str(source)},
+                             "settings": {}, "created": "", "updated": ""}]}
+    proj_path.write_text(json.dumps(legacy_doc), encoding="utf-8")
+
+    orig = Project._write_project_file
+    Project._write_project_file = lambda self: (_ for _ in ()).throw(OSError("disk full"))
+    try:
+        p = Project.load(proj_path)
+    finally:
+        Project._write_project_file = orig
+
+    assert p.dirty, "a failed persist must fall back to dirty=True"
+    assert (assets / "keyposes" / "s1" / "start.png").exists(), \
+        "the keypose source must NOT be deleted when the persist failed"
+    on_disk = json.loads(proj_path.read_text(encoding="utf-8"))
+    assert "keyposes" in (on_disk["shots"][0]["start_frame"] or ""), \
+        "nothing should have been persisted on a failed migration write"
+
+    # Recovery: with persist working again, a reload completes the migration with no loss.
+    r = Project.load(proj_path)
+    rs = r.get_shot("s1")
+    assert rs.start_frame and "keyposes" not in Path(rs.start_frame).parts
+    assert Path(rs.start_frame).exists() and not r.dirty
+    print("keypose migration failure OK: sources kept + dirty on failed persist, reload recovers")
+
+
 def test_output_url_parsing() -> None:
     """run_prediction's output->url resolution must never AttributeError on an unexpected
     output shape: a list whose first element is neither str nor dict ([None], a nested
@@ -329,6 +416,8 @@ if __name__ == "__main__":
     test_shot_context_ops()
     test_hybrid_persistence()
     test_shot_star_write_through()
+    test_keypose_migration_persist()
+    test_keypose_migration_persist_failure()
     test_output_url_parsing()
     test_gui_build()
     print("PHASE 1 SMOKE: PASS")
