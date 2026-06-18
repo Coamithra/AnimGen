@@ -126,6 +126,53 @@ def test_takes_view() -> None:
     print("TakesView OK: filter, star toggle, delete-to-bin, counts, auto-fit + drag-resize height")
 
 
+def test_take_star_badge() -> None:
+    """The clickable star badge: star_badge_rect is the top-left hot-zone, and the delegate's
+    editorEvent toggles a take's star (write-through) on a left-click inside it, while a click
+    elsewhere in the cell is ignored (left to selection / open)."""
+    from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
+
+    from ui.takes_view import TakesView, star_badge_rect, _STAR_ROLE
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("c", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_DONE)
+    assert not take.starred
+
+    tv = TakesView(project, shot.id)
+    assert tv.model.rowCount() == 1
+    idx = tv.model.index(0, 0)
+    assert idx.data(_STAR_ROLE) is False                       # role seeded unstarred
+
+    cell = QRect(0, 0, 160, 180)
+    badge = star_badge_rect(cell)
+    assert (badge.left(), badge.top(), badge.width()) == (4, 2, 20)  # top-left inset hot-zone
+    opt = QStyleOptionViewItem()
+    opt.rect = cell
+
+    def _release(point) -> QMouseEvent:
+        p = QPointF(point)
+        return QMouseEvent(QEvent.Type.MouseButtonRelease, p, p, Qt.MouseButton.LeftButton,
+                           Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+
+    # Click inside the badge -> star toggles ON and persists write-through.
+    handled = tv._star_delegate.editorEvent(_release(badge.center()), tv.model, opt, idx)
+    assert handled is True
+    assert project.get_take(take.id).starred, "badge click must star the take"
+    # toggle_star reloads the grid in place, so the item's star role reflects the new state
+    assert tv.model.index(0, 0).data(_STAR_ROLE) is True, "grid role refreshed after toggle"
+
+    # A click outside the badge is NOT consumed and doesn't change the star.
+    outside = QPoint(cell.center().x(), cell.center().y())
+    handled2 = tv._star_delegate.editorEvent(_release(outside), tv.model, opt, tv.model.index(0, 0))
+    assert handled2 is False
+    assert project.get_take(take.id).starred, "click outside the badge must not change the star"
+    print("take star badge OK: hot-zone rect, click toggles write-through, miss ignored")
+
+
 def test_assets_view() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -235,11 +282,10 @@ def test_take_progress_label() -> None:
     assert progress_percent(0.5) == "50%"
     assert progress_percent(0.0) == "0%" and progress_percent(1.0) == "100%"
     assert progress_percent(1.4) == "100%" and progress_percent(-0.3) == "0%"   # clamped
-    assert take_tile_label("generating", False, "abc123xyz", "45%").endswith("45%")
-    assert "generating" in take_tile_label("generating", False, "abc123xyz", "")  # no pct -> word
-    assert "generating" not in take_tile_label("generating", False, "abc123xyz", "45%")
-    assert take_tile_label("done", True, "abc123xyz", "").startswith("★")
-    assert take_tile_label("done", False, "abc123xyz", "") == "abc123"           # bare -> id prefix
+    assert take_tile_label("generating", "abc123xyz", "45%").endswith("45%")
+    assert "generating" in take_tile_label("generating", "abc123xyz", "")  # no pct -> word
+    assert "generating" not in take_tile_label("generating", "abc123xyz", "45%")
+    assert take_tile_label("done", "abc123xyz", "") == "abc123"           # bare -> id prefix (star is a badge now)
 
     project = Project.new()
     shot = project.add_shot("kick", model_id="seedance-2.0-std")
@@ -267,6 +313,7 @@ def test_take_progress_label() -> None:
 if __name__ == "__main__":
     test_bin_restore()
     test_takes_view()
+    test_take_star_badge()
     test_take_progress_label()
     test_assets_view()
     test_asset_picker()

@@ -540,8 +540,7 @@ class MainWindow(QMainWindow):
         shot = self.project.get_shot(shot_id)
         if not shot:
             return
-        self.project.set_shot_starred(shot_id, not shot.starred)
-        self._update_title()        # buffered edit -> dirty marker
+        self.project.set_shot_starred(shot_id, not shot.starred)   # write-through, no dirty
         self.reload()               # reflect the star + re-apply the "Starred shots" filter
 
     def delete_shot(self, shot_id: str) -> None:
