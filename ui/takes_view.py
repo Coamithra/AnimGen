@@ -14,13 +14,13 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor, QIcon, QPainter, QPixmap, QStandardItem, QStandardItemModel,
 )
 from PySide6.QtWidgets import (
     QComboBox, QFrame, QHBoxLayout, QLabel, QListView, QMenu, QPushButton, QSlider,
-    QVBoxLayout, QWidget,
+    QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from pipeline import extract, takes_io
@@ -30,6 +30,8 @@ from ui.take_player import decode_strip, take_source
 _ANIM_INTERVAL_MS = 80     # ~12.5 fps grid loop (a thumbnail only needs to read as motion)
 
 _USER_ROLE = int(Qt.ItemDataRole.UserRole)
+_STAR_ROLE = int(Qt.ItemDataRole.UserRole) + 1   # bool: take.starred, read by the star delegate
+_STAR_BADGE = 20                                 # px square clickable star badge, top-left of a cell
 _BADGE = {"pending": "⏳", "generating": "▶", "done": "", "failed": "✗"}
 _BADGE_COLOR = {"pending": "#b0b0b0", "generating": "#5aa0ff",
                 "done": "#7ade8c", "failed": "#ff6b6b", "cancelled": "#c0a060"}
@@ -77,6 +79,55 @@ def rows_for(n_items: int, viewport_width: int, icon_size: int,
         return max_rows
     needed = -(-max(n_items, 1) // cols)   # ceil division
     return max(1, min(needed, max_rows))
+
+
+def star_badge_rect(cell: QRect) -> QRect:
+    """Hot-zone + paint rect for a take's clickable star badge: the top-left corner of its
+    grid cell, inset slightly. Paint and click-detection share this so the visible badge is
+    exactly what's clickable. Pure (QRect in -> QRect out) so it's unit-testable headlessly."""
+    return QRect(cell.left() + 4, cell.top() + 2, _STAR_BADGE, _STAR_BADGE)
+
+
+class _StarDelegate(QStyledItemDelegate):
+    """Draws a clickable ★/☆ badge in the top-left of each take cell and toggles that take's
+    star when the badge is clicked - so starring matches the shot cards' click-a-star flow
+    instead of needing the right-click menu. Click detection and painting share
+    `star_badge_rect`; the actual toggle is delegated to `on_toggle(take_id)` so the view keeps
+    ownership of persistence. A badge click is swallowed (press/release/double-click) so it
+    never also changes the selection or opens the viewer."""
+
+    def __init__(self, on_toggle):
+        super().__init__()
+        self._on_toggle = on_toggle
+
+    def paint(self, painter, option, index):  # noqa: N802 - Qt override
+        super().paint(painter, option, index)
+        rect = star_badge_rect(option.rect)
+        starred = bool(index.data(_STAR_ROLE))
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 110))   # translucent disc so the glyph reads on any thumb
+        painter.drawEllipse(rect)
+        painter.setPen(QColor("#f2c14e") if starred else QColor("#dddddd"))
+        font = painter.font()
+        font.setPointSizeF(max(9.0, rect.height() * 0.62))
+        painter.setFont(font)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "★" if starred else "☆")
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):  # noqa: N802 - Qt override
+        et = event.type()
+        if et in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+                  QEvent.Type.MouseButtonDblClick):
+            if (event.button() == Qt.MouseButton.LeftButton
+                    and star_badge_rect(option.rect).contains(event.position().toPoint())):
+                if et == QEvent.Type.MouseButtonRelease:
+                    take_id = index.data(_USER_ROLE)
+                    if take_id:
+                        self._on_toggle(take_id)
+                return True                       # swallow so it doesn't select / open the viewer
+        return super().editorEvent(event, model, option, index)
 
 
 class _StripLoader(QObject):
@@ -203,6 +254,8 @@ class TakesView(QWidget):
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._context_menu)
         self.view.doubleClicked.connect(self._open_in_viewer)
+        self._star_delegate = _StarDelegate(self._toggle_star_by_id)
+        self.view.setItemDelegate(self._star_delegate)
         self._apply_icon_size()
 
         self.resize_handle = _ResizeHandle(self)
@@ -223,6 +276,7 @@ class TakesView(QWidget):
         for t in takes:
             item = QStandardItem(self._icon_for(t), self._label(t))
             item.setData(t.id, _USER_ROLE)
+            item.setData(bool(t.starred), _STAR_ROLE)
             item.setEditable(False)
             self.model.appendRow(item)
             self._items[t.id] = item
@@ -306,10 +360,11 @@ class TakesView(QWidget):
         self._apply_height()
 
     def _label(self, t) -> str:
+        # The star is shown as a clickable badge on the thumbnail (star delegate), so it's
+        # no longer prefixed here - the label is just the status badge.
         badge = _BADGE.get(t.status, "")
-        star = "★ " if t.starred else ""
         tail = "" if t.status == "done" else f"  {t.status}"
-        return f"{star}{badge}{tail}".strip() or t.id[:6]
+        return f"{badge}{tail}".strip() or t.id[:6]
 
     def _icon_for(self, t) -> QIcon:
         if t.thumbnail and Path(t.thumbnail).exists():
@@ -406,6 +461,11 @@ class TakesView(QWidget):
                 self.project.set_starred(tid, not t.starred)
         self.load()
         self.changed.emit()
+
+    def _toggle_star_by_id(self, take_id: str) -> None:
+        """Flip one take's star (from the clickable badge). Write-through via toggle_star, so
+        it persists instantly - same as the right-click 'Toggle star'."""
+        self.toggle_star([take_id])
 
     def delete(self, ids: list) -> None:
         for tid in ids:

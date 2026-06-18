@@ -5,6 +5,7 @@ A Project is a classic openable/saveable document:
     Fighter.animproj          JSON: {format, version, name, shots:[...]}  (authoring)
     Fighter.assets/           sidecar folder beside the file:
         takes.json            JSON: {version, takes:[...]}  (generated-take metadata)
+        shot_stars.json       JSON: {version, starred:[shot_id,...]}  (write-through shot stars)
         keyposes/<shot_id>/   baked start.png / end.png
         takes/<take_id>.mp4   generated takes
         thumbs/<take_id>.png  take thumbnails
@@ -16,6 +17,9 @@ Persistence is HYBRID (per the project design):
 - Take changes WRITE THROUGH immediately to assets/takes.json, so a finished render is
   never lost - and because takes live in a separate file, persisting one never flushes
   buffered shot edits.
+- Shot STARS are the one authoring field that also writes through (to assets/shot_stars.json),
+  so a star/unstar persists instantly - same timing as a take star - without flushing the
+  rest of the buffered shot edits or marking the project dirty.
 
 Managed media (under assets_dir) serialize as paths RELATIVE to assets_dir so the
 project is portable as a (file + .assets) pair; external references (e.g. a seeded
@@ -123,6 +127,7 @@ class Project:
                 take = proj._take_from_dict(td)
                 if take.shot_id in proj._shots:      # drop orphans defensively
                     proj._takes[take.id] = take
+        proj._load_shot_stars()
         proj.dirty = False
         proj._migrate_flatten_keyposes()
         return proj
@@ -296,6 +301,7 @@ class Project:
 
     def _shot_to_dict(self, s: Shot) -> dict:
         d = vars(s).copy()
+        d.pop("starred", None)   # shot stars live in the write-through shot_stars.json sidecar
         for f in _SHOT_PATHS:
             d[f] = self._rel(d[f])
         return d
@@ -373,9 +379,37 @@ class Project:
             self._write_takes_file()
 
     def set_shot_starred(self, shot_id: str, starred: bool) -> None:
-        """Star/unstar a shot. Buffers like any authoring edit (sets dirty); unlike a
-        take's star (write-through), it persists on the next save()."""
-        self.update_shot(shot_id, starred=starred)
+        """Star/unstar a shot. WRITE-THROUGH to the shot_stars.json sidecar (like a take's
+        star, unlike other shot edits) so it persists instantly without flushing buffered
+        authoring edits and without marking the project dirty."""
+        with self._lock:
+            shot = self._shots.get(shot_id)
+            if not shot or bool(shot.starred) == bool(starred):
+                return
+            shot.starred = starred
+        self._write_shot_stars_file()
+
+    def _write_shot_stars_file(self) -> None:
+        with self._lock:
+            ids = [s.id for s in self._ordered(self._shots) if s.starred]
+            doc = {"version": VERSION, "starred": ids}
+            _atomic_write_json(self._assets_dir / "shot_stars.json", doc)
+
+    def _load_shot_stars(self) -> None:
+        """Apply shot stars from the write-through sidecar (authoritative when present).
+        When it's absent, migrate any legacy `starred` flags carried in the .animproj into
+        the sidecar so it becomes the source of truth going forward."""
+        sidecar = self._assets_dir / "shot_stars.json"
+        if sidecar.exists():
+            try:
+                doc = json.loads(sidecar.read_text(encoding="utf-8"))
+                starred = set(doc.get("starred", []))
+            except (OSError, ValueError):
+                return                              # unreadable -> keep legacy in-memory flags
+            for shot in self._shots.values():
+                shot.starred = shot.id in starred
+        elif any(s.starred for s in self._shots.values()):
+            self._write_shot_stars_file()           # legacy .animproj stars -> migrate
 
     def used_model_ids(self) -> list[str]:
         """Distinct model_ids across shots - powers the 'filter by model' dropdown."""

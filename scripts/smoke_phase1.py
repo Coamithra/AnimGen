@@ -110,8 +110,11 @@ def test_project() -> None:
     got = p.get_shot(shot.id)
     assert got.prompt == "fierce kick" and got.settings["seed"] == 9
     assert not got.starred, "shots default to unstarred"
+    p.dirty = False
     p.set_shot_starred(shot.id, True)
-    assert p.get_shot(shot.id).starred and p.dirty, "starring a shot buffers (dirty)"
+    assert p.get_shot(shot.id).starred, "shot is starred"
+    assert not p.dirty, "starring a shot is write-through, must NOT mark the project dirty"
+    assert (p.assets_dir / "shot_stars.json").exists(), "shot star must persist immediately"
 
     take = p.add_take(
         shot.id, status=STATUS_DONE, seed=7,
@@ -212,6 +215,43 @@ def test_hybrid_persistence() -> None:
     print("hybrid persistence OK: shot edit buffered, take auto-persisted")
 
 
+def test_shot_star_write_through() -> None:
+    """Shot stars persist instantly to the shot_stars.json sidecar (not the .animproj), and
+    a legacy .animproj that still carries `starred` migrates into the sidecar on load."""
+    proj_path = Path(tempfile.mkdtemp()) / "stars.animproj"
+    p = Project.new()
+    a = p.add_shot("a", model_id="local-flf-wan14b")
+    b = p.add_shot("b", model_id="local-flf-wan14b")
+    p.save_as(proj_path)
+
+    # Star is write-through (no dirty) and lands in the sidecar, NOT the .animproj doc.
+    p.set_shot_starred(a.id, True)
+    assert not p.dirty
+    doc = json.loads(proj_path.read_text(encoding="utf-8"))
+    assert all("starred" not in sd for sd in doc["shots"]), "stars must not be in the .animproj"
+    side = json.loads((p.assets_dir / "shot_stars.json").read_text(encoding="utf-8"))
+    assert side["starred"] == [a.id]
+
+    # Reload reflects the sidecar; unstar removes it write-through.
+    q = Project.load(proj_path)
+    assert q.get_shot(a.id).starred and not q.get_shot(b.id).starred
+    q.set_shot_starred(a.id, False)
+    side = json.loads((q.assets_dir / "shot_stars.json").read_text(encoding="utf-8"))
+    assert side["starred"] == []
+
+    # Legacy migration: an .animproj with `starred:true` and NO sidecar seeds the sidecar.
+    legacy_path = Path(tempfile.mkdtemp()) / "legacy.animproj"
+    legacy_doc = {"format": "animgen-project", "version": 1, "name": "legacy",
+                  "shots": [{"id": "s1", "name": "old", "starred": True, "crop": {},
+                             "settings": {}, "created": "", "updated": ""}]}
+    legacy_path.write_text(json.dumps(legacy_doc), encoding="utf-8")
+    m = Project.load(legacy_path)
+    assert m.get_shot("s1").starred, "legacy .animproj star must be read on load"
+    migrated = json.loads((m.assets_dir / "shot_stars.json").read_text(encoding="utf-8"))
+    assert migrated["starred"] == ["s1"], "legacy star must migrate into the sidecar"
+    print("shot star write-through OK: sidecar persist, reload, unstar, legacy migration")
+
+
 def test_gui_build() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -233,5 +273,6 @@ if __name__ == "__main__":
     test_project()
     test_shot_context_ops()
     test_hybrid_persistence()
+    test_shot_star_write_through()
     test_gui_build()
     print("PHASE 1 SMOKE: PASS")
