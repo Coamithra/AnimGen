@@ -119,8 +119,8 @@ def run_with_crash_recovery(
                 # keep rendering - it would otherwise be a wasted overnight run on a GPU that
                 # was only briefly down. on_abandon cancels the still-PENDING siblings; a
                 # re-raised render error instead fails only this GENERATING take in the worker.
-                note(f"comfy crashed {max_attempts}x on this take (last after {elapsed}); "
-                     "attempting a final ComfyUI restart before pausing the local queue.")
+                note(f"ComfyUI crashed {max_attempts}x on this take (last after {elapsed}); "
+                     "attempting a final restart before pausing the local queue.")
                 try:
                     restart_server()
                 except Exception as rexc:  # noqa: BLE001 - couldn't bring it back -> abandon
@@ -128,6 +128,10 @@ def run_with_crash_recovery(
                     note(reason)
                     on_abandon(reason)
                     raise QueueAbandoned(reason) from rexc
+                # The production restart_server (comfy_client) already blocks until responsive
+                # and raises if it can't, so this re-probe normally confirms "up" immediately;
+                # it abandons only if the server died again in the gap after the restart returned
+                # (and on the injected fakes that don't block-until-up).
                 if _looks_crashed(server_running, crash_probes):
                     reason = (f"ComfyUI still unreachable after a final restart (crashed "
                               f"{max_attempts}x on this take); pausing the local queue. "

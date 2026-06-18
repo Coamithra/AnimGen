@@ -331,10 +331,13 @@ Full mechanism + invariants in **Hard-won rule #13**.
     "queue paused" warning) **only if that final restart raises or the server stays unreachable** —
     so a legitimately-broken GPU can't trigger a restart loop, but a recoverable one isn't condemned
     on count alone. If the final restart brings ComfyUI back, the render error is **re-raised so only
-    *this* take fails** (`FAILED`, `interrupted=False`) and the rest of the local queue keeps
-    rendering. The retry/abandon notes ("failed in XmYs, retrying (attempt n/3)", "attempting a
-    final ComfyUI restart…", "recovered after a final restart…") flow through the normal
-    `progress(line)` path, so they show on the take in the Queue tab and the main log.
+    *this* take fails** and the rest of the local queue keeps rendering. (That recovered-but-failed
+    take currently records `FAILED` with `interrupted=False`, so the bulk *Restart interrupted takes*
+    action doesn't yet pick it up even though it was crash-killed — flagging it `interrupted` is a
+    tracked follow-up, since it'd touch the worker's terminal-write path.) The retry/abandon notes
+    ("failed in XmYs, retrying (attempt n/3)", "attempting a final restart…", "recovered after a
+    final restart…") flow through the normal `progress(line)` path, so they show on the take in the
+    Queue tab and the main log.
     Each retry re-runs `preflight()`, so the dynamic-VRAM gate is never weakened. (Distinct from
     `backends/recovery.py`, which reconciles takes orphaned by an *app* restart on load.)
     **A deliberate user stop suppresses the auto-restart** (rule #16): `run_with_crash_recovery`
