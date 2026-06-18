@@ -279,6 +279,16 @@ class Project:
             for f in _TAKE_PATHS:
                 setattr(take, f, remap(getattr(take, f)))
 
+    def persist_ui_state(self) -> None:
+        """Write just the .animproj to record the current ui_state, without flushing
+        buffered shot edits or touching takes.json. UI-owned window metadata, so it does
+        not clear `dirty`. Callers must only invoke this when there are no uncommitted
+        authoring edits (it serializes current in-memory shots, which equal disk only then).
+        No-op on an untitled project (nowhere to write)."""
+        if self.path is None:
+            return
+        self._write_project_file()
+
     def _write_project_file(self) -> None:
         assert self.path is not None
         # Hold the lock across build+write so concurrent take updates can't race os.replace.
