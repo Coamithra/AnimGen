@@ -926,7 +926,10 @@ def test_crash_recovery() -> None:
     assert len(restarts) == 1 and not abandons
     assert any("retrying (attempt 2/3)" in n and "failed in" in n for n in notes), notes
 
-    # (c) crash every time -> QueueAbandoned after 3 tries, on_abandon called once, 2 restarts.
+    # (c) crash every time AND the server stays down through the final restart -> genuinely
+    # dead: QueueAbandoned, on_abandon once. Now 3 restarts, not 2: the last strike also tries
+    # one final restart before giving up (it just doesn't bring the server back here), so the
+    # abandon decision rests on the server's state, not the raw attempt count.
     notes, restarts, abandons = [], [], []
     def always_crash():
         raise comfy_client.ComfyError("ComfyUI unreachable")
@@ -938,8 +941,9 @@ def test_crash_recovery() -> None:
         assert False, "expected QueueAbandoned"
     except QueueAbandoned:
         pass
-    assert len(restarts) == 2 and len(abandons) == 1
+    assert len(restarts) == 3 and len(abandons) == 1, (restarts, abandons)
     assert "crashed 3x" in abandons[0] and "pausing the local queue" in abandons[0]
+    assert "unreachable after a final restart" in abandons[0], abandons[0]
 
     # (d) failure with the server still UP -> genuine workflow error, propagates unchanged.
     notes, restarts, abandons = [], [], []
@@ -1022,8 +1026,56 @@ def test_crash_recovery() -> None:
         assert not isinstance(e, QueueAbandoned)
     assert not restarts and not abandons, "a deliberate user stop must not restart or abandon"
     assert probed[0] == 0, "should_abort short-circuits before the crash probe"
+
+    # (h) crash on every attempt, but the FINAL restart brings ComfyUI back responsive: a third
+    # transient TDR must NOT pause the whole local queue on attempt count alone. The render
+    # models a GPU watchdog crash that takes the server down; restart_server brings it back, so
+    # server_running reads "down" at each crash detection but "up" at the post-final-restart
+    # probe. Expect a restart on the last strike (3 total), no abandon, and the render error
+    # re-raised so only THIS take fails while the rest of the queue keeps rendering.
+    notes, restarts, abandons = [], [], []
+    server_up = [True]
+    def render_tdr():
+        server_up[0] = False               # the crash (TDR) takes ComfyUI down
+        raise comfy_client.ComfyError("ComfyUI unreachable (TDR)")
+    def restart_recover():
+        restarts.append(1)
+        server_up[0] = True                # the restart brings the server back up
+    try:
+        run_with_crash_recovery(
+            render=render_tdr, server_running=lambda: server_up[0],
+            restart_server=restart_recover,
+            note=notes.append, on_abandon=abandons.append, clock=make_clock())
+        assert False, "expected the render error to propagate after recovery"
+    except comfy_client.ComfyError as e:
+        assert not isinstance(e, QueueAbandoned), "a recovered server must NOT abandon the queue"
+        assert "(TDR)" in str(e), ("must re-raise the original render error verbatim", str(e))
+    assert len(restarts) == 3, ("a final restart must fire on the last strike", restarts)
+    assert not abandons, "on_abandon must NOT fire when the final restart recovers the server"
+    assert any("recovered after a final restart" in n for n in notes), notes
+
+    # (i) restart succeeds on the first two strikes but RAISES on the final one -> abandon via
+    # the final-strike restart-fail path (distinct from (e), which raises on the very first
+    # strike). Covers the production-realistic case where comfy_client.restart_server's own
+    # block-until-responsive gives up on the last try.
+    notes, restarts, abandons = [], [], []
+    def restart_fails_on_last():
+        restarts.append(1)
+        if len(restarts) >= 3:
+            raise comfy_client.ComfyError("did not come back up")
+    try:
+        run_with_crash_recovery(
+            render=always_crash, server_running=lambda: False,
+            restart_server=restart_fails_on_last,
+            note=notes.append, on_abandon=abandons.append, clock=make_clock())
+        assert False, "expected QueueAbandoned"
+    except QueueAbandoned:
+        pass
+    assert len(restarts) == 3 and len(abandons) == 1, (restarts, abandons)
+    assert "restart failed" in abandons[0] and "did not come back up" in abandons[0], abandons[0]
+
     print("crash_recovery OK: success/retry/abandon/workflow-error/restart-fail/"
-          "transient-down/user-abort + format_elapsed")
+          "transient-down/user-abort/final-restart-recovers/final-restart-fails + format_elapsed")
 
 
 def test_wait_until_responsive() -> None:
