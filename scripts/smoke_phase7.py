@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -126,6 +127,60 @@ def test_actions() -> None:
     print("actions OK")
 
 
+def test_monitor_poller_supersede() -> None:
+    """start()/stop()/start() in quick succession must leave exactly ONE live poller thread
+    probing the port; superseded threads exit and stop probing (card #62). Stubs
+    comfy_client.monitor_snapshot with a slow probe so a supersede races a blocked worker."""
+    _app()  # _MonitorPoller is a QObject; ensure an application exists
+    from backends import comfy_client
+    from ui.comfy_monitor_window import _MonitorPoller
+
+    lock = threading.Lock()
+    probes: list[int] = []  # idents of threads that called monitor_snapshot
+
+    def fake_snapshot(timeout: float = 2.0):
+        with lock:
+            probes.append(threading.get_ident())
+        time.sleep(0.05)  # simulate the blocking socket probe so a supersede can race it
+        return {}
+
+    orig = comfy_client.monitor_snapshot
+    comfy_client.monitor_snapshot = fake_snapshot
+    try:
+        poller = _MonitorPoller(interval=0.02)
+        poller.start()
+        t1 = poller._thread
+        poller.stop()
+        poller.start()      # supersede while t1 may still be blocked in fake_snapshot
+        t2 = poller._thread
+        poller.start()      # double-start without stop -> also superseded
+        t3 = poller._thread
+        assert t1 is not None and t2 is not None and t3 is not None
+
+        deadline = time.time() + 3.0
+        while time.time() < deadline and (t1.is_alive() or t2.is_alive()):
+            time.sleep(0.02)
+        assert not t1.is_alive(), "first poller thread did not exit when superseded"
+        assert not t2.is_alive(), "second poller thread did not exit when superseded"
+        assert t3.is_alive(), "the latest poller thread should still be running"
+
+        with lock:
+            probes.clear()
+        time.sleep(0.25)  # several poll intervals - only the survivor should probe
+        with lock:
+            seen = set(probes)
+        assert seen == {t3.ident}, f"expected only the live poller to probe, got {seen}"
+
+        poller.stop()
+        deadline = time.time() + 3.0
+        while time.time() < deadline and t3.is_alive():
+            time.sleep(0.02)
+        assert not t3.is_alive(), "poller thread did not exit after stop()"
+    finally:
+        comfy_client.monitor_snapshot = orig
+    print("monitor poller supersede OK")
+
+
 def test_server_roundtrip() -> None:
     app = _app()
     win, btn, edit, chk = _build_form()
@@ -206,5 +261,6 @@ if __name__ == "__main__":
     test_snapshot_and_resolve()
     test_tab_widget()
     test_actions()
+    test_monitor_poller_supersede()
     test_server_roundtrip()
     print("PHASE 7 SMOKE: PASS")
