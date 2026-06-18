@@ -76,13 +76,23 @@ class GenerationJob(QRunnable):
     def run(self) -> None:
         # Belt-and-braces: a QRunnable::run() override that lets ANY exception escape propagates
         # into C++ as std::terminate/abort, killing the whole app with no traceback. Swallow
-        # everything here so a single take's failure can never take the process down - the inner
-        # _run already records the take terminally; this only guards the truly-unexpected.
+        # everything (BaseException deliberately - KeyboardInterrupt/SystemExit on a pool worker
+        # would abort just as hard) so a single take's failure can never take the process down.
         try:
             self._run()
         except BaseException:  # noqa: BLE001 - never let anything escape the C++ override
+            # _run's own finally normally records the take and calls done_cb. If it raised
+            # *before* that finally (e.g. the GENERATING-transition update_take/add_job itself
+            # failed), the take would be left non-terminal and its serialized-pool slot leaked -
+            # the same "a take silently vanishes" failure mode this fix targets. Last resort:
+            # record FAILED (best-effort) and fire done_cb so the manager still frees the slot.
             import traceback
             traceback.print_exc()
+            try:
+                self.project.update_take(self.take_id, status=STATUS_FAILED, error="worker aborted")
+            except Exception:  # noqa: BLE001 - best-effort; never re-raise out of the override
+                pass
+            self.done_cb(self.take_id, STATUS_FAILED)
 
     def _run(self) -> None:
         tid = self.take_id
