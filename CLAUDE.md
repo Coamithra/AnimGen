@@ -411,9 +411,20 @@ Full mechanism + invariants in **Hard-won rule #13**.
     fresh re-Generate/reroll fallback (deliberate, user's call 2026-06-18: "exact restart in place, if
     assets are no longer available then just set it to failed with a message"). The split (restartable
     vs unrestartable+reason) is the pure `backends/restart.plan_restart`. Two surfaces, both through the
-    rule-#1 cost gate (`confirm_launch(plan.items)`, one summary): a **Restart cancelled takes** control-
-    strip action (project-wide, ignoring view filters, like Cancel pending) and a per-take **Restart take**
-    entry in the takes-grid context menu (`takes_view._build_context_menu`, no `exec()`, bubbles
+    rule-#1 cost gate (`confirm_launch(plan.items)`, one summary): a project-wide **Restart interrupted
+    takes** control-strip action (ignoring view filters, like Cancel pending) and a per-take **Restart
+    take** entry in the takes-grid context menu (`takes_view._build_context_menu`, no `exec()`, bubbles
     `restart_requested` up). Cancelling the gate fails nothing; only the unrestartable takes are failed,
-    and only after a confirmed (or no-spend) restart. Smoke-tested in `smoke_phase2`
-    (`test_restart_plan`, `test_restart_take`, `test_restart_from_snapshot`).
+    and only after a confirmed (or no-spend) restart.
+    **`Take.interrupted` flag (2026-06-18):** "cancelled" conflated two things — takes the user
+    *deliberately* cancelled vs takes auto-cancelled when ComfyUI/the app *died* (orphan recovery's
+    CANCEL, or the 3-strike `abandon_local`). The `interrupted: bool` field on `Take` records the
+    difference: the **auto/death paths set it True**, every **manual cancel sets it False** (set
+    explicitly at each site, so a take crash-cancelled → restarted → user-cancelled doesn't keep a
+    stale True). The **bulk** "Restart interrupted takes" only re-runs `status==CANCELLED and
+    interrupted` ones (`main_window._interrupted_take_count` gates the action's enabled state); the
+    **per-take** "Restart take" still restarts *any* cancelled take (an explicit user override).
+    Additive/back-compat: `_take_from_dict` **backfills** a legacy cancelled take's flag from its
+    `error` reason text ("...restart..." → True) so a pre-existing crashed batch is recognised on
+    load. Smoke-tested in `smoke_phase2` (`test_restart_plan`, `test_restart_take`,
+    `test_restart_from_snapshot`, `test_interrupted_flag`).

@@ -56,6 +56,10 @@ class Take:
     frame_count: Optional[int] = None
     starred: bool = False
     deleted: bool = False                   # soft delete -> moved to <assets>/.bin/
+    interrupted: bool = False               # cancelled by a crash/app-or-ComfyUI death (orphan
+                                            # recovery / 3-strike abandon), NOT a deliberate user
+                                            # cancel - the bulk "Restart interrupted takes" action
+                                            # only re-runs these (see rule #17)
     error: Optional[str] = None
     created: str = ""                       # when queued (added to the project)
     started: Optional[str] = None           # when it actually began rendering (-> GENERATING)

@@ -151,10 +151,11 @@ class MainWindow(QMainWindow):
         self.cancel_act.triggered.connect(self.cancel_pending)
         self.cancel_act.setEnabled(False)
         tb.addAction(self.cancel_act)
-        self.restart_act = QAction("Restart cancelled takes", self)
-        self.restart_act.setToolTip("Re-run every cancelled take from its frozen settings "
-                                    "(same seed + framing). Takes that can't be replayed exactly "
-                                    "are marked failed with a reason")
+        self.restart_act = QAction("Restart interrupted takes", self)
+        self.restart_act.setToolTip("Re-run takes that were cancelled by a crash or by ComfyUI/the "
+                                    "app dying (not ones you cancelled yourself), from their frozen "
+                                    "settings (same seed + framing). Takes that can't be replayed "
+                                    "exactly are marked failed with a reason")
         self.restart_act.triggered.connect(self.restart_cancelled_takes)
         self.restart_act.setEnabled(False)
         tb.addAction(self.restart_act)
@@ -826,20 +827,21 @@ class MainWindow(QMainWindow):
         self._refresh_restart_action()
 
     def _refresh_restart_action(self) -> None:
-        self.restart_act.setEnabled(self._cancelled_take_count() > 0)
+        self.restart_act.setEnabled(self._interrupted_take_count() > 0)
 
-    def _cancelled_take_count(self) -> int:
+    def _interrupted_take_count(self) -> int:
         return sum(1 for t in self.project.list_takes(include_deleted=False)
-                   if t.status == STATUS_CANCELLED)
+                   if t.status == STATUS_CANCELLED and t.interrupted)
 
-    # ---- restart cancelled takes ---------------------------------------
+    # ---- restart interrupted takes -------------------------------------
     def restart_cancelled_takes(self) -> None:
-        """Re-run every cancelled take in the project (ignoring the view filters, like Cancel
-        pending). Exact-restartable takes replay in place from their snapshot; the rest are
-        marked failed with a reason."""
-        cancelled = [t for t in self.project.list_takes(include_deleted=False)
-                     if t.status == STATUS_CANCELLED]
-        self._restart_takes(cancelled)
+        """Re-run every INTERRUPTED cancelled take in the project (ignoring the view filters, like
+        Cancel pending). Only takes cancelled by a crash / ComfyUI-or-app death are restarted -
+        ones the user deliberately cancelled are left alone. Exact-restartable takes replay in
+        place from their snapshot; the rest are marked failed with a reason."""
+        interrupted = [t for t in self.project.list_takes(include_deleted=False)
+                       if t.status == STATUS_CANCELLED and t.interrupted]
+        self._restart_takes(interrupted)
 
     def _restart_takes_by_ids(self, ids: list) -> None:
         """Restart just the given takes (the takes-grid context-menu entry). Non-cancelled ids
@@ -1172,7 +1174,8 @@ class MainWindow(QMainWindow):
             counts: Counter = Counter()           # lost; clear never-submitted, leave submitted
             for p in recovery.plan_offline_recovery(orphans):
                 if p.action == recovery.CANCEL:
-                    proj.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason)
+                    proj.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason,
+                                     interrupted=True)   # crash/app-death, not a user cancel
                 elif p.action == recovery.FAIL:
                     proj.update_take(p.take_id, status=STATUS_FAILED, error=p.reason)
                 else:                             # LEAVE - keep generating; reclaim on a later launch
@@ -1220,7 +1223,8 @@ class MainWindow(QMainWindow):
             elif p.action == recovery.FAIL:
                 self.project.update_take(p.take_id, status=STATUS_FAILED, error=p.reason)
             elif p.action == recovery.CANCEL:
-                self.project.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason)
+                self.project.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason,
+                                         interrupted=True)   # crash/app-death, not a user cancel
             counts[p.action] += 1
             self._log(f"orphan {p.take_id[:8]}: {p.reason}")
             self._refresh_shot(p.shot_id)

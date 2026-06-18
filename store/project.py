@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Optional
 
 import paths
-from store.models import Job, Shot, Take
+from store.models import STATUS_CANCELLED, Job, Shot, Take
 
 FORMAT = "animgen-project"
 VERSION = 1
@@ -326,6 +326,12 @@ class Project:
         d = dict(d)
         for f in _TAKE_PATHS:
             d[f] = self._abs(d.get(f))
+        # Migration: pre-2026-06-18 cancelled takes carry no `interrupted` flag. Backfill it from
+        # the recovery reason text in `error` ("...not submitted before restart...") so an existing
+        # crash/restart-cancelled batch is still recognised as interrupted (not user-cancelled) by
+        # the bulk Restart action. New takes always serialize the field, so this only fires once.
+        if "interrupted" not in d and d.get("status") == STATUS_CANCELLED:
+            d["interrupted"] = "restart" in (d.get("error") or "").lower()
         return Take(**d)
 
     # ---- shots (authoring; set dirty, no immediate persist) -------------
