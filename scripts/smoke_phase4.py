@@ -552,7 +552,7 @@ def test_queue_view() -> None:
     from PySide6.QtWidgets import QApplication, QProgressBar, QPushButton, QWidget
 
     from backends.jobs import JobManager
-    from store.models import STATUS_CANCELLED, STATUS_GENERATING, STATUS_PENDING
+    from store.models import STATUS_CANCELLED, STATUS_DONE, STATUS_GENERATING, STATUS_PENDING
     from ui.queue_view import QueueView, _BAR_LABEL_ROLE, _BAR_ROLE, _PROGRESS_COL
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
@@ -620,12 +620,24 @@ def test_queue_view() -> None:
     assert [a.text() for a in menu.actions()] == ["Cancel queued generation"]
     assert qv._build_context_menu([g.id]).actions() == []      # a generating take: nothing to cancel
 
+    # (d2) Header gains a cumulative 'N done' counter and the 'Last finished' strip surfaces the
+    #      newest finished take, so a result is visible without scrolling the queue (card #77).
+    #      (isHidden(), not isVisible(): the unshown headless widget is never "visible" but its
+    #      explicit show/hide intent is what we drive.)
+    assert qv.last_label.isHidden()                            # nothing finished yet -> strip hidden
+    d = add(STATUS_DONE)
+    project.update_take(d.id, started="2026-06-18T10:00:00", completed="2026-06-18T10:00:12")
+    qv.refresh()
+    assert "1 done" in qv.summary.text(), qv.summary.text()
+    assert not qv.last_label.isHidden()                        # a finished take -> strip shown
+    assert qv.last_label.text() == "Last finished: kick - done in 12s", qv.last_label.text()
+
     # (e) Force a real paint so _ProgressDelegate.paint actually runs (the determinate-bar
     #     branch for the local take + the plain-text branch for the rest) - the model-role
     #     asserts above don't exercise the paint path.
     qv.resize(900, 360)
     assert not qv.grab().isNull()
-    print("QueueView OK: zero per-row widgets, bounded child count, 1-row progress, coalesced rebuild, cancel menu, paint")
+    print("QueueView OK: zero per-row widgets, bounded child count, 1-row progress, coalesced rebuild, cancel menu, done counter, last-finished strip, paint")
 
 
 if __name__ == "__main__":

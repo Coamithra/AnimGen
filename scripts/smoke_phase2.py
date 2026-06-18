@@ -2144,6 +2144,41 @@ def test_select_rows() -> None:
           "clear hides finished, active never hidden, no cap")
 
 
+def test_queue_summary() -> None:
+    """The Queue header: a cumulative 'N done' counter alongside running/queued/failed, plus
+    the 'Last finished' strip text for the newest finished take (card #77)."""
+    from store.models import (STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED,
+                              STATUS_GENERATING, STATUS_PENDING)
+    from ui.queue_view import last_finished, last_finished_text, select_rows, summary_line
+
+    gen = Take(id="g", shot_id="s", status=STATUS_GENERATING)
+    pend = Take(id="p", shot_id="s", status=STATUS_PENDING)
+    done = Take(id="d", shot_id="s", status=STATUS_DONE,
+                started="2026-06-18T10:00:00", completed="2026-06-18T10:00:12")
+    done2 = Take(id="d2", shot_id="s", status=STATUS_DONE, completed="2026-06-18T11:00:00")
+    fail = Take(id="f", shot_id="s", status=STATUS_FAILED, completed="2026-06-18T09:00:00")
+    takes = [gen, pend, done, done2, fail]
+
+    # Counter: running/queued always; done + failed appended only when nonzero, in that order.
+    assert summary_line(takes, True) == "1 running · 1 queued · 2 done · 1 failed", summary_line(takes, True)
+    assert summary_line([gen, pend], True) == "1 running · 1 queued"            # done/failed omitted at 0
+    assert summary_line([done], True) == "0 running · 0 queued · 1 done"        # done shown, failed omitted
+    assert summary_line(takes, False) == "Queue empty - nothing generating or queued."  # empty wins
+
+    # last_finished: newest finished among the (already-ordered) rows = the first finished row.
+    rows = select_rows(takes)
+    assert last_finished(rows).id == "d2", last_finished(rows).id               # newest completion
+    assert last_finished([gen, pend]) is None                                   # none finished
+
+    # last_finished_text: a done take shows render duration; a failed/cancelled shows its word.
+    assert last_finished_text(done, "Kick") == "Last finished: Kick - done in 12s", last_finished_text(done, "Kick")
+    assert last_finished_text(done2, "Kick") == "Last finished: Kick - done"    # no started -> no elapsed
+    assert last_finished_text(fail, "Punch") == "Last finished: Punch - failed"
+    canc = Take(id="c", shot_id="s", status=STATUS_CANCELLED)
+    assert last_finished_text(canc, "Block") == "Last finished: Block - cancelled"
+    print("queue_summary OK: done counter, last-finished strip text")
+
+
 def test_queue_actions_in_queue_tab() -> None:
     """The three generation-queue actions (Pause batch / Cancel pending / Restart interrupted
     takes) render in the Queue tab header, not the Shots-tab control strip. The QActions are
@@ -2212,6 +2247,7 @@ if __name__ == "__main__":
     test_progress_pct()
     test_done_elapsed()
     test_select_rows()
+    test_queue_summary()
     test_queue_actions_in_queue_tab()
     test_batch()
     test_batch_finalize()

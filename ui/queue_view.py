@@ -5,7 +5,9 @@ local jobs one at a time, streaming free-text progress lines into the main log. 
 interleaves every job's output keyed only by an 8-char take-id, so it's hard to see *what's
 running, what's queued behind it, and how far along each is*. This tab assembles that into a
 list: one row per active (queued / generating) take plus every finished take (most-recent
-first), each showing its shot, model, backend, status and progress.
+first), each showing its shot, model, backend, status and progress. The header carries a
+counter summary (running/queued, plus done/failed when nonzero) and a 'Last finished' strip
+naming the most-recent result, so a completion is visible without scrolling past a deep queue.
 
 **No per-row widgets (rule #18).** This is a `QTableView` over a `QAbstractTableModel`; the
 Progress column is **delegate-painted** (`QStyle.CE_ProgressBar`) - a determinate bar is
@@ -42,7 +44,7 @@ from PySide6.QtWidgets import (
 import library
 from store.project import Project
 from store.models import (
-    STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
+    STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING, Take,
 )
 
 _COLUMNS = ["Shot", "Model", "Backend", "Status", "Progress"]
@@ -126,6 +128,51 @@ def select_rows(takes, dismissed: "frozenset[str] | set[str]" = frozenset()) -> 
         reverse=True,
     )
     return active + finished
+
+
+def last_finished(rows) -> "Take | None":
+    """The newest finished take among the already-ordered display rows, or None.
+
+    `rows` is select_rows() output (active first, then finished newest-first by completion),
+    so the most-recently-finished take is simply the first row with a terminal status - which
+    also makes this respect Clear automatically (dismissed takes are already absent from rows).
+    Backs the header 'Last finished' strip so a result is visible without scrolling past a
+    deep active queue (card #77)."""
+    for t in rows:
+        if t.status in _FINISHED:
+            return t
+    return None
+
+
+def last_finished_text(take, shot_name: str) -> str:
+    """The 'Last finished' header-strip text for the most-recently-finished take: a done take
+    shows its render duration ("done in X"), a failed/cancelled take shows its status word."""
+    if take.status == STATUS_DONE:
+        elapsed = done_elapsed(take)
+        detail = f"done in {elapsed}" if elapsed else "done"
+    else:
+        detail = _STATUS_DISPLAY.get(take.status, (take.status, None))[0]
+    return f"Last finished: {shot_name} - {detail}"
+
+
+def summary_line(takes, has_rows: bool) -> str:
+    """The Queue header counter line. running/queued are always shown; done/failed are
+    appended only when nonzero (in that order). Counts span ALL project takes - the same
+    all-takes basis the running/queued/failed counters already used - so 'N done' is a
+    cumulative tally consistent with its 'N failed' sibling (card #77). Returns the
+    empty-queue message when nothing is shown (no active and no finished rows)."""
+    if not has_rows:
+        return "Queue empty - nothing generating or queued."
+    n_run = sum(1 for t in takes if t.status == STATUS_GENERATING)
+    n_queue = sum(1 for t in takes if t.status == STATUS_PENDING)
+    n_done = sum(1 for t in takes if t.status == STATUS_DONE)
+    n_fail = sum(1 for t in takes if t.status == STATUS_FAILED)
+    parts = [f"{n_run} running", f"{n_queue} queued"]
+    if n_done:
+        parts.append(f"{n_done} done")
+    if n_fail:
+        parts.append(f"{n_fail} failed")
+    return " · ".join(parts)
 
 
 def _model_backend(take) -> tuple[str, str]:
@@ -339,6 +386,9 @@ class QueueView(QWidget):
     def _build(self) -> None:
         self.summary = QLabel()
         self.summary.setStyleSheet("font-weight: 600; padding: 2px;")
+        self.last_label = QLabel()                     # the 'Last finished' strip (card #77)
+        self.last_label.setStyleSheet("color: #57606a; padding: 2px;")
+        self.last_label.setVisible(False)
         self.clear_btn = QPushButton("Clear finished")
         self.clear_btn.setToolTip(
             "Remove finished, failed and cancelled takes from this list "
@@ -368,6 +418,7 @@ class QueueView(QWidget):
             btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
             header.addWidget(btn)
         header.addWidget(self.summary)
+        header.addWidget(self.last_label)
         header.addStretch(1)
         header.addWidget(self.clear_btn)
 
@@ -394,15 +445,19 @@ class QueueView(QWidget):
 
     def _update_summary(self, rows: list) -> None:
         takes = self.project.list_takes()
-        n_run = sum(1 for t in takes if t.status == STATUS_GENERATING)
-        n_queue = sum(1 for t in takes if t.status == STATUS_PENDING)
-        n_fail = sum(1 for t in takes if t.status == STATUS_FAILED)
-        summary = f"{n_run} running · {n_queue} queued"
-        if n_fail:
-            summary += f" · {n_fail} failed"
-        if not rows:
-            summary = "Queue empty - nothing generating or queued."
-        self.summary.setText(summary)
+        self.summary.setText(summary_line(takes, bool(rows)))
+        # 'Last finished' strip: surface the most-recent finished result near the top so it's
+        # visible without scrolling past a deep active queue (card #77). Respects Clear, since
+        # last_finished reads the (dismissed-filtered) rows.
+        last = last_finished(rows)
+        if last is not None:
+            shot = self.project.get_shot(last.shot_id)
+            name = shot.name if shot else last.shot_id[:8]
+            self.last_label.setText(last_finished_text(last, name))
+            self.last_label.setVisible(True)
+        else:
+            self.last_label.clear()
+            self.last_label.setVisible(False)
         # enable Clear only when a finished row is actually showing to be cleared
         self.clear_btn.setEnabled(any(t.status in _FINISHED for t in rows))
 
