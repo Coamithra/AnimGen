@@ -52,7 +52,7 @@ class ShotTab(QWidget):
     generate_requested = Signal(str)  # shot_id
     export_requested = Signal(list)   # take ids
     open_take_requested = Signal(str)  # take id -> open in the frame-by-frame viewer tab
-    restart_requested = Signal(list)   # cancelled take ids -> re-run them
+    restart_requested = Signal(list)   # cancelled / crash-interrupted-failed take ids -> re-run them
     dirty_changed = Signal()          # this tab's unsaved-edits state flipped
 
     def __init__(self, project: Project, shot=None, parent=None, jobs=None):
