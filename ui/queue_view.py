@@ -52,9 +52,8 @@ _FINISHED = (STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED)
 
 # custom item-data roles the Progress delegate reads (an int 0..100 + label when the cell
 # should paint a determinate bar; None bar-role => the delegate falls back to plain text).
-_TAKE_ID_ROLE = int(Qt.ItemDataRole.UserRole)
-_BAR_ROLE = int(Qt.ItemDataRole.UserRole) + 1
-_BAR_LABEL_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+_BAR_ROLE = int(Qt.ItemDataRole.UserRole)
+_BAR_LABEL_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
 # status value -> (label shown in the Status column, row tint)
 _STATUS_DISPLAY = {
@@ -155,8 +154,6 @@ class QueueModel(QAbstractTableModel):
             return None
         take = self._rows[index.row()]
         col = index.column()
-        if role == _TAKE_ID_ROLE:
-            return take.id
         if col == _PROGRESS_COL:
             return self._progress_role(take, role)
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole):
@@ -227,10 +224,13 @@ class QueueModel(QAbstractTableModel):
         self._dismissed |= {t.id for t in takes if t.status in _FINISHED}
 
     def rebuild(self) -> list:
-        """Recompute the ordered rows from the project. If the row identity+order is
-        unchanged (the common case - a progress tick, or several coalesced status changes
-        that don't reshuffle the list) emit a granular dataChanged; otherwise a full reset.
-        Either way zero per-row widgets are created. Returns the new row list."""
+        """Recompute the ordered rows from the project. When the row identity+order is
+        unchanged (a refresh() that didn't actually change the queue — e.g. switching to the
+        tab) emit a granular dataChanged so scroll/selection survive; any add/remove/reorder
+        (most status transitions reshuffle active-vs-finished) takes a full reset. Either way
+        ZERO per-row widgets are created — that's the rule #18 fix. Returns the new row list.
+        (Progress/% ticks don't come through here; they're single-cell updates, see
+        update_line/update_pct.)"""
         takes = self.project.list_takes()
         finished_ids = {t.id for t in takes if t.status in _FINISHED}
         self._dismissed &= finished_ids                # drop ids of takes no longer present

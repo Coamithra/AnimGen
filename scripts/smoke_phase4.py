@@ -553,7 +553,7 @@ def test_queue_view() -> None:
 
     from backends.jobs import JobManager
     from store.models import STATUS_CANCELLED, STATUS_GENERATING, STATUS_PENDING
-    from ui.queue_view import QueueView, _BAR_ROLE, _PROGRESS_COL
+    from ui.queue_view import QueueView, _BAR_LABEL_ROLE, _BAR_ROLE, _PROGRESS_COL
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
 
@@ -585,6 +585,10 @@ def test_queue_view() -> None:
     # (b) A progress tick on a still-rendering local take touches exactly one row's Progress cell.
     g = add(STATUS_GENERATING, backend="comfyui", model_id="local-flf-wan14b")
     qv.refresh()
+    # before any tick a local generating take already shows a determinate 0% bar (not text).
+    g_idx = qv.model.index(next(i for i, t in enumerate(qv.model.rows()) if t.id == g.id),
+                           _PROGRESS_COL)
+    assert qv.model.data(g_idx, _BAR_ROLE) == 0 and qv.model.data(g_idx, _BAR_LABEL_ROLE) == "0%"
     touched: list = []
     qv.model.dataChanged.connect(
         lambda tl, br, *_: touched.append((tl.row(), tl.column(), br.row(), br.column())))
@@ -592,8 +596,9 @@ def test_queue_view() -> None:
     assert len(touched) == 1, touched
     row, col, br_row, br_col = touched[0]
     assert (row, col) == (br_row, br_col) == (row, _PROGRESS_COL)   # one cell, one row
-    # the model now feeds the delegate a determinate 50% bar for that local generating take
+    # the model now feeds the delegate a determinate 50% bar + the WS step label for that take
     assert qv.model.data(qv.model.index(row, _PROGRESS_COL), _BAR_ROLE) == 50
+    assert qv.model.data(qv.model.index(row, _PROGRESS_COL), _BAR_LABEL_ROLE) == "step 1/2"
     # a hosted/queued take is plain text, no bar
     pend_row = next(i for i, t in enumerate(qv.model.rows()) if t.status == STATUS_PENDING)
     assert qv.model.data(qv.model.index(pend_row, _PROGRESS_COL), _BAR_ROLE) is None
@@ -614,7 +619,13 @@ def test_queue_view() -> None:
     menu = qv._build_context_menu([pending_id])
     assert [a.text() for a in menu.actions()] == ["Cancel queued generation"]
     assert qv._build_context_menu([g.id]).actions() == []      # a generating take: nothing to cancel
-    print("QueueView OK: zero per-row widgets, bounded child count, 1-row progress, coalesced rebuild, cancel menu")
+
+    # (e) Force a real paint so _ProgressDelegate.paint actually runs (the determinate-bar
+    #     branch for the local take + the plain-text branch for the rest) - the model-role
+    #     asserts above don't exercise the paint path.
+    qv.resize(900, 360)
+    assert not qv.grab().isNull()
+    print("QueueView OK: zero per-row widgets, bounded child count, 1-row progress, coalesced rebuild, cancel menu, paint")
 
 
 if __name__ == "__main__":
