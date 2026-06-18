@@ -52,6 +52,21 @@ def build_summary(items: list[dict]) -> tuple[str, float, bool]:
     return header + "\n\n" + "\n".join(lines), total, has_spend
 
 
+def launch_button_label(total: float, has_spend: bool) -> str:
+    """Accept-button label, mirroring confirm_launch's three-way header warning.
+
+    An all-unknown-cost batch has has_spend=True but total==0 (build_summary tallies
+    None costs separately), so feeding total into _fmt_cost would render
+    "Launch (spend ~free)" — contradicting the "MAY spend money" header. Split out so
+    the label is testable without exec().
+    """
+    if total > 0:
+        return f"Launch (spend ~{_fmt_cost(total)})"
+    if has_spend:
+        return "Launch (cost unknown)"
+    return "Launch (free)"
+
+
 def total_price_text(costs: list[Optional[float]]) -> str:
     """Shots-view label: full-set generation cost summed over per-shot estimates.
 
@@ -89,7 +104,7 @@ def confirm_launch(parent, items: list[dict]) -> bool:
 
     bb = QDialogButtonBox()
     cancel = bb.addButton(QDialogButtonBox.StandardButton.Cancel)
-    launch_label = "Launch (free)" if not has_spend else f"Launch (spend ~{_fmt_cost(total)})"
+    launch_label = launch_button_label(total, has_spend)
     bb.addButton(launch_label, QDialogButtonBox.ButtonRole.AcceptRole)
     cancel.setDefault(True)       # safety: Enter cancels, not launches
     cancel.setAutoDefault(True)
