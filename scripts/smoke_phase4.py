@@ -310,6 +310,45 @@ def test_take_progress_label() -> None:
     print("TakesView progress OK: generating tile shows live %, done tile ignores late tail")
 
 
+def test_param_enum_preserves_out_of_schema_value() -> None:
+    """The generic enum-param combo must PRESERVE a stored value absent from the live schema
+    enum (e.g. an option renamed/removed by a Model Library refresh) instead of silently
+    snapping to enum[0] and overwriting the user's choice. The stale value is kept selectable
+    and flagged red (mirrors the invalid-aspect handling) so the user re-picks deliberately."""
+    from PySide6.QtWidgets import QApplication, QComboBox
+
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("c", model_id="seedance-2.0-std")
+    tab = ShotTab(project, shot)
+    model = tab._current_model() or {}
+
+    # A live schema whose enum no longer contains the stored value 'pro'.
+    tab._schema = {"quality": {"enum": ["standard", "high"]}}
+
+    # In-enum value: selected normally, no red flag.
+    w_ok, get_ok = tab._make_param_widget("quality", "high", model)
+    assert isinstance(w_ok, QComboBox)
+    assert get_ok() == "high"
+    assert "d9534f" not in w_ok.styleSheet()                  # valid -> no red border
+
+    # Out-of-enum value: preserved (NOT enum[0]='standard') and flagged red to re-pick.
+    w_bad, get_bad = tab._make_param_widget("quality", "pro", model)
+    assert isinstance(w_bad, QComboBox)
+    assert get_bad() == "pro", "stored value must be preserved, not snapped to enum[0]"
+    assert get_bad() != "standard"
+    assert "pro" in [w_bad.itemText(i) for i in range(w_bad.count())]  # kept as a selectable item
+    assert "d9534f" in w_bad.styleSheet()                     # flagged red like an invalid aspect
+
+    # Re-picking a valid option clears the flag.
+    w_bad.setCurrentText("standard")
+    assert get_bad() == "standard"
+    assert "d9534f" not in w_bad.styleSheet()
+    print("shot-tab enum param OK: out-of-schema value preserved + flagged, valid re-pick clears flag")
+
+
 if __name__ == "__main__":
     test_bin_restore()
     test_takes_view()
@@ -319,4 +358,5 @@ if __name__ == "__main__":
     test_asset_picker()
     test_card_and_window()
     test_framed_row_thumbs()
+    test_param_enum_preserves_out_of_schema_value()
     print("PHASE 4 SMOKE: PASS")
