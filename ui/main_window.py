@@ -431,7 +431,7 @@ class MainWindow(QMainWindow):
                 continue
             if starred_only and not self.project.list_takes(shot.id, starred_only=True):
                 continue
-            card = ShotCard(self.project, shot)
+            card = ShotCard(self.project, shot, jobs=self.jobs)
             card.generate_requested.connect(self.generate_shot)
             card.open_requested.connect(self.open_shot)
             card.duplicate_requested.connect(self.duplicate_shot)
@@ -488,7 +488,7 @@ class MainWindow(QMainWindow):
 
     # ---- shot tabs ------------------------------------------------------
     def new_shot(self) -> None:
-        tab = ShotTab(self.project)
+        tab = ShotTab(self.project, jobs=self.jobs)
         self._wire_shot_tab(tab)
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
 
@@ -499,7 +499,7 @@ class MainWindow(QMainWindow):
         shot = self.project.get_shot(shot_id)
         if not shot:
             return
-        tab = ShotTab(self.project, shot=shot)
+        tab = ShotTab(self.project, shot=shot, jobs=self.jobs)
         self._wire_shot_tab(tab)
         self.shot_tabs[shot_id] = tab
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, tab.title()))
