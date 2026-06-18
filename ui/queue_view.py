@@ -21,10 +21,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 import library
@@ -99,10 +100,11 @@ def select_rows(takes, dismissed: "frozenset[str] | set[str]" = frozenset(),
 
 
 class QueueView(QWidget):
-    def __init__(self, project: Project, jobs, parent=None):
+    def __init__(self, project: Project, jobs, parent=None, queue_actions=None):
         super().__init__(parent)
         self.project = project
         self.jobs = jobs
+        self._queue_actions = list(queue_actions or [])   # QActions owned by MainWindow
         self._latest: dict[str, str] = {}              # take_id -> last progress line
         self._latest_pct: dict[str, tuple[float, str]] = {}     # take_id -> (fraction, label)
         self._progress_items: dict[str, QTableWidgetItem] = {}  # take_id -> its Progress text cell
@@ -146,6 +148,11 @@ class QueueView(QWidget):
             hh.setSectionResizeMode(col, mode)
 
         header = QHBoxLayout()
+        for act in self._queue_actions:                # queue actions on the left (MainWindow-owned)
+            btn = QToolButton()
+            btn.setDefaultAction(act)                  # reflects the action's enabled/text state
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            header.addWidget(btn)
         header.addWidget(self.summary)
         header.addStretch(1)
         header.addWidget(self.clear_btn)
