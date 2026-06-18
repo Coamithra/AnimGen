@@ -65,6 +65,12 @@ def plan_restart(takes, *, model_of_id: Callable[[Optional[str]], Optional[dict]
         if not path_exists(start):
             plan.unrestartable.append((take, "start keyframe no longer available"))
             continue
+        end = snap.get("end_frame")
+        if end and not path_exists(end):
+            # render_keyposes silently drops a missing end frame, which would replay a
+            # first-last take as start-only - not the exact render. Fail it instead.
+            plan.unrestartable.append((take, "end keyframe no longer available"))
+            continue
         settings = snap.get("settings") or {}
         plan.restartable.append(take)
         plan.items.append({

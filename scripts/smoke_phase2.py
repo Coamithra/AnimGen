@@ -1570,29 +1570,33 @@ def test_restart_plan() -> None:
     framed = {"model_id": "good", "backend": "replicate", "start_frame": "a.png",
               "settings": {"seed": 7, "duration": 4}, "canvas": [1254, 1254], "crop": {}}
     ok = _take(framed)
+    ok_with_end = _take({**framed, "end_frame": "b.png"})   # present end frame -> still restartable
     unknown_model = _take({**framed, "model_id": "gone"})
     missing_frame = _take({**framed, "start_frame": "deleted.png"})
+    missing_end = _take({**framed, "end_frame": "deleted_end.png"})  # end frame gone -> can't replay exactly
     old_snapshot = _take({"model_id": "good", "backend": "replicate",  # pre-2026-06-17: no canvas/crop
                           "start_frame": "a.png", "settings": {"seed": 1}})
     not_cancelled = _take(framed, status=STATUS_DONE)  # filtered out entirely
 
     models = {"good": {"display_name": "Good", "backend": "replicate"}}
     plan = restart.plan_restart(
-        [ok, unknown_model, missing_frame, old_snapshot, not_cancelled],
+        [ok, ok_with_end, unknown_model, missing_frame, missing_end, old_snapshot, not_cancelled],
         model_of_id=lambda mid: models.get(mid),
         est_of=lambda mid, s: 0.5,
-        path_exists=lambda p: p == "a.png",
+        path_exists=lambda p: p in ("a.png", "b.png"),
         name_of=lambda t: t.id)
 
-    assert plan.restartable == [ok], plan.restartable
-    assert len(plan.items) == 1
+    assert plan.restartable == [ok, ok_with_end], plan.restartable
+    assert len(plan.items) == 2
     it = plan.items[0]
     assert set(it) >= {"name", "model_display", "backend", "est_cost", "params"}
     assert it["est_cost"] == 0.5 and it["params"]["seed"] == 7
     reasons = {t.id: r for t, r in plan.unrestartable}
-    assert set(reasons) == {unknown_model.id, missing_frame.id, old_snapshot.id}, reasons
+    assert set(reasons) == {unknown_model.id, missing_frame.id, missing_end.id,
+                            old_snapshot.id}, reasons
     assert "unknown model" in reasons[unknown_model.id]
     assert "start keyframe" in reasons[missing_frame.id]
+    assert "end keyframe" in reasons[missing_end.id]
     assert "predates framing" in reasons[old_snapshot.id]
     print("restart plan OK: restartable filter + per-take unrestartable reasons")
 

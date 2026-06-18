@@ -852,6 +852,7 @@ class MainWindow(QMainWindow):
         plan = restart.plan_restart(
             takes, model_of_id=library.get_model, est_of=library.estimate_cost,
             path_exists=lambda p: bool(p) and Path(p).exists(), name_of=self._take_label)
+        detail = "\n".join(f"  • {self._take_label(t)}: {r}" for t, r in plan.unrestartable)
         if plan.restartable:
             if not confirm_launch(self, plan.items):
                 self._log("restart cancelled")
@@ -863,14 +864,23 @@ class MainWindow(QMainWindow):
                 return
             for take in plan.restartable:
                 self._restart_in_place(take)
+        elif plan.unrestartable:
+            # Nothing to re-fire (no spend, so no cost gate), but there are takes we can't replay
+            # exactly. Confirm before flipping CANCELLED->FAILED so the click stays backable-out.
+            if QMessageBox.question(
+                    self, "Restart",
+                    f"None of the {len(plan.unrestartable)} cancelled take(s) can be restarted "
+                    f"exactly:\n\n{detail}\n\nMark them failed?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
         for take, reason in plan.unrestartable:
             self.project.update_take(take.id, status=STATUS_FAILED,
                                      error=f"cannot restart: {reason}")
             self._refresh_shot_for_take(take.id)
         self._log(f"restart: {len(plan.restartable)} re-queued, "
                   f"{len(plan.unrestartable)} marked failed")
-        if plan.unrestartable:
-            detail = "\n".join(f"  • {self._take_label(t)}: {r}" for t, r in plan.unrestartable)
+        if plan.restartable and plan.unrestartable:
             QMessageBox.information(
                 self, "Restart",
                 f"Re-queued {len(plan.restartable)} take(s).\n\n"
@@ -899,13 +909,12 @@ class MainWindow(QMainWindow):
         """A throwaway Shot carrying the snapshot's frozen framing, fed to _make_runner /
         framing.render_keyposes so the restart reproduces the take exactly (not the shot's
         possibly-since-edited state). Only the fields those readers touch are populated."""
-        canvas = snap.get("canvas") or [None, None]
+        canvas = snap.get("canvas") or [None, None]   # always [w, h] when present (_queue_take)
         existing = self.project.get_shot(shot_id)
         return Shot(
             id=shot_id, name=(existing.name if existing else "(restart)"),
             start_frame=snap.get("start_frame"), end_frame=snap.get("end_frame"),
-            canvas_w=(canvas[0] if len(canvas) > 0 else None),
-            canvas_h=(canvas[1] if len(canvas) > 1 else None),
+            canvas_w=canvas[0], canvas_h=canvas[1],
             crop=snap.get("crop") or {}, prompt=snap.get("prompt", ""),
             negative_prompt=snap.get("negative_prompt", ""),
             model_id=snap.get("model_id", ""), settings=snap.get("settings") or {})
