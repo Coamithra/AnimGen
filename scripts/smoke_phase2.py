@@ -593,6 +593,53 @@ def test_inflight_stop_maps_to_cancelled() -> None:
     print("inflight stop OK: stop-induced backend error -> CANCELLED, not FAILED")
 
 
+def test_recovered_crash_maps_to_interrupted() -> None:
+    # A render error re-raised by crash recovery after a successful final restart carries the
+    # CRASH_INTERRUPTED_ATTR stamp; the worker must record the take FAILED + interrupted=True so
+    # the bulk "Restart interrupted takes" action picks it up (card #68). A plain (unstamped)
+    # workflow error must still land FAILED + interrupted=False. Run the QRunnable directly.
+    from PySide6.QtWidgets import QApplication
+
+    from backends.crash_recovery import CRASH_INTERRUPTED_ATTR
+    from backends.jobs import GenerationJob, JobManager
+    from store.models import STATUS_FAILED, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    jm = JobManager(project)
+
+    crashed = project.add_take(shot.id, status=STATUS_PENDING)
+
+    def stamped_runner(progress):
+        e = RuntimeError("ComfyUI unreachable (TDR)")     # the original render error,
+        setattr(e, CRASH_INTERRUPTED_ATTR, True)          # stamped by the recover path
+        raise e
+
+    GenerationJob(project, crashed.id, "comfyui", stamped_runner, jm._signals,
+                  jm._cancelled, jm._stopping, jm._requeue, jm._on_job_done).run()
+
+    plain = project.add_take(shot.id, status=STATUS_PENDING)
+
+    def plain_runner(progress):
+        raise RuntimeError("bad node")                    # genuine workflow error, no stamp
+
+    GenerationJob(project, plain.id, "comfyui", plain_runner, jm._signals,
+                  jm._cancelled, jm._stopping, jm._requeue, jm._on_job_done).run()
+    # The take state below is read straight from the write-through (project.update_take runs
+    # inline in run()); processEvents only drains the emitted signals, which this test ignores.
+    app.processEvents()
+
+    got_crash = project.get_take(crashed.id)
+    assert got_crash.status == STATUS_FAILED and got_crash.interrupted is True, (
+        got_crash.status, got_crash.interrupted)
+    assert "TDR" in (got_crash.error or ""), "must keep the original error verbatim"
+    got_plain = project.get_take(plain.id)
+    assert got_plain.status == STATUS_FAILED and got_plain.interrupted is False, (
+        got_plain.status, got_plain.interrupted)
+    print("recovered crash OK: stamped re-raise -> FAILED+interrupted; plain error -> FAILED only")
+
+
 def test_request_stop_calls_backend() -> None:
     # request_stop must flag the take and issue the right best-effort backend stop, and
     # must swallow a backend that's down (no raise out of a delete). Monkeypatch the two
@@ -870,8 +917,8 @@ def test_orphan_recovery() -> None:
 
 
 def test_crash_recovery() -> None:
-    from backends.crash_recovery import (QueueAbandoned, _looks_crashed, format_elapsed,
-                                         run_with_crash_recovery)
+    from backends.crash_recovery import (CRASH_INTERRUPTED_ATTR, QueueAbandoned, _looks_crashed,
+                                         format_elapsed, run_with_crash_recovery)
 
     # format_elapsed: compact span, clamps negatives.
     assert format_elapsed(45) == "45s"
@@ -1050,6 +1097,9 @@ def test_crash_recovery() -> None:
     except comfy_client.ComfyError as e:
         assert not isinstance(e, QueueAbandoned), "a recovered server must NOT abandon the queue"
         assert "(TDR)" in str(e), ("must re-raise the original render error verbatim", str(e))
+        # The re-raised crash error is STAMPED so the worker records the take interrupted=True
+        # (bulk-restartable) - it WAS crash-killed, not a genuine workflow error (card #68).
+        assert getattr(e, CRASH_INTERRUPTED_ATTR, False) is True, "recovered crash must be stamped"
     assert len(restarts) == 3, ("a final restart must fire on the last strike", restarts)
     assert not abandons, "on_abandon must NOT fire when the final restart recovers the server"
     assert any("recovered after a final restart" in n for n in notes), notes
@@ -2094,6 +2144,7 @@ if __name__ == "__main__":
     test_cancel_pending()
     test_cancel_shot_takes()
     test_inflight_stop_maps_to_cancelled()
+    test_recovered_crash_maps_to_interrupted()
     test_request_stop_calls_backend()
     test_is_stop_requested()
     test_job_manager()
