@@ -24,12 +24,12 @@ import paths  # noqa: E402
 
 paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
 
-from pipeline import export  # noqa: E402
+from pipeline import export, extract  # noqa: E402
 from store.project import Project  # noqa: E402
 from store.models import STATUS_DONE, STATUS_FAILED, STATUS_PENDING  # noqa: E402
 
 
-def _make_mp4(path: Path, n: int = 5) -> None:
+def _make_mp4(path: Path, n: int = 5) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     codec = "mpeg4"
     container = av.open(str(path), mode="w")
@@ -43,6 +43,7 @@ def _make_mp4(path: Path, n: int = 5) -> None:
     for pkt in stream.encode():
         container.mux(pkt)
     container.close()
+    return path
 
 
 def test_export() -> None:
@@ -80,6 +81,28 @@ def test_export() -> None:
     res3 = export.export_takes(project, [r3.id], dest_root=dest)
     assert res3["parent"] is None and r3.id in res3["skipped"]
     print("export OK: single(flat)/multi(subfolders)/skipped, settings.txt snapshot")
+
+
+def test_extract_frames_wide_padding() -> None:
+    """Frame filenames zero-pad to a width derived from the true decoded frame count, so a
+    lexicographic sort always equals frame order. A flat {i:03d} pad scrambled takes past
+    999 frames (frame_1000 sorting before frame_999); a take whose top index reaches 1000
+    now widens to 4 digits, while a short take keeps the historic 3-digit floor."""
+    tmp = Path(tempfile.mkdtemp())
+
+    # Short take: the 3-digit floor is preserved (frame_000.png, the historic look).
+    short_names = [p.name for p in extract.extract_frames(_make_mp4(tmp / "short.mp4", 5),
+                                                           tmp / "short_frames")]
+    assert short_names[0] == "frame_000.png", short_names[0]
+
+    # A take whose top index reaches 1000 widens to 4 digits so the sort holds.
+    paths = extract.extract_frames(_make_mp4(tmp / "long.mp4", 1001), tmp / "long_frames")
+    assert len(paths) == 1001, len(paths)
+    names = [p.name for p in paths]             # returned in frame order (0..1000)
+    assert names[0] == "frame_0000.png" and names[-1] == "frame_1000.png", (names[0], names[-1])
+    assert len({len(n) for n in names}) == 1, "padding must be fixed-width across all frames"
+    assert names == sorted(names), "lexicographic sort must equal frame order"
+    print("extract_frames OK: pad width tracks frame count (3-digit floor, 4 digits past 999)")
 
 
 def test_window_builds() -> None:
@@ -599,6 +622,7 @@ def test_run_survives_deleted_signals() -> None:
 
 if __name__ == "__main__":
     test_export()
+    test_extract_frames_wide_padding()
     test_window_builds()
     test_close_dirty_tab_guard()
     test_tab_state_persistence()
