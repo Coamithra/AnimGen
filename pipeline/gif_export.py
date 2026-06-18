@@ -22,10 +22,10 @@ def encode_gif(frames: list[Image.Image], out_path: str | Path, fps: float, *,
     """Write `frames` (PIL Images) as an animated GIF at `out_path`; returns the path.
 
     `duration` is the per-frame hold in ms derived from fps (the GIF format stores it in
-    centiseconds, so it rounds to ~10ms steps). `loop=0` is infinite. `disposal=2` clears
-    each frame to the background before the next is drawn so a moving subject can't ghost;
-    paired with full (un-optimized) frames there's no flashing since every frame repaints
-    the whole canvas. `max_side` optionally downscales the longest edge."""
+    centiseconds, so it rounds to ~10ms steps). `loop=0` is infinite. Each frame is a full,
+    opaque, un-optimized RGB repaint (its own local palette), so it fully overwrites the
+    previous one — `disposal=1` (leave-in-place) is the right choice and there's nothing to
+    ghost. `max_side` optionally downscales the longest edge."""
     if not frames:
         raise ValueError("no frames to encode")
     out_path = Path(out_path)
@@ -43,7 +43,7 @@ def encode_gif(frames: list[Image.Image], out_path: str | Path, fps: float, *,
 
     first, rest = prepared[0], prepared[1:]
     first.save(out_path, format="GIF", save_all=True, append_images=rest,
-               duration=duration, loop=loop, disposal=2)
+               duration=duration, loop=loop, disposal=1)
     return out_path
 
 

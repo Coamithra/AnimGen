@@ -181,6 +181,7 @@ class TakePlayerTab(QWidget):
         self._fps = _DEFAULT_FPS
         self._loader: Optional[_FrameLoader] = None
         self._gif_worker: Optional[_GifExporter] = None   # kept alive across the export
+        self._gif_busy = False                            # one export at a time (GUI-thread flag)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
         self._build()
@@ -322,7 +323,7 @@ class TakePlayerTab(QWidget):
 
     def _save_gif(self) -> None:
         source = self._gif_source()
-        if not source:
+        if not source or self._gif_busy:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save take as GIF", self._default_gif_name(), "Animated GIF (*.gif)")
@@ -335,7 +336,7 @@ class TakePlayerTab(QWidget):
 
     def _copy_gif(self) -> None:
         source = self._gif_source()
-        if not source:
+        if not source or self._gif_busy:
             return
         # The temp file must outlive the copy (paste happens later), so it's written under a
         # stable per-take path and reused on repeat copies rather than auto-deleted.
@@ -346,17 +347,22 @@ class TakePlayerTab(QWidget):
 
     def _start_gif_export(self, source: str, out_path: str,
                           on_done: Callable[[str], None]) -> None:
+        self._gif_busy = True
         self._gif_worker = _GifExporter(source, out_path)   # kept on self so it isn't GC'd
         self._gif_worker.done.connect(on_done)
         self._gif_worker.failed.connect(self._on_gif_failed)
         self._gif_worker.start()
 
-    def _on_gif_saved(self, path: str) -> None:
+    def _end_gif_export(self) -> None:
+        self._gif_busy = False
         self.canvas.setToolTip("")
+
+    def _on_gif_saved(self, path: str) -> None:
+        self._end_gif_export()
         QMessageBox.information(self, "GIF saved", f"Saved animated GIF to:\n{path}")
 
     def _on_gif_copied(self, path: str) -> None:
-        self.canvas.setToolTip("")
+        self._end_gif_export()
         self._set_clipboard_gif(path)
         QMessageBox.information(
             self, "GIF copied",
@@ -364,7 +370,7 @@ class TakePlayerTab(QWidget):
             "Paste it into a chat, email, or file manager.")
 
     def _on_gif_failed(self, msg: str) -> None:
-        self.canvas.setToolTip("")
+        self._end_gif_export()
         QMessageBox.warning(self, "GIF export failed", f"Could not create the GIF:\n{msg}")
 
     @staticmethod

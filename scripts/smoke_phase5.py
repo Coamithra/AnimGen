@@ -845,6 +845,7 @@ def test_gif_export() -> None:
     # take_to_gif: decode a real mp4 and re-encode; frame count survives the round-trip.
     mp4 = _make_mp4(tmp / "clip.mp4", n=5)
     src_count = sum(1 for _ in extract.iter_frames(mp4))
+    assert src_count == 5, src_count                         # the mp4 decodes to what we asked for
     gif = gif_export.take_to_gif(mp4, tmp / "clip.gif")
     with Image.open(gif) as g:
         assert g.is_animated and g.n_frames == src_count, (g.n_frames, src_count)
