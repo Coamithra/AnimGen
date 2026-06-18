@@ -353,8 +353,27 @@ def _heartbeat(port):
                   f"inflight={sum(1 for r in _renders.values() if not r['done'])}", flush=True)
 
 
-def main(argv):
+def make_server(port: int = 8188, *, render_s: float = RENDER_S, jitter_s: float = JITTER_S,
+                preview_bytes: int = WS_PREVIEW_BYTES,
+                fail_rate: float = FAIL_RATE) -> ThreadingHTTPServer:
+    """Build (don't start) an in-process fake-ComfyUI server with a canned clip ready to serve.
+
+    Sets the module render tunables, ensures the canned .mp4 exists (`_canned_output`), and
+    returns an un-started `ThreadingHTTPServer` bound to 127.0.0.1:<port> (port 0 -> an
+    OS-assigned ephemeral port, read back from `srv.server_address[1]`). This is how the
+    headless integration smoke (`scripts/smoke_phase8.py`) drives real takes through the queue
+    with no GPU and no spend; `main()` builds its server the same way (single source of truth).
+    `fail_rate` is clamped to 0..1 like the CLI."""
     global RENDER_S, JITTER_S, WS_PREVIEW_BYTES, FAIL_RATE
+    RENDER_S, JITTER_S, WS_PREVIEW_BYTES = render_s, jitter_s, preview_bytes
+    FAIL_RATE = min(1.0, max(0.0, fail_rate))
+    _canned_output()
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv.daemon_threads = True
+    return srv
+
+
+def main(argv):
     ap = argparse.ArgumentParser(description="Fake ComfyUI for GPU-free AnimGen stress testing")
     ap.add_argument("--port", type=int, default=8188)
     ap.add_argument("--delay", type=float, default=RENDER_S, help="fake per-render seconds")
@@ -364,20 +383,18 @@ def main(argv):
     ap.add_argument("--fail-rate", type=float, default=FAIL_RATE,
                     help="fraction (0..1) of renders that return a workflow error (FAILED take)")
     args = ap.parse_args(argv)
-    RENDER_S, JITTER_S, WS_PREVIEW_BYTES = args.delay, args.jitter, args.preview_bytes
-    FAIL_RATE = min(1.0, max(0.0, args.fail_rate))
-    if FAIL_RATE != args.fail_rate:
-        print(f"[mock] WARNING: --fail-rate {args.fail_rate} clamped to {FAIL_RATE} "
-              f"(expected a fraction 0..1)", flush=True)
+    if args.fail_rate != min(1.0, max(0.0, args.fail_rate)):
+        print(f"[mock] WARNING: --fail-rate {args.fail_rate} clamped to "
+              f"{min(1.0, max(0.0, args.fail_rate))} (expected a fraction 0..1)", flush=True)
 
-    canned = _canned_output()
+    srv = make_server(args.port, render_s=args.delay, jitter_s=args.jitter,
+                      preview_bytes=args.preview_bytes, fail_rate=args.fail_rate)
+    canned = _canned_output()      # idempotent: make_server already created it
     print(f"[mock] canned output: {canned} ({canned.stat().st_size} bytes)", flush=True)
     print(f"[mock] COMFY output dir: {OUTPUT_DIR}", flush=True)
     print(f"[mock] render={RENDER_S}s +/-{JITTER_S}s  preview_bytes={WS_PREVIEW_BYTES}  "
           f"fail_rate={FAIL_RATE}", flush=True)
 
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    srv.daemon_threads = True
     threading.Thread(target=_heartbeat, args=(args.port,), daemon=True).start()
     print(f"[mock] fake ComfyUI listening on http://127.0.0.1:{args.port}  (Ctrl-C to stop)",
           flush=True)

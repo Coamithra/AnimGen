@@ -43,6 +43,11 @@ and a live local take. The backends are verified offline only.
 for n in 1 2 3 4 5 6 7; do QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 \
   .venv/Scripts/python.exe scripts/smoke_phase$n.py; done
 
+# phase 8 is the OPT-IN offline integration smoke (NOT in the 1-7 gate): drives one real
+# take through the mock-ComfyUI submit -> /history -> claim path. Run it when touching the
+# local queue / comfy backend / mock_comfy (a real socket server + JobManager; ~a few seconds).
+QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/smoke_phase8.py
+
 # (re)build the starter project from the shipped-move manifest (idempotent;
 # delete data/Fighter.animproj + data/Fighter.assets first for a clean rebuild)
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/seed_configs.py
@@ -97,6 +102,14 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/mock_comfy.py --delay 8 
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/mock_comfy.py --fail-rate 0.25
 ```
 
+The same fake server also runs **in-process** for the opt-in headless integration smoke
+`scripts/smoke_phase8.py` (card #76): `mock_comfy.make_server(0, ...)` binds the `Handler` to
+an ephemeral port and `comfy_client.COMFY_URL` is monkeypatched at it (the phase-2 redirect
+pattern), so one real take goes through the full `submit -> /history -> claim` path with no
+GUI, no GPU, no spend - landing DONE (output claimed + written through to `takes.json`), and
+with `fail_rate=1.0` landing FAILED + `interrupted=False`. It is NOT part of the always-run
+1-7 gate (a real socket server + `JobManager` is heavier/timing-sensitive); run it explicitly.
+
 then launch the app and fire **Generate batch…**. **`--fail-rate F`** (0..1) makes that fraction
 of renders return a `status_str=="error"` `/history` entry (an `execution_error`, no outputs) so
 the app records a **FAILED** take — the server stays **up**, so it reads as a genuine workflow
@@ -140,7 +153,7 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
 | `store/app_settings.py` | app-global user preferences (`data/app_settings.json`; `get_bool`/`set_bool`). Own file (NOT `app_state.json`, which `main_window._remember_last` rewrites wholesale). Same lock + atomic-write discipline as `schema_cache`. First key `update_schemas_on_startup` (default off) — read by `MainWindow` to auto-refresh Replicate schemas at launch, toggled from the **Settings** menu |
 | `store/prompt_library.py` | app-global library of reusable prompt prefabs (`data/prompt_templates.json`; entry = `{name, positive, negative}`, upsert-by-name). Same lock + atomic-write discipline as `schema_cache`; ships seed templates; read/written by the shot tab's Prompt subtab template combo |
 | `remote/` | opt-in localhost control server so an external agent (Claude) can drive the live GUI like a web page — `server.py` (`RemoteControlServer`: `ThreadingHTTPServer` on 127.0.0.1, endpoints `/health` `/snapshot` `/screenshot` `/click` `/type` `/key` `/set`), `bridge.py` (`GuiBridge`: marshals each widget touch onto the GUI thread via a posted `QEvent`, so it never races the event loop and still works while a modal is open), `snapshot.py` (pure, headless-testable: `build_snapshot`/`resolve_target` + action primitives `do_click`/`do_type`/`do_key`/`do_set`/`grab_png`). Off unless `ANIMGEN_REMOTE` is truthy; `MainWindow._maybe_start_remote` starts it, `closeEvent` stops it |
-| `scripts/` | `seed_configs.py` (writes `Fighter.animproj`, imports keyframes as assets) + `smoke_phase*.py` + `remote_cli.py` (stdlib client for the `remote/` control server) + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) + **`mock_comfy.py`** (the supported **offline GPU-free** fake ComfyUI — drive real local batches with no GPU; see "Offline GPU-free harness" under Run / test / seed). `_`-prefixed scripts are dev/diagnostic scratch (the rule #18 crash hunt: `_app_watch.py`/`_crash_watch.py`/`_widget_census.py`/…) |
+| `scripts/` | `seed_configs.py` (writes `Fighter.animproj`, imports keyframes as assets) + `smoke_phase*.py` (`smoke_phase1-7` = the always-run gate; **`smoke_phase8.py`** = the opt-in offline mock-ComfyUI integration smoke driving a real take end-to-end via `mock_comfy.make_server`, card #76) + `remote_cli.py` (stdlib client for the `remote/` control server) + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) + **`mock_comfy.py`** (the supported **offline GPU-free** fake ComfyUI — drive real local batches with no GPU; see "Offline GPU-free harness" under Run / test / seed). `_`-prefixed scripts are dev/diagnostic scratch (the rule #18 crash hunt: `_app_watch.py`/`_crash_watch.py`/`_widget_census.py`/…) |
 | `data/` | runtime (gitignored): `*.animproj` project files (default `Fighter.animproj`) + their sidecar `<name>.assets/` (flat keyframe images + `takes/`, `thumbs/`, `.bin/`); plus `exports/`, `_scratch/` (untitled-project assets), `app_state.json` (last opened) |
 | `workflows/` | bundled ComfyUI templates for the local backend |
 
