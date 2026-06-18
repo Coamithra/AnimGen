@@ -216,7 +216,15 @@ Full mechanism + invariants in **Hard-won rule #13**.
    (`ui/take_player.py`) surfaces it on demand: a **⚙ Settings** button next to the frame
    timer and a right-click **Show generation settings** on the video both reveal a
    dockable panel (a floatable `QDockWidget` in an inner `QMainWindow`) rendered by the
-   pure, headless-testable `format_generation_settings(take, shot=None)`.
+   pure, headless-testable `format_generation_settings(take, shot=None)`. **The render also
+   reads FROM the snapshot, not the live Shot (card #53):** `_queue_take` feeds `_make_runner`
+   a snapshot-derived synth Shot (`_shot_from_snapshot`, the same helper the restart path
+   uses), so a shot edited+saved before the serialized worker (or a later batch round)
+   dequeues can't make the take render a different prompt/framing/canvas than its own
+   snapshot records. The worker-thread closures (`framing.render_keyposes` + both backends'
+   `generate`) must keep reading off that synth Shot — never re-close over the live `shot`.
+   `_shot_from_snapshot` deep-copies the snapshot's `crop`/`settings` into the synth so a
+   reader can't mutate the frozen snapshot through a shared dict.
 4. **Smoke tests run headless** with `QT_QPA_PLATFORM=offscreen`; never call a modal's
    `.exec()` in a test (it blocks). Tests override `paths.SCRATCH_DIR` to a tempdir so
    untitled-project scratch stays out of `data/`. `build_summary` / pure functions are

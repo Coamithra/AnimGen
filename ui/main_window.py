@@ -12,6 +12,7 @@ discarding); finished takes auto-persist (see store/project.py).
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -711,8 +712,13 @@ class MainWindow(QMainWindow):
         take = self.project.add_take(shot.id, status=STATUS_PENDING,
                                      seed=settings.get("seed"), cost_estimate=est,
                                      settings_snapshot=snapshot)
+        # Render from the take's frozen snapshot, not the live Shot. The serialized local
+        # worker (or a later batch round) can dequeue long after the shot was edited+saved;
+        # feeding _make_runner a snapshot-derived synth Shot keeps the render matching the
+        # take's immutable settings_snapshot (rule #3). Same helper the restart path uses.
+        synth = self._shot_from_snapshot(shot.id, snapshot)
         self.jobs.enqueue(take.id, model["backend"],
-                          self._make_runner(model, shot, settings, take.id))
+                          self._make_runner(model, synth, settings, take.id))
         self._log(f"queued {take.id[:8]} ({shot.name})")
         return take.id
 
@@ -939,17 +945,19 @@ class MainWindow(QMainWindow):
 
     def _shot_from_snapshot(self, shot_id: str, snap: dict) -> Shot:
         """A throwaway Shot carrying the snapshot's frozen framing, fed to _make_runner /
-        framing.render_keyposes so the restart reproduces the take exactly (not the shot's
-        possibly-since-edited state). Only the fields those readers touch are populated."""
+        framing.render_keyposes so the take reproduces exactly (not the shot's
+        possibly-since-edited state). Only the fields those readers touch are populated.
+        crop/settings are deep-copied so a synth-Shot reader can never mutate the take's
+        immutable settings_snapshot through the shared dict (rule #3)."""
         canvas = snap.get("canvas") or [None, None]   # always [w, h] when present (_queue_take)
         existing = self.project.get_shot(shot_id)
         return Shot(
             id=shot_id, name=(existing.name if existing else "(restart)"),
             start_frame=snap.get("start_frame"), end_frame=snap.get("end_frame"),
             canvas_w=canvas[0], canvas_h=canvas[1],
-            crop=snap.get("crop") or {}, prompt=snap.get("prompt", ""),
+            crop=copy.deepcopy(snap.get("crop") or {}), prompt=snap.get("prompt", ""),
             negative_prompt=snap.get("negative_prompt", ""),
-            model_id=snap.get("model_id", ""), settings=snap.get("settings") or {})
+            model_id=snap.get("model_id", ""), settings=copy.deepcopy(snap.get("settings") or {}))
 
     def _take_label(self, take) -> str:
         s = self.project.get_shot(take.shot_id)
