@@ -79,6 +79,32 @@ cost-confirm gate still appears and must be driven, never bypassed. Headless `sm
 remains the gate for logic; the control server is for *interactive* UI verification.
 Full mechanism + invariants in **Hard-won rule #13**.
 
+### Offline GPU-free harness (mock ComfyUI)
+
+`scripts/mock_comfy.py` is the supported way to drive **real local batches with NO GPU**. It
+stands up a fake ComfyUI that speaks just enough of the HTTP+WS protocol — `/system_stats`
+with safe argv so `preflight()` passes, `/prompt`, `/history`, `/queue`, `/interrupt`, and a
+hand-rolled `/ws` streaming `progress` + binary preview frames — for the **unmodified** app to
+queue, render, and claim takes against it. Each fake render finishes in ~8s and serves a real
+canned `.mp4` the app copies + extracts frames from (genuine CPU load). Use it for long offline
+soak tests (does the app survive without the GPU? widget/memory growth — pair with the `applog`
+heartbeat `max_widgets=` census, rule #18) and for fast iteration on the local-render / Queue-tab
+UI without spending GPU time.
+
+```bash
+# keep the REAL ComfyUI down so 8188 is free; honors ANIMGEN_COMFY_DIR
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/mock_comfy.py --delay 8 --jitter 3
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/mock_comfy.py --fail-rate 0.25
+```
+
+then launch the app and fire **Generate batch…**. **`--fail-rate F`** (0..1) makes that fraction
+of renders return a `status_str=="error"` `/history` entry (an `execution_error`, no outputs) so
+the app records a **FAILED** take — the server stays **up**, so it reads as a genuine workflow
+error (not a crash), exercising crash-recovery's "up == not a crash" discrimination (rule #12) and
+the **Restart take** path (rule #17) offline. It does **not** simulate a server-death crash (that
+needs the real ComfyUI lifecycle, since `restart_server` relaunches via `build_launch_command`).
+GPU-free, no spend — but the cost-confirm gate (rule #1) still appears and must be driven.
+
 ## Architecture map
 
 | Path | Role |
@@ -112,7 +138,7 @@ Full mechanism + invariants in **Hard-won rule #13**.
 | `store/app_settings.py` | app-global user preferences (`data/app_settings.json`; `get_bool`/`set_bool`). Own file (NOT `app_state.json`, which `main_window._remember_last` rewrites wholesale). Same lock + atomic-write discipline as `schema_cache`. First key `update_schemas_on_startup` (default off) — read by `MainWindow` to auto-refresh Replicate schemas at launch, toggled from the **Settings** menu |
 | `store/prompt_library.py` | app-global library of reusable prompt prefabs (`data/prompt_templates.json`; entry = `{name, positive, negative}`, upsert-by-name). Same lock + atomic-write discipline as `schema_cache`; ships seed templates; read/written by the shot tab's Prompt subtab template combo |
 | `remote/` | opt-in localhost control server so an external agent (Claude) can drive the live GUI like a web page — `server.py` (`RemoteControlServer`: `ThreadingHTTPServer` on 127.0.0.1, endpoints `/health` `/snapshot` `/screenshot` `/click` `/type` `/key` `/set`), `bridge.py` (`GuiBridge`: marshals each widget touch onto the GUI thread via a posted `QEvent`, so it never races the event loop and still works while a modal is open), `snapshot.py` (pure, headless-testable: `build_snapshot`/`resolve_target` + action primitives `do_click`/`do_type`/`do_key`/`do_set`/`grab_png`). Off unless `ANIMGEN_REMOTE` is truthy; `MainWindow._maybe_start_remote` starts it, `closeEvent` stops it |
-| `scripts/` | `seed_configs.py` (writes `Fighter.animproj`, imports keyframes as assets) + `smoke_phase*.py` + `remote_cli.py` (stdlib client for the `remote/` control server) + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) |
+| `scripts/` | `seed_configs.py` (writes `Fighter.animproj`, imports keyframes as assets) + `smoke_phase*.py` + `remote_cli.py` (stdlib client for the `remote/` control server) + `launch_comfyui.py`/`.bat` (local backend, `--disable-dynamic-vram`) + **`mock_comfy.py`** (the supported **offline GPU-free** fake ComfyUI — drive real local batches with no GPU; see "Offline GPU-free harness" under Run / test / seed). `_`-prefixed scripts are dev/diagnostic scratch (the rule #18 crash hunt: `_app_watch.py`/`_crash_watch.py`/`_widget_census.py`/…) |
 | `data/` | runtime (gitignored): `*.animproj` project files (default `Fighter.animproj`) + their sidecar `<name>.assets/` (flat keyframe images + `takes/`, `thumbs/`, `.bin/`); plus `exports/`, `_scratch/` (untitled-project assets), `app_state.json` (last opened) |
 | `workflows/` | bundled ComfyUI templates for the local backend |
 

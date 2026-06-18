@@ -18,18 +18,25 @@ PROTOCOL (matches backends/comfy_client.py):
   POST /prompt           -> {"prompt_id": ...}; starts a fake timed "render"
   GET  /history/{pid}    -> {} until the fake delay elapses, then completed + outputs that
                             reference a real canned .mp4 under <comfy>/output/ (the app copies
-                            it to the take path and extracts frames -- real CPU load)
+                            it to the take path and extracts frames -- real CPU load). With
+                            --fail-rate, a fraction of renders instead return a status_str=="error"
+                            entry (an execution_error message, no outputs) so comfy_client raises
+                            ComfyError and the app records a FAILED take -- the server stays UP, so
+                            it reads as a genuine workflow error, exercising crash-recovery's
+                            "up == not a crash" discrimination and the restart-take path offline
   GET  /queue            -> running/pending buckets (benign; used by orphan recovery)
   POST /interrupt, /queue(clear), GET /object_info, GET /prompt -> benign
   GET  /ws?clientId=...  -> hand-rolled WebSocket streaming `progress` frames (+ optional
                             binary preview frames) then `executing`(null), like real ComfyUI
 
 Run (keep the REAL ComfyUI shut down so port 8188 is free for the mock):
-  PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/_mock_comfy.py
-  PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/_mock_comfy.py --delay 10 --jitter 3
+  PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/mock_comfy.py
+  PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/mock_comfy.py --delay 8 --jitter 3
+  PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/mock_comfy.py --fail-rate 0.25
 
-Then launch the app normally and fire a big "Generate batch...". Session-scoped scratch;
-not committed.
+Then launch the app normally and fire a big "Generate batch...". This is AnimGen's supported
+offline GPU-free test/repro harness -- see "Offline GPU-free harness (mock ComfyUI)" in
+CLAUDE.md.
 """
 from __future__ import annotations
 
@@ -59,14 +66,15 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 RENDER_S = 10.0           # fake per-render wall time (the local queue is serialized)
 JITTER_S = 3.0            # +/- random jitter so takes vary a touch
 WS_PREVIEW_BYTES = 3000   # binary preview-frame size to mirror real ~3584 maxframe; 0 disables
+FAIL_RATE = 0.0           # fraction (0..1) of renders that return a workflow error (FAILED take)
 SAFE_ARGV = ["main.py", "--listen", "127.0.0.1", "--port", "8188",
              "--disable-dynamic-vram", "--disable-async-offload", "--cache-none"]
 
 _lock = threading.Lock()
-_renders: dict[str, dict] = {}   # pid -> {created, ready_at, done}
+_renders: dict[str, dict] = {}   # pid -> {created, ready_at, done, fail}
 _order: list[str] = []           # submission order (serialized) for WS active-pid lookup
 _counter = 0
-_stats = {"submitted": 0, "completed": 0, "ws_open": 0, "started": time.time()}
+_stats = {"submitted": 0, "completed": 0, "failed": 0, "ws_open": 0, "started": time.time()}
 
 
 def _canned_output() -> Path:
@@ -75,7 +83,7 @@ def _canned_output() -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
         return dest
-    takes = sorted((REPO_ROOT / "data" / "Biker.assets" / "takes").glob("*.mp4"),
+    takes = sorted((REPO_ROOT / "data").glob("*.assets/takes/*.mp4"),
                    key=lambda p: p.stat().st_size)
     if takes:
         shutil.copy2(takes[0], dest)
@@ -182,16 +190,18 @@ class Handler(BaseHTTPRequestHandler):
         global _counter
         delay = max(0.5, RENDER_S + random.uniform(-JITTER_S, JITTER_S))
         pid = hashlib.md5(f"{time.time()}-{random.random()}".encode()).hexdigest()
+        fail = random.random() < FAIL_RATE
         now = time.time()
         with _lock:
             _counter += 1
             number = _counter
-            _renders[pid] = {"created": now, "ready_at": now + delay, "done": False}
+            _renders[pid] = {"created": now, "ready_at": now + delay, "done": False,
+                             "fail": fail}
             _order.append(pid)
             _stats["submitted"] += 1
             sub = _stats["submitted"]
-        print(f"[mock] submit #{number} pid={pid[:8]} delay={delay:0.1f}s "
-              f"(submitted={sub})", flush=True)
+        print(f"[mock] submit #{number} pid={pid[:8]} delay={delay:0.1f}s"
+              f"{' FAIL' if fail else ''} (submitted={sub})", flush=True)
         return {"prompt_id": pid, "number": number, "node_errors": {}}
 
     def _history(self, pid):
@@ -203,11 +213,27 @@ class Handler(BaseHTTPRequestHandler):
                 return {}
             if not r["done"] and time.time() >= r["ready_at"]:
                 r["done"] = True
-                _stats["completed"] += 1
-                comp = _stats["completed"]
-                print(f"[mock] done   pid={pid[:8]} (completed={comp})", flush=True)
+                if r.get("fail"):
+                    _stats["failed"] += 1
+                    print(f"[mock] FAIL   pid={pid[:8]} (failed={_stats['failed']})", flush=True)
+                else:
+                    _stats["completed"] += 1
+                    print(f"[mock] done   pid={pid[:8]} (completed={_stats['completed']})",
+                          flush=True)
             if not r["done"]:
                 return {}
+            failed = r.get("fail", False)
+        if failed:
+            return {pid: {
+                "status": {"status_str": "error", "completed": False, "messages": [
+                    ["execution_start", {"prompt_id": pid}],
+                    ["execution_error", {"prompt_id": pid, "node_id": "sampler",
+                                         "node_type": "KSampler",
+                                         "exception_type": "MockInjectedFailure",
+                                         "exception_message":
+                                             "mock --fail-rate injected workflow error"}]]},
+                "outputs": {},
+            }}
         return {pid: {
             "status": {"status_str": "success", "completed": True, "messages": [
                 ["execution_start", {"prompt_id": pid}],
@@ -300,25 +326,30 @@ def _heartbeat(port):
         with _lock:
             up = time.time() - _stats["started"]
             print(f"[mock] heartbeat up={up/60:0.1f}min submitted={_stats['submitted']} "
-                  f"completed={_stats['completed']} ws_open={_stats['ws_open']} "
+                  f"completed={_stats['completed']} failed={_stats['failed']} "
+                  f"ws_open={_stats['ws_open']} "
                   f"inflight={sum(1 for r in _renders.values() if not r['done'])}", flush=True)
 
 
 def main(argv):
-    global RENDER_S, JITTER_S, WS_PREVIEW_BYTES
+    global RENDER_S, JITTER_S, WS_PREVIEW_BYTES, FAIL_RATE
     ap = argparse.ArgumentParser(description="Fake ComfyUI for GPU-free AnimGen stress testing")
     ap.add_argument("--port", type=int, default=8188)
     ap.add_argument("--delay", type=float, default=RENDER_S, help="fake per-render seconds")
     ap.add_argument("--jitter", type=float, default=JITTER_S, help="+/- render jitter seconds")
     ap.add_argument("--preview-bytes", type=int, default=WS_PREVIEW_BYTES,
                     help="binary WS preview-frame size (0 disables)")
+    ap.add_argument("--fail-rate", type=float, default=FAIL_RATE,
+                    help="fraction (0..1) of renders that return a workflow error (FAILED take)")
     args = ap.parse_args(argv)
     RENDER_S, JITTER_S, WS_PREVIEW_BYTES = args.delay, args.jitter, args.preview_bytes
+    FAIL_RATE = min(1.0, max(0.0, args.fail_rate))
 
     canned = _canned_output()
     print(f"[mock] canned output: {canned} ({canned.stat().st_size} bytes)", flush=True)
     print(f"[mock] COMFY output dir: {OUTPUT_DIR}", flush=True)
-    print(f"[mock] render={RENDER_S}s +/-{JITTER_S}s  preview_bytes={WS_PREVIEW_BYTES}", flush=True)
+    print(f"[mock] render={RENDER_S}s +/-{JITTER_S}s  preview_bytes={WS_PREVIEW_BYTES}  "
+          f"fail_rate={FAIL_RATE}", flush=True)
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     srv.daemon_threads = True
