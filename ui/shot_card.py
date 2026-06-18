@@ -76,6 +76,7 @@ class ShotCard(QFrame):
     star_toggled = Signal(str)              # toggle the shot's own star
     export_takes_requested = Signal(list)   # take ids (row obeys its view filter)
     open_take_requested = Signal(str)       # take id -> open in the frame-by-frame viewer
+    restart_requested = Signal(list)        # cancelled take ids -> re-run them
     changed = Signal()
 
     def __init__(self, project: Project, shot):
@@ -186,6 +187,7 @@ class ShotCard(QFrame):
             self.takes_view.changed.connect(self._on_takes_changed)
             self.takes_view.export_requested.connect(self.export_takes_requested)
             self.takes_view.open_take_requested.connect(self.open_take_requested)
+            self.takes_view.restart_requested.connect(self.restart_requested)
             self.body.layout().addWidget(self.takes_view)
         self.body.setVisible(on)
         if self.takes_view is not None:

@@ -167,6 +167,18 @@ class JobManager(QObject):
         self._runners[take_id] = (backend, runner)
         self._start(take_id, backend, runner)
 
+    def restart_take(self, take_id: str, backend: str, runner: Runner) -> None:
+        """Re-enqueue a previously-terminal take (a CANCELLED one being restarted in place).
+
+        A cancelled take's id lingers in `_cancelled` (and possibly `_stopping`/`_requeue`),
+        which would make the fresh GenerationJob bail straight to CANCELLED. Clear that stale
+        membership first, then enqueue exactly like a new take. The caller flips the take's
+        status back to PENDING before calling this. GIL-atomic set ops, like resume_local."""
+        self._cancelled.discard(take_id)
+        self._stopping.discard(take_id)
+        self._requeue.discard(take_id)
+        self.enqueue(take_id, backend, runner)
+
     def _start(self, take_id: str, backend: str, runner: Runner) -> None:
         job = GenerationJob(self.project, take_id, backend, runner, self._signals,
                             self._cancelled, self._stopping, self._requeue, self._on_job_done)

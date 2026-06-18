@@ -150,6 +150,7 @@ class TakesView(QWidget):
     changed = Signal()
     export_requested = Signal(list)   # list[take_id]
     open_take_requested = Signal(str)  # take_id -> open it in the frame-by-frame viewer tab
+    restart_requested = Signal(list)   # list[take_id] -> re-run cancelled takes (MainWindow drives it)
 
     def __init__(self, project: Project, shot_id: str):
         super().__init__()
@@ -380,24 +381,29 @@ class TakesView(QWidget):
         ids = self.selected_take_ids()
         if not ids:
             return
+        self._build_context_menu(ids).exec(self.view.mapToGlobal(pos))
+
+    def _build_context_menu(self, ids: list) -> QMenu:
+        """Build the per-take right-click menu with its actions wired (no exec()), so the menu
+        and its wiring are headless-testable (rule #4 / the shot_card pattern). A Restart entry
+        appears only when the selection holds a cancelled take; it bubbles up to MainWindow,
+        which owns the cost gate + queue."""
         menu = QMenu(self)
-        act_view = menu.addAction("Open in viewer")
-        act_ext = menu.addAction("Open in external player")
+        menu.addAction("Open in viewer").triggered.connect(self._open_in_viewer)
+        menu.addAction("Open in external player").triggered.connect(self._open_selected)
         menu.addSeparator()
-        act_star = menu.addAction("Toggle star")
-        act_del = menu.addAction("Delete (to bin)")
-        act_exp = menu.addAction("Export selected")
-        chosen = menu.exec(self.view.mapToGlobal(pos))
-        if chosen == act_view:
-            self._open_in_viewer()
-        elif chosen == act_ext:
-            self._open_selected()
-        elif chosen == act_star:
-            self.toggle_star(ids)
-        elif chosen == act_del:
-            self.delete(ids)
-        elif chosen == act_exp:
-            self.export_requested.emit(ids)
+        cancelled = [tid for tid in ids
+                     if (t := self.project.get_take(tid)) and t.status == "cancelled"]
+        if cancelled:
+            label = "Restart take" if len(cancelled) == 1 else f"Restart {len(cancelled)} takes"
+            menu.addAction(label).triggered.connect(
+                lambda: self.restart_requested.emit(cancelled))
+            menu.addSeparator()
+        menu.addAction("Toggle star").triggered.connect(lambda: self.toggle_star(ids))
+        menu.addAction("Delete (to bin)").triggered.connect(lambda: self.delete(ids))
+        menu.addAction("Export selected").triggered.connect(
+            lambda: self.export_requested.emit(ids))
+        return menu
 
     def toggle_star(self, ids: list) -> None:
         for tid in ids:

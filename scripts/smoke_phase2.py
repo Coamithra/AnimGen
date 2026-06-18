@@ -1557,6 +1557,149 @@ def test_batch_finalize() -> None:
     print("batch finalize OK: drain->report+power, partial pending no-op, abandon neutralizes")
 
 
+def test_restart_plan() -> None:
+    """Pure restart.plan_restart: new-format cancelled takes with a known model + present start
+    frame are restartable; the rest are reported unrestartable with a reason (caller fails them)."""
+    from backends import restart
+    from store.models import STATUS_CANCELLED, STATUS_DONE, Take
+
+    def _take(snap, status=STATUS_CANCELLED, shot="s"):
+        return Take(id="t" + str(id(snap))[-6:], shot_id=shot, status=status,
+                    settings_snapshot=snap)
+
+    framed = {"model_id": "good", "backend": "replicate", "start_frame": "a.png",
+              "settings": {"seed": 7, "duration": 4}, "canvas": [1254, 1254], "crop": {}}
+    ok = _take(framed)
+    unknown_model = _take({**framed, "model_id": "gone"})
+    missing_frame = _take({**framed, "start_frame": "deleted.png"})
+    old_snapshot = _take({"model_id": "good", "backend": "replicate",  # pre-2026-06-17: no canvas/crop
+                          "start_frame": "a.png", "settings": {"seed": 1}})
+    not_cancelled = _take(framed, status=STATUS_DONE)  # filtered out entirely
+
+    models = {"good": {"display_name": "Good", "backend": "replicate"}}
+    plan = restart.plan_restart(
+        [ok, unknown_model, missing_frame, old_snapshot, not_cancelled],
+        model_of_id=lambda mid: models.get(mid),
+        est_of=lambda mid, s: 0.5,
+        path_exists=lambda p: p == "a.png",
+        name_of=lambda t: t.id)
+
+    assert plan.restartable == [ok], plan.restartable
+    assert len(plan.items) == 1
+    it = plan.items[0]
+    assert set(it) >= {"name", "model_display", "backend", "est_cost", "params"}
+    assert it["est_cost"] == 0.5 and it["params"]["seed"] == 7
+    reasons = {t.id: r for t, r in plan.unrestartable}
+    assert set(reasons) == {unknown_model.id, missing_frame.id, old_snapshot.id}, reasons
+    assert "unknown model" in reasons[unknown_model.id]
+    assert "start keyframe" in reasons[missing_frame.id]
+    assert "predates framing" in reasons[old_snapshot.id]
+    print("restart plan OK: restartable filter + per-take unrestartable reasons")
+
+
+def test_restart_take() -> None:
+    """JobManager.restart_take clears a cancelled take's stale `_cancelled` membership so the
+    re-enqueued worker actually runs it (rather than bailing straight back to CANCELLED)."""
+    from PySide6.QtWidgets import QApplication
+    from backends.jobs import JobManager
+    from store.models import STATUS_CANCELLED, STATUS_DONE, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_PENDING,
+                            settings_snapshot={"backend": "replicate"})
+    jm = JobManager(project)
+    jm.cancel_take(take.id)
+    assert project.get_take(take.id).status == STATUS_CANCELLED
+    assert take.id in jm._cancelled
+
+    project.update_take(take.id, status=STATUS_PENDING, error=None)
+    jm.restart_take(take.id, "replicate", lambda p: {"video_path": "redo.mp4"})
+    assert jm.wait_for_done(20000), "restart job did not finish"
+    app.processEvents()
+    got = project.get_take(take.id)
+    assert got.status == STATUS_DONE and got.video_path == "redo.mp4", (got.status, got.video_path)
+    assert take.id not in jm._cancelled
+    print("restart_take OK: stale cancel cleared, re-enqueued take runs to done")
+
+
+def test_restart_from_snapshot() -> None:
+    """MainWindow restart: a cancelled take with a full snapshot replays IN PLACE (same id, runner
+    fed the snapshot's frozen model/seed/framing); an unrestartable one is marked FAILED with a
+    reason; the takes-grid context menu offers Restart for a cancelled take without exec()."""
+    import tempfile
+    from pathlib import Path
+
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from ui.main_window import MainWindow
+    from ui.takes_view import TakesView
+    from store.models import STATUS_CANCELLED, STATUS_FAILED, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    orig_info = QMessageBox.information
+    QMessageBox.information = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok)
+    start_png = Path(tempfile.mkdtemp()) / "a.png"
+    start_png.write_bytes(b"not-a-real-png")   # plan_restart only checks the path exists
+    try:
+        project = Project.new()
+        shot = project.add_shot("kick", model_id="seedance-2.0-std")
+        snap = {"model_id": "seedance-2.0-std", "backend": "replicate",
+                "start_frame": str(start_png), "end_frame": None,
+                "settings": {"seed": 4242, "duration": 4},
+                "canvas": [1254, 1254], "crop": {"aspect": "1:1"}, "prompt": "p", "negative_prompt": "n"}
+        good = project.add_take(shot.id, status=STATUS_CANCELLED, settings_snapshot=snap)
+        old = project.add_take(shot.id, status=STATUS_CANCELLED,  # pre-framing snapshot -> fail
+                               settings_snapshot={"model_id": "seedance-2.0-std", "backend": "replicate"})
+
+        win = MainWindow(project)
+        # Capture the runner build instead of firing a real backend; assert it gets the snapshot's
+        # frozen shot + settings (seed 4242, the snapshot canvas/crop), not the live shot's.
+        captured = {}
+
+        def fake_make_runner(model, s, settings, tid):
+            captured[tid] = {"model": model, "shot": s, "settings": settings}
+            return lambda p: {}
+        win._make_runner = fake_make_runner
+        enqueued = []
+        win.jobs.restart_take = lambda tid, backend, runner: enqueued.append(tid)
+        win.save_project = lambda: True
+        from ui import main_window as mw
+        orig_confirm = mw.confirm_launch
+        mw.confirm_launch = lambda parent, items: True
+        try:
+            win.restart_cancelled_takes()
+        finally:
+            mw.confirm_launch = orig_confirm
+
+        assert enqueued == [good.id], enqueued
+        assert project.get_take(good.id).status == STATUS_PENDING
+        cap = captured[good.id]
+        assert cap["settings"]["seed"] == 4242
+        assert cap["shot"].canvas_w == 1254 and cap["shot"].crop == {"aspect": "1:1"}
+        assert cap["shot"].start_frame == str(start_png) and cap["shot"].prompt == "p"
+        # The unrestartable old take is failed with a reason.
+        failed = project.get_take(old.id)
+        assert failed.status == STATUS_FAILED and "cannot restart" in (failed.error or "")
+
+        # Context menu: a cancelled take gets a Restart entry, built without exec().
+        project.update_take(good.id, status=STATUS_CANCELLED)   # the restart above flipped it to PENDING
+        tv = TakesView(project, shot.id)
+        restart_emits = []
+        tv.restart_requested.connect(restart_emits.append)
+        menu = tv._build_context_menu([good.id])
+        labels = [a.text() for a in menu.actions()]
+        assert any("Restart" in t for t in labels), labels
+        next(a for a in menu.actions() if "Restart" in a.text()).trigger()
+        assert restart_emits == [[good.id]], restart_emits
+        # A non-cancelled selection has no Restart entry.
+        project.update_take(good.id, status=STATUS_PENDING)
+        assert not any("Restart" in a.text() for a in tv._build_context_menu([good.id]).actions())
+    finally:
+        QMessageBox.information = orig_info
+    print("restart from snapshot OK: in-place replay, unrestartable->failed, headless menu entry")
+
+
 def test_done_elapsed() -> None:
     from ui.queue_view import done_elapsed
     from store.models import Take
@@ -1666,4 +1809,7 @@ if __name__ == "__main__":
     test_select_rows()
     test_batch()
     test_batch_finalize()
+    test_restart_plan()
+    test_restart_take()
+    test_restart_from_snapshot()
     print("PHASE 2 SMOKE: PASS")

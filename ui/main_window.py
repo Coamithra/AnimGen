@@ -21,6 +21,7 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QObject, Signal
@@ -34,13 +35,13 @@ from PySide6.QtWidgets import (
 import applog
 import library
 import paths
-from backends import batch, comfy_client, crash_recovery, recovery, replicate_client
+from backends import batch, comfy_client, crash_recovery, recovery, replicate_client, restart
 from backends.jobs import JobManager
 from pipeline import export, framing
 from store import app_settings
 from store.project import Project
 from store.models import (
-    STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
+    STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING, Shot,
 )
 from ui.assets_view import AssetsView
 from ui.batch_dialog import BatchDialog, SCOPE_VIEW
@@ -149,6 +150,13 @@ class MainWindow(QMainWindow):
         self.cancel_act.triggered.connect(self.cancel_pending)
         self.cancel_act.setEnabled(False)
         tb.addAction(self.cancel_act)
+        self.restart_act = QAction("Restart cancelled takes", self)
+        self.restart_act.setToolTip("Re-run every cancelled take from its frozen settings "
+                                    "(same seed + framing). Takes that can't be replayed exactly "
+                                    "are marked failed with a reason")
+        self.restart_act.triggered.connect(self.restart_cancelled_takes)
+        self.restart_act.setEnabled(False)
+        tb.addAction(self.restart_act)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -435,6 +443,7 @@ class MainWindow(QMainWindow):
             card.star_toggled.connect(self.toggle_shot_star)
             card.export_takes_requested.connect(self.export_takes)
             card.open_take_requested.connect(self.open_take)
+            card.restart_requested.connect(self._restart_takes_by_ids)
             if shot.id in expanded:
                 card.expand_btn.setChecked(True)
             self.cards_layout.addWidget(card)
@@ -444,6 +453,7 @@ class MainWindow(QMainWindow):
         self.cards_layout.addWidget(self._make_add_shot_card())
         self.statusBar().showMessage(f"{shown} shots shown · {len(shots)} total")
         self._refresh_total_price(shots)
+        self._refresh_restart_action()   # a freshly-opened project may already hold cancelled takes
         self._update_title()
 
     def _refresh_total_price(self, shots) -> None:
@@ -598,6 +608,7 @@ class MainWindow(QMainWindow):
         tab.generate_requested.connect(self.generate_shot)
         tab.export_requested.connect(self.export_takes)
         tab.open_take_requested.connect(self.open_take)
+        tab.restart_requested.connect(self._restart_takes_by_ids)
 
     def _on_shot_saved(self, shot_id: str, tab: ShotTab) -> None:
         # A blank tab just became a real shot (or an existing shot was re-saved): register
@@ -809,6 +820,99 @@ class MainWindow(QMainWindow):
 
     def _refresh_cancel_action(self) -> None:
         self.cancel_act.setEnabled(self.jobs.pending_count() > 0)
+        self._refresh_restart_action()
+
+    def _refresh_restart_action(self) -> None:
+        self.restart_act.setEnabled(self._cancelled_take_count() > 0)
+
+    def _cancelled_take_count(self) -> int:
+        return sum(1 for t in self.project.list_takes(include_deleted=False)
+                   if t.status == STATUS_CANCELLED)
+
+    # ---- restart cancelled takes ---------------------------------------
+    def restart_cancelled_takes(self) -> None:
+        """Re-run every cancelled take in the project (ignoring the view filters, like Cancel
+        pending). Exact-restartable takes replay in place from their snapshot; the rest are
+        marked failed with a reason."""
+        cancelled = [t for t in self.project.list_takes(include_deleted=False)
+                     if t.status == STATUS_CANCELLED]
+        self._restart_takes(cancelled)
+
+    def _restart_takes_by_ids(self, ids: list) -> None:
+        """Restart just the given takes (the takes-grid context-menu entry). Non-cancelled ids
+        are ignored - the menu only offers Restart when a cancelled take is selected."""
+        takes = [t for t in (self.project.get_take(i) for i in ids)
+                 if t and t.status == STATUS_CANCELLED]
+        self._restart_takes(takes)
+
+    def _restart_takes(self, takes: list) -> None:
+        if not takes:
+            QMessageBox.information(self, "Restart", "No cancelled takes to restart.")
+            return
+        plan = restart.plan_restart(
+            takes, model_of_id=library.get_model, est_of=library.estimate_cost,
+            path_exists=lambda p: bool(p) and Path(p).exists(), name_of=self._take_label)
+        if plan.restartable:
+            if not confirm_launch(self, plan.items):
+                self._log("restart cancelled")
+                return
+            # Persist first so a restarted take never references an unsaved shot (untitled ->
+            # Save As prompt). Aborting the save aborts the whole restart - fail nothing.
+            if not self.save_project():
+                self._log("restart cancelled (project not saved)")
+                return
+            for take in plan.restartable:
+                self._restart_in_place(take)
+        for take, reason in plan.unrestartable:
+            self.project.update_take(take.id, status=STATUS_FAILED,
+                                     error=f"cannot restart: {reason}")
+            self._refresh_shot_for_take(take.id)
+        self._log(f"restart: {len(plan.restartable)} re-queued, "
+                  f"{len(plan.unrestartable)} marked failed")
+        if plan.unrestartable:
+            detail = "\n".join(f"  • {self._take_label(t)}: {r}" for t, r in plan.unrestartable)
+            QMessageBox.information(
+                self, "Restart",
+                f"Re-queued {len(plan.restartable)} take(s).\n\n"
+                f"{len(plan.unrestartable)} take(s) couldn't be restarted exactly and were "
+                f"marked failed:\n\n{detail}")
+        self.reload()
+        self._refresh_cancel_action()
+        self.queue_tab.refresh()
+
+    def _restart_in_place(self, take) -> None:
+        """Flip one cancelled take back to PENDING and re-enqueue a runner built straight from
+        its immutable snapshot (same seed, same framing). The snapshot is never mutated - only
+        the take's status + output/timing fields reset."""
+        snap = take.settings_snapshot or {}
+        model = library.get_model(snap.get("model_id"))
+        settings = snap.get("settings") or {}
+        synth = self._shot_from_snapshot(take.shot_id, snap)
+        self.project.update_take(
+            take.id, status=STATUS_PENDING, error=None, started=None, completed=None,
+            video_path=None, thumbnail=None, preview_gif=None, cost_actual=None)
+        self.jobs.restart_take(take.id, model["backend"],
+                               self._make_runner(model, synth, settings, take.id))
+        self._log(f"restarting {take.id[:8]} ({self._take_label(take)})")
+
+    def _shot_from_snapshot(self, shot_id: str, snap: dict) -> Shot:
+        """A throwaway Shot carrying the snapshot's frozen framing, fed to _make_runner /
+        framing.render_keyposes so the restart reproduces the take exactly (not the shot's
+        possibly-since-edited state). Only the fields those readers touch are populated."""
+        canvas = snap.get("canvas") or [None, None]
+        existing = self.project.get_shot(shot_id)
+        return Shot(
+            id=shot_id, name=(existing.name if existing else "(restart)"),
+            start_frame=snap.get("start_frame"), end_frame=snap.get("end_frame"),
+            canvas_w=(canvas[0] if len(canvas) > 0 else None),
+            canvas_h=(canvas[1] if len(canvas) > 1 else None),
+            crop=snap.get("crop") or {}, prompt=snap.get("prompt", ""),
+            negative_prompt=snap.get("negative_prompt", ""),
+            model_id=snap.get("model_id", ""), settings=snap.get("settings") or {})
+
+    def _take_label(self, take) -> str:
+        s = self.project.get_shot(take.shot_id)
+        return s.name if s else take.id[:8]
 
     def _refresh_pause_action(self) -> None:
         """Pause/Resume is only meaningful while a batch is in flight. Reset its label to
