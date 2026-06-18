@@ -52,17 +52,30 @@ def build_summary(items: list[dict]) -> tuple[str, float, bool]:
     return header + "\n\n" + "\n".join(lines), total, has_spend
 
 
+def _spend_tier(total: float, has_spend: bool) -> str:
+    """Classify a batch's spend for the gate: 'spend' (known cost), 'unknown' (may
+    spend, no estimate), or 'free' (local, no spend). The header warning and the
+    launch button label both derive from this single source so they can't contradict.
+    """
+    if total > 0:
+        return "spend"
+    if has_spend:
+        return "unknown"
+    return "free"
+
+
 def launch_button_label(total: float, has_spend: bool) -> str:
-    """Accept-button label, mirroring confirm_launch's three-way header warning.
+    """Accept-button label for confirm_launch, keyed off the shared _spend_tier.
 
     An all-unknown-cost batch has has_spend=True but total==0 (build_summary tallies
     None costs separately), so feeding total into _fmt_cost would render
     "Launch (spend ~free)" — contradicting the "MAY spend money" header. Split out so
     the label is testable without exec().
     """
-    if total > 0:
+    tier = _spend_tier(total, has_spend)
+    if tier == "spend":
         return f"Launch (spend ~{_fmt_cost(total)})"
-    if has_spend:
+    if tier == "unknown":
         return "Launch (cost unknown)"
     return "Launch (free)"
 
@@ -87,9 +100,10 @@ def confirm_launch(parent, items: list[dict]) -> bool:
     dlg.setWindowTitle("Confirm generation")
     lay = QVBoxLayout(dlg)
 
-    if total > 0:
+    tier = _spend_tier(total, has_spend)
+    if tier == "spend":
         warn = "This will spend real money on Replicate."
-    elif has_spend:
+    elif tier == "unknown":
         warn = "Cost unknown - this MAY spend money."
     else:
         warn = "Local render - no spend."
