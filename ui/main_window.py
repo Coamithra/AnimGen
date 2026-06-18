@@ -701,13 +701,18 @@ class MainWindow(QMainWindow):
         settings = dict(settings)
         if settings.get("seed") == library.SEED_RANDOM:
             settings["seed"] = library.resolve_seed(library.SEED_RANDOM)
+        # Deep-copy crop/settings so the frozen snapshot is detached from the live shot the
+        # moment it's created (rule #3): an in-place mutation of shot.crop (or a nested
+        # settings dict) can't reach back and corrupt the take's immutable record. Mirrors the
+        # render-side detach in _shot_from_snapshot (card #53); small dicts, cheap.
         snapshot = {
             "model_id": shot.model_id, "backend": model["backend"],
             "replicate_model_id": model.get("replicate_model_id"),
             "workflow_template": model.get("workflow_template"),
             "start_frame": shot.start_frame, "end_frame": shot.end_frame,
-            "prompt": shot.prompt, "negative_prompt": shot.negative_prompt, "settings": settings,
-            "canvas": [shot.canvas_w, shot.canvas_h], "crop": shot.crop,
+            "prompt": shot.prompt, "negative_prompt": shot.negative_prompt,
+            "settings": copy.deepcopy(settings),
+            "canvas": [shot.canvas_w, shot.canvas_h], "crop": copy.deepcopy(shot.crop),
         }
         take = self.project.add_take(shot.id, status=STATUS_PENDING,
                                      seed=settings.get("seed"), cost_estimate=est,
