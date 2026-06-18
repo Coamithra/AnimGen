@@ -1472,7 +1472,10 @@ def test_batch() -> None:
     order = [shot.name for shot, _m, _s, _e in batch.queue_order(plan.eligible, 3)]
     assert order == ["ok1", "ok2", "ok1", "ok2", "ok1", "ok2"], order
     assert [s.name for s, *_ in batch.queue_order(plan.eligible, 1)] == ["ok1", "ok2"]
-    assert batch.queue_order(plan.eligible, 0) == plan.eligible   # floors at 1 round
+    # n<1 floors at one round
+    floored = batch.queue_order(plan.eligible, 0)
+    assert [s.name for s, *_ in floored] == ["ok1", "ok2"], floored
+    assert batch.queue_order([], 5) == []                         # empty eligible -> empty
 
     # BatchRun completion: terminal-only, complete when all takes drained
     run = batch.BatchRun(take_ids={"a", "b"}, power_action=batch.POWER_NONE, started="t0")

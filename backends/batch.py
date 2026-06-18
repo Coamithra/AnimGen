@@ -75,7 +75,7 @@ def plan_batch(shots, *, takes_per_shot: int,
     return BatchPlan(items=items, eligible=eligible, skipped=skipped, takes_per_shot=n)
 
 
-def queue_order(eligible, takes_per_shot):
+def queue_order(eligible: list[tuple], takes_per_shot: int) -> list[tuple]:
     """Round-major enqueue order: one take of every eligible shot per round, repeated N
     rounds, instead of N takes of shot 1 then N of shot 2 (shot-major).
 
