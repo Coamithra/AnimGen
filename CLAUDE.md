@@ -487,20 +487,60 @@ Full mechanism + invariants in **Hard-won rule #13**.
     substring — so a "cannot restart: …" unrestartable mark is not misread) so a pre-existing
     crashed batch is recognised on load. Smoke-tested in `smoke_phase2` (`test_restart_plan`,
     `test_restart_take`, `test_restart_from_snapshot`, `test_interrupted_flag`).
-18. **The 2026-06-18 native stack-overflow crash is UNRESOLVED — instrumented, not fixed.** A
-    local batch died with `Windows fatal exception: stack overflow` (in `animgen_faults.log`).
-    It's a **native (C/C++) overflow**, not Python: faulthandler dumped only *shallow* Python
-    frames (the WS recv chain is loop-based, ~10 frames; the main thread sat in `app.exec()`),
-    so the deep recursion was in C++ (Qt) — invisible to Python's stack walker — and being a
-    native fatal exception it can't be caught (no traceback, process just vanishes). It's rare
-    (~1 in 14 launches) and not yet reproduced. An earlier 16MB-stack band-aid on the WS thread
-    was **removed** (it would only mask the symptom). The current posture is **catch it, don't
-    paper over it**: (a) `ANIMGEN_NO_WS_PROGRESS` disables the prime-suspect progress WS as a
-    bisection lever (above); (b) `_ws_progress_listener` logs frame **telemetry** (text/bin
-    counts, bytes, max frame size) to `animgen.log` so the tail before a crash shows WS load;
-    (c) the **watchdog logs `max_pydepth`** (`applog._max_stack_depth`) each tick — a climbing
-    value fingers Python recursion + names the thread, a flat value confirms the overflow is
-    native; (d) `scripts/enable_crashdumps.py` configures **WER LocalDumps** so the OS writes a
-    full minidump (with the C++ call stack — the only way to name the faulting native frames)
-    to `data/crashdumps/` on the next crash. Until a minidump or a clean bisection pins the
-    cause, no targeted fix is possible. Smoke: `smoke_phase2.test_ws_progress_diagnostics`.
+18. **The 2026-06-18 native stack-overflow crash is ROOT-CAUSED: a runaway
+    `QWidgetPrivate::paintSiblingsRecursive` (a targeted fix is still pending).** The genuine
+    crash was the **overnight run at 03:34 on 2026-06-18** (pid 42392), logged as `Windows fatal
+    exception: stack overflow` in `animgen_faults.log`. It is a **native (C/C++) overflow on the
+    GUI thread**, not Python: faulthandler dumped only shallow Python frames ("Current thread" =
+    the main thread in `app.exec()`; the `_ws_progress_listener` recv chain is a *different*
+    thread, printed first only by enumeration order, NOT the faulting frame). Now confirmed three
+    ways: **(1)** WER **Event 1000** names faulting module **`Qt6Widgets.dll` 6.11.1.0**, exception
+    **`0xC00000FD` (STATUS_STACK_OVERFLOW)**; **(2)** a full **minidump survived** (see below);
+    **(3)** cracking that minidump with pure-Python `minidump` + `pefile` (no PDBs needed —
+    `scripts/_dump_analyze.py` scans the faulting thread's stack, `scripts/_sym_nearest.py` maps
+    hot RVAs to the nearest export) shows the faulting GUI thread (tid `0x9ef8`, matching
+    faulthandler's "Current thread") with a **~1968 KiB stack — essentially the full ~2 MB
+    main-thread limit, exhausted** — filled by **6913 copies of the same return address
+    `Qt6Widgets.dll+0x62a15`** at a **288-byte stride** (6913 x 288 = ~1.99 MB = the whole stack),
+    interleaved with Qt6Gui paint frames. `+0x62a15` sits +0x2e5 inside the nearest export
+    **`QWidgetPrivate::paintSiblingsRecursive`** (the backingstore sibling-paint walk). So the
+    crash is **unbounded / re-entrant recursion in Qt's sibling-paint path on the GUI thread** —
+    and crucially it is **NOT bounded by AnimGen's widget count** (Biker has only 31 ShotCards;
+    the takes grid and the Queue are delegate-painted `QListView`/`QTableView` with no per-item
+    child widgets), so it is a true runaway cycle, not a "too many children" linear walk.
+    **Trigger / what's RULED OUT (deeper hunt, 2026-06-18):** the WS thread is exonerated as the
+    *faulting* frame (different thread). The earlier "minimized window" suspicion was WRONG — at
+    the genuine 03:34 crash every heartbeat reads `minimized=False visible=True`, 1 shot tab, 183
+    pending, RSS flat 342mb, dying 2s after a normal heartbeat (the `minimized=True` state was the
+    *unrelated* 12:27 GPU event). The recursion is a **flat self-recursion** of
+    `paintSiblingsRecursive` (no `drawWidget` frame between levels — confirmed by the per-module
+    slot counts) and it skips hidden / non-intersecting siblings, so the dump demands **~6900
+    VISIBLE, OVERLAPPING children under ONE parent**. The obvious churners were tested and
+    **rejected** as that parent: the **Queue table** cell widgets (`QProgressBar`/`QPushButton`
+    rebuilt each `refresh()`) do NOT leak under a real `app.exec()` loop — a manual-drain probe
+    (`scripts/_leak_probe.py`) only "leaks" because `processEvents()` skips `DeferredDelete`; under
+    a real loop (`scripts/_repro_loop.py`) the viewport child count *plateaus* (bounded by active
+    rows), and table cells don't overlap anyway; the **takes grids** + **shot cards** are
+    delegate-painted `QListView`/`QStandardItemModel` (no per-item child widgets; `load()` does
+    `model.clear()`); `reload()` `deleteLater()`s old cards; the log is a `QPlainTextEdit` (text).
+    A live census of the REAL Biker window (`scripts/_widget_census.py`) stays bounded (~649
+    widgets, max ~101 children under any one parent) and doesn't grow under churn. So the
+    accumulator is some **rare, conditional** path the offscreen runs don't reach (matching the
+    "~1 in 14" rarity), NOT the hot per-take path. `ANIMGEN_NO_WS_PROGRESS=1` stays a bisection
+    lever. **To NAME it on recurrence (instrumentation added 2026-06-18):** `applog._widget_census()`
+    walks `QApplication.allWidgets()` on the GUI thread each **heartbeat** and logs
+    `max_widgets=N(Class#objectName <ChildClassxN>)` — the direct analog of `max_pydepth` (GUI-thread
+    only; `allWidgets()` isn't thread-safe so it's NOT in the watchdog daemon). On the next
+    occurrence the heartbeat tail shows the offending container's child count climbing over the
+    hours BEFORE the fatal repaint and names its class + dominant child type.
+    **Minidump capture works, with one timing caveat:** `scripts/enable_crashdumps.py` writes the
+    WER LocalDumps key `HKLM\...\LocalDumps\python.exe` (DumpFolder=`data/crashdumps`,
+    DumpType=2 full, DumpCount=10). It was applied at 10:53 — *after* the 03:34 crash — so that
+    dump went to WER's **default** folder `%LOCALAPPDATA%\CrashDumps\python.exe.42392.dmp`
+    instead; it is preserved at `data/crashdumps/python.exe.42392.0334.stackoverflow.dmp`. Future
+    crashes land in `data/crashdumps` directly. The rest of the instrumentation still stands: the
+    **watchdog logs `max_pydepth`** (`applog._max_stack_depth`) — it stayed flat at 14, which is
+    exactly what confirms the overflow is native, not Python. **Separately, the 12:27 'death' the
+    same day was NOT this crash** — an nvlddmkm **GPU fault (System Event 153)** wedged ComfyUI
+    mid-render and the python processes were terminated with **no** WER/minidump/faulthandler
+    artifact (external kill, not a fault). Smoke: `smoke_phase2.test_ws_progress_diagnostics`.

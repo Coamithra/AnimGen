@@ -127,6 +127,45 @@ def _max_stack_depth() -> tuple[int, str]:
     return best, who
 
 
+def _widget_census() -> str:
+    """The parent widget holding the most child widgets, as a compact heartbeat field.
+
+    Companion to _max_stack_depth for the rule-#18 paintSiblingsRecursive stack overflow:
+    that crash needs ~thousands of visible sibling widgets under ONE parent, and the obvious
+    churning views (Queue table, takes grids) were proven bounded - so the real accumulator is
+    elsewhere and rare. A climbing count here NAMES the offending container (class + objectName)
+    and its dominant child class BEFORE the fatal repaint, turning 'somewhere' into one line.
+    MUST run on the GUI thread - it walks QApplication.allWidgets() - so it's called only from
+    the heartbeat, never the watchdog daemon thread. Returns '' if there's no QApplication;
+    swallows any error so it can never break the heartbeat."""
+    try:
+        from PySide6.QtWidgets import QApplication, QWidget
+        app = QApplication.instance()
+        if not isinstance(app, QApplication):
+            return ""
+        counts: dict[int, int] = {}
+        parents: dict[int, QWidget] = {}
+        for w in app.allWidgets():
+            p = w.parentWidget()
+            if p is not None:
+                pid = id(p)
+                counts[pid] = counts.get(pid, 0) + 1
+                parents[pid] = p
+        if not counts:
+            return "max_widgets=0"
+        from collections import Counter
+        pid = max(counts, key=lambda k: counts[k])
+        p = parents[pid]
+        kids = Counter(type(c).__name__ for c in p.children() if c.isWidgetType())
+        dom = kids.most_common(1)
+        domstr = f" <{dom[0][0]}x{dom[0][1]}>" if dom else ""
+        obj = p.objectName()
+        name = type(p).__name__ + (f"#{obj}" if obj else "")
+        return f"max_widgets={counts[pid]}({name}{domstr})"
+    except Exception as e:  # noqa: BLE001
+        return f"max_widgets_err={e!r}"
+
+
 # ---- setup --------------------------------------------------------------------
 def setup() -> logging.Logger:
     """Install file+stderr logging, faulthandler, uncaught-exception hooks (main + worker
@@ -257,7 +296,7 @@ def start_heartbeat(parent, context_fn=None) -> None:
                 extra = " " + context_fn()
             except Exception as e:  # noqa: BLE001
                 extra = f" ctx_err={e!r}"
-        logger.info("heartbeat(gui)  %s%s", _proc_stats(), extra)
+        logger.info("heartbeat(gui)  %s%s %s", _proc_stats(), extra, _widget_census())
 
     t = QTimer(parent)
     t.setInterval(int(HEARTBEAT_S * 1000))
