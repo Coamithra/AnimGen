@@ -23,7 +23,9 @@ import paths  # noqa: E402
 paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
 
 from store.project import Project  # noqa: E402
-from store.models import STATUS_DONE, STATUS_GENERATING, STATUS_PENDING  # noqa: E402
+from store.models import (  # noqa: E402
+    STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
+)
 
 
 def _png(path: Path, color=(0, 200, 0)) -> None:
@@ -492,10 +494,15 @@ def test_takes_view_incremental_update() -> None:
     tv = TakesView(project, shot.id)
     assert tv.model.rowCount() == 2
 
-    # The QIcon cache hands back the SAME object for an unchanged take (no disk re-decode).
-    td = project.add_take(shot.id, status=STATUS_DONE)
+    # The QIcon cache hands back the SAME object for an unchanged take (no disk re-decode) ...
+    td = project.add_take(shot.id, status=STATUS_PENDING)
     tv.load()
-    assert tv._icon_for(project.get_take(td.id)) is tv._icon_for(project.get_take(td.id))
+    icon_pending = tv._icon_for(project.get_take(td.id))
+    assert tv._icon_for(project.get_take(td.id)) is icon_pending
+    # ... but INVALIDATES when the content signature changes (here the status placeholder), so a
+    # frozen cache key (e.g. dropping the mtime/status from it) would be caught.
+    project.update_take(td.id, status=STATUS_FAILED)
+    assert tv._icon_for(project.get_take(td.id)) is not icon_pending
 
     # A status transition updates the existing item IN PLACE - same object, no model.clear().
     item1 = tv._items[t1.id]
@@ -526,6 +533,12 @@ def test_takes_view_incremental_update() -> None:
     tv.update_take(t1.id)
     assert tv.model.rowCount() == 1                   # no new row, no reload
     assert tv._items[t2.id] is shown                  # the visible starred take is untouched
+
+    # The inverse boundary cross: a SHOWN starred take that becomes unstarred under Favorites must
+    # fall back to load() and drop from the view (the most regression-prone branch).
+    project.set_starred(t2.id, False)
+    tv.update_take(t2.id)
+    assert tv.model.rowCount() == 0 and t2.id not in tv._items
     print("TakesView incremental OK: in-place tile update, icon cache, membership fallback")
 
 

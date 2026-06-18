@@ -329,7 +329,9 @@ class TakesView(QWidget):
         actually changed: a newly-visible take, a deletion, or a filter boundary crossed."""
         fav = self.filter.currentText() == "Favorites"
         t = self.project.get_take(take_id)
-        should_show = bool(t and (not fav or t.starred))
+        # Mirror list_takes() (what load() uses): a soft-deleted take is never shown, and under
+        # the Favorites filter only starred takes are.
+        should_show = t is not None and not t.deleted and (not fav or t.starred)
         item = self._items.get(take_id)
         if item is None:
             if should_show:
@@ -371,7 +373,12 @@ class TakesView(QWidget):
                 jobs.append((t.id, src))
         if not jobs:
             return
-        self._loader = _StripLoader(jobs, self._anim_gen)   # kept on self so it isn't GC'd
+        # Held on self only so a freshly-started loader isn't GC'd before its thread runs; a
+        # single-take update_take decode may overwrite this ref while a full-load decode is still
+        # in flight, which is fine - the running thread keeps the older loader alive via its bound
+        # _run, both share _anim_gen, so both deliver. Concurrent loaders are intentionally
+        # fire-and-forget; don't "fix" the overwrite.
+        self._loader = _StripLoader(jobs, self._anim_gen)
         self._loader.ready.connect(self._on_strip_ready)
         self._loader.start()
 
