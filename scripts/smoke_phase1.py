@@ -266,9 +266,11 @@ def test_output_url_parsing() -> None:
     assert _output_video_url({"url": "https://x/d.mp4"}) == "https://x/d.mp4"
     assert _output_video_url({"video": "https://x/e.mp4"}) == "https://x/e.mp4"
 
-    # Bad shapes raise ReplicateError (NEVER AttributeError) and quote the raw output.
+    # Bad shapes raise ReplicateError (NEVER AttributeError/TypeError) and quote the raw
+    # output. The nested list [[...]] has a list (not str/dict) first element, and the
+    # nested-value dicts have a non-str url/video, so all fall through to no usable URL.
     bad_outputs = ([None], [[{"url": "https://x/n.mp4"}]], [42], [True], [], {}, None, "",
-                   {"foo": "bar"})
+                   {"foo": "bar"}, {"url": {"nested": "x"}}, {"video": ["https://x/v.mp4"]})
     for bad in bad_outputs:
         try:
             _output_video_url(bad)

@@ -269,11 +269,12 @@ def cancel_prediction(pred_id: str, token: Optional[str] = None) -> None:
     api_request(token or load_token(), f"{API}/predictions/{pred_id}/cancel", method="POST")
 
 
-def _output_video_url(output) -> str:
+def _output_video_url(output: object) -> str:
     """Resolve a succeeded prediction's `output` to a video URL, raising ReplicateError
-    (quoting the raw output) when it carries no recognizable URL. A list whose first
-    element is neither a str nor a dict (e.g. ``[None]``, ``[[...]]``, ``[42]``) yields
-    no URL and falls through to the ReplicateError rather than an AttributeError."""
+    (quoting the raw output) when it carries no recognizable URL. A non-str URL — a list
+    whose first element is neither a str nor a dict (e.g. ``[None]``, ``[[...]]``, ``[42]``),
+    or a dict whose ``url``/``video`` value is itself nested — yields no usable URL and
+    falls through to the ReplicateError rather than an opaque AttributeError/TypeError."""
     url = None
     if isinstance(output, str):
         url = output
@@ -285,7 +286,7 @@ def _output_video_url(output) -> str:
             url = first.get("url")
     elif isinstance(output, dict):
         url = output.get("url") or output.get("video")
-    if not url:
+    if not isinstance(url, str) or not url:
         raise ReplicateError(f"No video URL in output: {json.dumps(output)[:500]}")
     return url
 
