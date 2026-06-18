@@ -393,6 +393,49 @@ def test_runner_uses_snapshot_not_live_shot() -> None:
     print("runner snapshot freeze OK: both backends render the frozen snapshot, not the edited shot")
 
 
+def test_snapshot_detached_from_live_shot_at_creation() -> None:
+    """_queue_take freezes the take's settings_snapshot DETACHED from the live shot: an
+    in-place mutation of shot.crop (or a nested settings dict the caller still holds) after
+    queueing must NOT reach the immutable snapshot. Creation-side mirror of card #53 / the
+    render-side detach in _shot_from_snapshot (rule #3)."""
+    from PySide6.QtWidgets import QApplication
+
+    import library
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    tmp = Path(tempfile.mkdtemp())
+    _png(tmp / "kf.png")
+    project = Project.new()
+    asset = str(project.import_asset(tmp / "kf.png"))
+    shot = project.add_shot(
+        "punchy", model_id="seedance-2.0-std", start_frame=asset,
+        canvas_w=1254, canvas_h=706,
+        crop={"aspect": "16:9", "start": {"scale": 0.6, "cx": 0.5, "cy": 0.4}},
+        prompt="punch", negative_prompt="blurry", settings={"seed": 7})
+    win = MainWindow(project)
+    model = library.get_model("seedance-2.0-std")
+    # A nested dict in settings is the aliasing vector the shallow dict() copy can't cover.
+    settings = {**model.get("default_params", {}), **shot.settings, "extra": {"k": 1}}
+
+    win.jobs.enqueue = lambda *a, **k: None          # freeze the snapshot, run nothing
+    take_id = win._queue_take(shot, model, settings, est=0.0)
+    snap = project.get_take(take_id).settings_snapshot
+    assert snap["crop"]["start"]["scale"] == 0.6     # captured at creation
+    assert snap["settings"]["extra"]["k"] == 1
+
+    # Mutate the live shot's crop IN PLACE (not update_shot replacing the whole dict) and the
+    # nested settings dict the caller still references — the frozen snapshot must not move.
+    shot.crop["start"]["scale"] = 999
+    shot.crop["aspect"] = "1:1"
+    settings["extra"]["k"] = 999
+    assert snap["crop"]["start"]["scale"] == 0.6, "in-place crop mutation leaked into the snapshot"
+    assert snap["crop"]["aspect"] == "16:9"
+    assert snap["settings"]["extra"]["k"] == 1, "nested settings mutation leaked into the snapshot"
+    print("snapshot creation-detach OK: in-place crop/settings mutation can't corrupt the frozen snapshot")
+
+
 def test_param_enum_preserves_out_of_schema_value() -> None:
     """The generic enum-param combo must PRESERVE a stored value absent from the live schema
     enum (e.g. an option renamed/removed by a Model Library refresh) instead of silently
@@ -442,5 +485,6 @@ if __name__ == "__main__":
     test_card_and_window()
     test_framed_row_thumbs()
     test_runner_uses_snapshot_not_live_shot()
+    test_snapshot_detached_from_live_shot_at_creation()
     test_param_enum_preserves_out_of_schema_value()
     print("PHASE 4 SMOKE: PASS")
