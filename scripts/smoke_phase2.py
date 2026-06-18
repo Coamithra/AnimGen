@@ -626,6 +626,8 @@ def test_recovered_crash_maps_to_interrupted() -> None:
 
     GenerationJob(project, plain.id, "comfyui", plain_runner, jm._signals,
                   jm._cancelled, jm._stopping, jm._requeue, jm._on_job_done).run()
+    # The take state below is read straight from the write-through (project.update_take runs
+    # inline in run()); processEvents only drains the emitted signals, which this test ignores.
     app.processEvents()
 
     got_crash = project.get_take(crashed.id)
