@@ -2176,7 +2176,17 @@ def test_queue_summary() -> None:
     assert last_finished_text(fail, "Punch") == "Last finished: Punch - failed"
     canc = Take(id="c", shot_id="s", status=STATUS_CANCELLED)
     assert last_finished_text(canc, "Block") == "Last finished: Block - cancelled"
-    print("queue_summary OK: done counter, last-finished strip text")
+
+    # Deliberate divergence after Clear: the done/failed counter spans ALL project takes (a
+    # cumulative tally, the same all-takes basis 'N failed' always used), while the strip reads
+    # the dismissed-filtered rows. So a clear (all finished dismissed) empties the strip yet the
+    # counter still reports the project totals - pin it so a future change doesn't silently flip
+    # the counter to rows-based.
+    cleared_rows = select_rows(takes, dismissed={done.id, done2.id, fail.id})
+    assert [t.id for t in cleared_rows] == ["g", "p"]                          # only active survive
+    assert last_finished(cleared_rows) is None                                 # strip hidden
+    assert summary_line(takes, bool(cleared_rows)) == "1 running · 1 queued · 2 done · 1 failed"
+    print("queue_summary OK: done counter, last-finished strip text, clear divergence")
 
 
 def test_queue_actions_in_queue_tab() -> None:
