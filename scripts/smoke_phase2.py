@@ -2116,6 +2116,24 @@ def test_select_rows() -> None:
     ids = [t.id for t in select_rows([c_old, c_new])]
     assert ids == ["cn", "co"], ids
 
+    # Same-second completion (timestamps are second-precision): the tie must break
+    # deterministically by `created` desc (newest-created on top), NOT silently fall back to
+    # input/list order - that fallback is the very bug this fix removes.
+    t_a = Take(id="a", shot_id="s", status=STATUS_DONE,
+               completed="2026-06-18T15:00:00", created="2026-06-18T14:00:00")
+    t_b = Take(id="b", shot_id="s", status=STATUS_DONE,
+               completed="2026-06-18T15:00:00", created="2026-06-18T14:30:00")
+    assert [t.id for t in select_rows([t_a, t_b])] == ["b", "a"]   # newer created on top
+    assert [t.id for t in select_rows([t_b, t_a])] == ["b", "a"]   # independent of input order
+
+    # Fully tied (same completed AND created): the `id` tiebreak still makes the order
+    # independent of input order, so a same-second cluster never flickers between rebuilds.
+    t_c = Take(id="c1", shot_id="s", status=STATUS_DONE,
+               completed="2026-06-18T15:00:00", created="2026-06-18T14:00:00")
+    t_d = Take(id="c2", shot_id="s", status=STATUS_DONE,
+               completed="2026-06-18T15:00:00", created="2026-06-18T14:00:00")
+    assert [t.id for t in select_rows([t_c, t_d])] == [t.id for t in select_rows([t_d, t_c])]
+
     # No cap: every finished take shows (the old 15-row limit is gone), newest-first.
     many = [Take(id=f"x{i}", shot_id="s", status=STATUS_DONE,
                  completed=f"2026-06-18T{i:02d}:00:00") for i in range(20)]

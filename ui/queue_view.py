@@ -108,6 +108,11 @@ def select_rows(takes, dismissed: "frozenset[str] | set[str]" = frozenset()) -> 
     finishes at its original, earlier list position, and ordering by completion (not list
     order) is what lets its fresh result reach the top instead of staying buried.
 
+    Timestamps are second-precision, so two takes finishing in the same second tie on
+    `completed`; the key breaks ties by `created` (newest first), then `id`, so the order is
+    fully determined by the takes themselves and never silently falls back to input order —
+    which is the list/creation order this fix exists to stop depending on.
+
     There is no cap. The view is a virtualized QTableView with zero per-row widgets (rule
     #18), so an unbounded finished list costs the same as a short one; the Clear button is
     how the user prunes. Finished takes whose id is in `dismissed` are filtered out — that's
@@ -117,7 +122,7 @@ def select_rows(takes, dismissed: "frozenset[str] | set[str]" = frozenset()) -> 
     active += [t for t in takes if t.status == STATUS_PENDING]
     finished = sorted(
         (t for t in takes if t.status in _FINISHED and t.id not in dismissed),
-        key=lambda t: t.completed or t.created or "",
+        key=lambda t: (t.completed or t.created or "", t.created or "", t.id),
         reverse=True,
     )
     return active + finished
