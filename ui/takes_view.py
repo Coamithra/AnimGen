@@ -179,7 +179,7 @@ class TakesView(QWidget):
         self.project = project
         self.shot_id = shot_id
         self.jobs = jobs
-        self._latest_pct: dict[str, tuple[float, str]] = {}   # take_id -> (fraction, label) live render progress
+        self._latest_pct: dict[str, float] = {}       # take_id -> live render fraction 0..1
         self._items: dict[str, QStandardItem] = {}    # take_id -> grid item (for live frames)
         self._strips: dict[str, list] = {}            # take_id -> list[QPixmap] (decoded loop)
         self._frame_idx: dict[str, int] = {}          # take_id -> current frame in its strip
@@ -338,23 +338,25 @@ class TakesView(QWidget):
     def _label(self, t) -> str:
         pct = ""
         if t.status == "generating":
-            entry = self._latest_pct.get(t.id)
-            if entry is not None:
-                pct = progress_percent(entry[0])
+            frac = self._latest_pct.get(t.id)
+            if frac is not None:
+                pct = progress_percent(frac)
         return take_tile_label(t.status, t.starred, t.id, pct)
 
     def _on_progress_pct(self, take_id: str, frac: float, label: str) -> None:
-        """Live render fraction for a take: update just its tile label in place (no reload,
-        which would reset the running thumbnail animations). Ignored unless the take is one of
-        ours and still generating — a documented progress_state tail keeps arriving ~20-30s
-        after a local render completes (rule #11) and must not relabel an already-finished tile."""
+        """Live render fraction for a take: relabel just its tile in place (no reload, which
+        would reset the running thumbnail animation). Ignored unless the take is one of ours and
+        still generating — a documented progress_state tail keeps arriving ~20-30s after a local
+        render completes (rule #11) and must not relabel an already-finished tile. `label` (the
+        Queue tab's "step N/M" text) has no surface here, so only the fraction is kept."""
         item = self._items.get(take_id)
         if item is None:
             return                                    # not in this shot's grid (other shot / filtered out)
-        self._latest_pct[take_id] = (frac, label)
         t = self.project.get_take(take_id)
-        if t is not None and t.status == "generating":
-            item.setText(self._label(t))
+        if t is None or t.status != "generating":
+            return
+        self._latest_pct[take_id] = frac
+        item.setText(self._label(t))
 
     def _icon_for(self, t) -> QIcon:
         if t.thumbnail and Path(t.thumbnail).exists():

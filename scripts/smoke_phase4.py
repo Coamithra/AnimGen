@@ -257,8 +257,10 @@ def test_take_progress_label() -> None:
     # once the take is done it must not be relabelled back to a percentage.
     project.update_take(g.id, status=STATUS_DONE)
     tv.load()
-    jm.progress_pct.emit(g.id, 0.9, "")
-    assert "90%" not in tv._items[g.id].text()
+    done_text = tv._items[g.id].text()
+    jm.progress_pct.emit(g.id, 0.9, "")              # the emit must be actively ignored...
+    assert tv._items[g.id].text() == done_text       # ...the done tile is left exactly as-is
+    assert "90%" not in done_text
     print("TakesView progress OK: generating tile shows live %, done tile ignores late tail")
 
 
