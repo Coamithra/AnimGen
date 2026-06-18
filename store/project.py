@@ -213,7 +213,9 @@ class Project:
         re-point lives in memory, so a Discard at the next save-prompt would revert the
         re-point yet leave the sources already gone -- permanently stranding the shot's
         keyframes. Writing now makes the re-point durable and leaves the freshly-loaded
-        project clean (no phantom '*' priming a misleading save-prompt)."""
+        project clean (no phantom '*' priming a misleading save-prompt). A persist failure
+        can orphan the just-imported copies (a later reload re-imports) -- a harmless leak,
+        never data loss, since the keypose sources are kept until a persist succeeds."""
         kp = self._assets_dir / "keyposes"
         if not kp.exists():
             return

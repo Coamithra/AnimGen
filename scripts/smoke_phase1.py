@@ -297,6 +297,48 @@ def test_keypose_migration_persist() -> None:
     print("keypose migration OK: re-point persisted before source deletion, clean reload")
 
 
+def test_keypose_migration_persist_failure() -> None:
+    """When persisting the re-point fails, the migration must NOT delete the keyposes sources
+    -- it keeps them and falls back to dirty=True so a later Save (or reload) retries (card
+    #56). This is the headline safety property: no source is deleted before the re-point is
+    durable on disk."""
+    tmp = Path(tempfile.mkdtemp())
+    proj_path = tmp / "legacy.animproj"
+    assets = tmp / "legacy.assets"
+    kp_dir = assets / "keyposes" / "s1"
+    kp_dir.mkdir(parents=True)
+    (kp_dir / "start.png").write_bytes(b"baked-keypose")
+    source = tmp / "orig_start.png"
+    source.write_bytes(b"original-source")
+    legacy_doc = {"format": "animgen-project", "version": 1, "name": "legacy",
+                  "shots": [{"id": "s1", "name": "kick", "model_id": "local-flf-wan14b",
+                             "start_frame": "keyposes/s1/start.png", "end_frame": None,
+                             "crop": {"source_start": str(source)},
+                             "settings": {}, "created": "", "updated": ""}]}
+    proj_path.write_text(json.dumps(legacy_doc), encoding="utf-8")
+
+    orig = Project._write_project_file
+    Project._write_project_file = lambda self: (_ for _ in ()).throw(OSError("disk full"))
+    try:
+        p = Project.load(proj_path)
+    finally:
+        Project._write_project_file = orig
+
+    assert p.dirty, "a failed persist must fall back to dirty=True"
+    assert (assets / "keyposes" / "s1" / "start.png").exists(), \
+        "the keypose source must NOT be deleted when the persist failed"
+    on_disk = json.loads(proj_path.read_text(encoding="utf-8"))
+    assert "keyposes" in (on_disk["shots"][0]["start_frame"] or ""), \
+        "nothing should have been persisted on a failed migration write"
+
+    # Recovery: with persist working again, a reload completes the migration with no loss.
+    r = Project.load(proj_path)
+    rs = r.get_shot("s1")
+    assert rs.start_frame and "keyposes" not in Path(rs.start_frame).parts
+    assert Path(rs.start_frame).exists() and not r.dirty
+    print("keypose migration failure OK: sources kept + dirty on failed persist, reload recovers")
+
+
 def test_gui_build() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -320,5 +362,6 @@ if __name__ == "__main__":
     test_hybrid_persistence()
     test_shot_star_write_through()
     test_keypose_migration_persist()
+    test_keypose_migration_persist_failure()
     test_gui_build()
     print("PHASE 1 SMOKE: PASS")
