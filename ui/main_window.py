@@ -884,11 +884,24 @@ class MainWindow(QMainWindow):
     def _refresh_purge_cancelled_action(self) -> None:
         self.purge_cancelled_act.setEnabled(self._cancelled_take_count() > 0)
 
+    def _close_take_tabs(self, take_ids) -> None:
+        """Close any open take-viewer tabs for the given takes, so a tab can't dangle on a take
+        that's about to be removed. Mirrors _on_tab_close's disposal (stop playback, drop tab)."""
+        for tid in take_ids:
+            tab = self.take_tabs.pop(tid, None)
+            if tab is None:
+                continue
+            idx = self.tabs.indexOf(tab)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            tab.close_player()
+            tab.deleteLater()
+
     def remove_cancelled_takes(self) -> None:
         """Edit menu: permanently remove every cancelled take in the project, across all shots
-        (ignores the view filters, like Cancel pending / Restart interrupted). Cancelled takes
-        never rendered, so this just drops their records (no media to bin); it's irreversible,
-        so confirm first - the dialog defaults to No."""
+        (ignores the view filters, like Cancel pending / Restart interrupted). Drops their records
+        and best-effort unlinks any managed media (a stopped-mid-render or binned take may carry
+        some; external refs are left in place). Irreversible, so confirm first - defaults to No."""
         cancelled = [t for t in self.project.list_takes(include_deleted=True)
                      if t.status == STATUS_CANCELLED]
         if not cancelled:
@@ -903,11 +916,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
-        removed = self.project.purge_takes(t.id for t in cancelled)
+        ids = [t.id for t in cancelled]
+        self._close_take_tabs(ids)           # a purged take must not leave a dangling viewer tab
+        removed = self.project.purge_takes(ids)
         self._log(f"removed {removed} cancelled take(s)")
-        self.reload()                 # rebuild shot cards / takes grids without the purged takes
-        self._refresh_cancel_action()  # also refreshes the Restart action's enabled state
-        self.queue_tab.refresh()
+        self.reload()             # rebuilds cards + refreshes the purge/restart action states
+        self.queue_tab.refresh()  # drop the purged takes from the Queue tab
 
     # ---- restart interrupted takes -------------------------------------
     def restart_cancelled_takes(self) -> None:

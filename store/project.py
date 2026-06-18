@@ -41,7 +41,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import paths
 from store.models import STATUS_CANCELLED, STATUS_FAILED, Job, Shot, Take
@@ -552,7 +552,7 @@ class Project:
     def restore_take(self, take_id: str) -> None:
         self.update_take(take_id, deleted=False)
 
-    def purge_takes(self, take_ids) -> int:
+    def purge_takes(self, take_ids: Iterable[str]) -> int:
         """Permanently remove takes - drop them from takes.json entirely (no bin, no restore).
         Best-effort deletes each take's MANAGED media (files under the assets dir); an external
         ref (e.g. a seeded ../Fighter/out take) is left exactly where it is - this stays purely
@@ -575,6 +575,13 @@ class Project:
                             p.unlink()
                     except OSError:
                         pass    # best-effort; a locked managed file just lingers as orphan media
+                # A binned take's media lived in <assets>/.bin/<id>/; drop that dir once emptied.
+                bin_dir = self._assets_dir / ".bin" / tid
+                try:
+                    if bin_dir.is_dir() and not any(bin_dir.iterdir()):
+                        bin_dir.rmdir()
+                except OSError:
+                    pass
         if removed:
             self._write_takes_file()
         return removed

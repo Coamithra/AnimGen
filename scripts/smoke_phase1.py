@@ -411,8 +411,15 @@ def test_purge_takes() -> None:
     external = Path(tempfile.mkdtemp()) / "ext.mp4"   # an external ref (seeded-style)
     external.write_bytes(b"external")
     p.add_take(shot.id, status=STATUS_CANCELLED, video_path=str(external))
-    binned = p.add_take(shot.id, status=STATUS_CANCELLED)
-    p.soft_delete_take(binned.id)              # binned but still cancelled -> still purged
+    # A binned cancelled take whose media was MOVED into <assets>/.bin/<id>/ (still cancelled ->
+    # still purged); purge must delete the binned file AND remove the emptied per-take bin dir.
+    from pipeline.takes_io import move_to_bin
+    binned_media = p.takes_dir / "c2.mp4"
+    binned_media.write_bytes(b"binned")
+    binned = p.add_take(shot.id, status=STATUS_CANCELLED, video_path=str(binned_media))
+    move_to_bin(p.get_take(binned.id), p)
+    bin_take_dir = p.bin_dir / binned.id
+    assert any(bin_take_dir.iterdir()), "media should have moved into the per-take bin dir"
 
     cancelled = [t for t in p.list_takes(include_deleted=True) if t.status == STATUS_CANCELLED]
     assert len(cancelled) == 3, len(cancelled)
@@ -424,8 +431,9 @@ def test_purge_takes() -> None:
     on_disk = json.loads((p.assets_dir / "takes.json").read_text(encoding="utf-8"))
     assert [t["id"] for t in on_disk["takes"]] == [done.id], "only the done take remains on disk"
 
-    # Managed media deleted; the external ref is left exactly where it is.
+    # Managed media deleted (incl. the binned copy + its emptied bin dir); external ref untouched.
     assert not managed.exists(), "managed media under .assets must be deleted"
+    assert not bin_take_dir.exists(), "emptied per-take bin dir must be removed"
     assert external.exists(), "external media ref must NOT be touched (gotcha #2)"
 
     # No-op safety: purging unknown / already-gone ids removes nothing and skips the write.
