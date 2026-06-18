@@ -122,7 +122,9 @@ Full mechanism + invariants in **Hard-won rule #13**.
   keyframe **asset** images, and managed media (`takes/`, `thumbs/`, `.bin/`).
 - **Open-tab layout (`ui_state`, 2026-06-18):** the `.animproj` doc carries an optional
   `ui_state = {"tabs": [...], "active": int}` recording which tabs were open (and their
-  order) so reopening a project restores its layout. Each tab descriptor is `{"kind":
+  order) so reopening a project restores its layout (`active` is the index into the `tabs`
+  descriptor list — not a raw tab position — so it survives a later tab being skipped on
+  restore, and the active tab is re-selected by identity). Each tab descriptor is `{"kind":
   "fixed", "key": <title>}` (a closable fixed tab — Shots/Queue/Assets/Model Library/
   ComfyUI Status), `{"kind": "shot", "id": <shot_id>}`, or `{"kind": "take", "id":
   <take_id>}`. It's **UI-owned window metadata, not authoring data**: `Project.ui_state`

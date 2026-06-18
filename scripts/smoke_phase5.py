@@ -251,6 +251,49 @@ def test_tab_state_persistence() -> None:
     print("MainWindow OK: open-tab layout captured on save + restored on open")
 
 
+def test_tab_state_active_survives_skip() -> None:
+    """The saved active tab is restored by identity, not raw tab position, so deleting an
+    earlier tab's shot doesn't drift focus onto the wrong tab. Also exercises the take-tab
+    descriptor round-trip (the 'take' kind, untested by the layout test above)."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.take_player import TakePlayerTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "active.animproj"
+    project = Project.new()
+    a = project.add_shot("aaa", model_id="seedance-2.0-std")
+    b = project.add_shot("bbb", model_id="seedance-2.0-std")
+    take = project.add_take(a.id, status=STATUS_DONE)   # no video -> no decode thread
+    project.save_as(path)
+
+    win = MainWindow(project)
+    win.open_shot(a.id)
+    win.open_shot(b.id)
+    win.open_take(take.id)                 # tab order: ...fixed..., a, b, take
+    win.tabs.setCurrentWidget(win.shot_tabs[b.id])   # active is a NON-last tab
+    assert win.save_project()
+
+    # Reopen everything intact: the take viewer tab round-trips and focus lands on b.
+    w2 = MainWindow(Project.load(path))
+    assert take.id in w2.take_tabs and isinstance(w2.take_tabs[take.id], TakePlayerTab)
+    assert a.id in w2.shot_tabs and b.id in w2.shot_tabs
+    assert w2.tabs.currentWidget() is w2.shot_tabs[b.id], "active restored to shot b"
+
+    # Delete shot a (an EARLIER descriptor than the active one) + its take, then reopen.
+    # Position-based restore would now mis-point or fall back to Shots; identity-based
+    # restore must keep focus on b.
+    reop = Project.load(path)
+    reop.delete_shot(a.id)
+    reop.save()
+    w3 = MainWindow(Project.load(path))
+    assert a.id not in w3.shot_tabs, "deleted shot a is not reopened"
+    assert take.id not in w3.take_tabs, "take orphaned by the shot delete is dropped"
+    assert w3.tabs.currentWidget() is w3.shot_tabs[b.id], "focus stayed on b despite the skip"
+    print("MainWindow OK: active tab restored by identity across a skipped earlier tab")
+
+
 def test_format_generation_settings() -> None:
     """The take-viewer settings formatter renders a full snapshot and degrades cleanly."""
     from store.models import Take
@@ -405,6 +448,7 @@ if __name__ == "__main__":
     test_window_builds()
     test_close_dirty_tab_guard()
     test_tab_state_persistence()
+    test_tab_state_active_survives_skip()
     test_format_generation_settings()
     test_snapshot_includes_framing()
     test_take_player_settings_panel()
