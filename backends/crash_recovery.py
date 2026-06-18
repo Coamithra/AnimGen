@@ -28,18 +28,37 @@ from typing import Callable
 MAX_ATTEMPTS = 3   # total tries per take before the whole local queue is abandoned
 CRASH_PROBES = 3   # times to reconfirm "server down" before treating a failure as a crash
 
-# Stamped on the render exception re-raised after a SUCCESSFUL final restart (the GPU recovered,
-# but this take's in-flight render was already lost to the crash). The worker
-# (backends.jobs.GenerationJob) reads it via getattr to record the take FAILED + interrupted=True,
-# so the bulk "Restart interrupted takes" action picks it up alongside its abandon_local'd siblings
-# - it WAS crash-killed, not a genuine workflow error (rule #17, card #68). An attribute (vs a
-# wrapper exception) keeps the original error message verbatim.
+# Stamped on a render exception re-raised after a SUCCESSFUL final restart (the GPU recovered, but
+# this take's in-flight render was already lost to the crash), AND on the QueueAbandoned raised when
+# the queue is abandoned (a restart failed / the server stayed down - see _abandon). In both cases
+# the take in the worker IS the crash victim. The worker (backends.jobs.GenerationJob) reads this via
+# getattr to record the take FAILED + interrupted=True, so the bulk "Restart interrupted takes" action
+# picks it up alongside its abandon_local'd siblings - it WAS crash-killed, not a genuine workflow
+# error (rule #17, cards #68 + #71). An attribute (vs a wrapper exception) keeps the original error
+# message verbatim on the recovered path.
 CRASH_INTERRUPTED_ATTR = "animgen_crash_interrupted"
 
 
 class QueueAbandoned(RuntimeError):
     """A take crashed MAX_ATTEMPTS times (or the server couldn't be restarted); the caller
     should pause the local queue rather than keep restarting ComfyUI."""
+
+
+def _abandon(note: Callable[[str], None], on_abandon: Callable[[str], None],
+             reason: str) -> QueueAbandoned:
+    """Log + pause the local queue, then build the QueueAbandoned for the caller to raise.
+
+    The returned exception is stamped CRASH_INTERRUPTED_ATTR so the worker
+    (backends.jobs.GenerationJob) records the crash-VICTIM take FAILED + interrupted=True: it
+    crashed MAX_ATTEMPTS times and the server couldn't be brought back, so it WAS crash-killed,
+    not a genuine workflow error - the bulk "Restart interrupted takes" then picks it up alongside
+    the still-PENDING siblings on_abandon cancels with the same flag (card #71). The caller keeps
+    `raise _abandon(...) from <cause>` so the original cause still chains through."""
+    note(reason)
+    on_abandon(reason)
+    exc = QueueAbandoned(reason)
+    setattr(exc, CRASH_INTERRUPTED_ATTR, True)
+    return exc
 
 
 def _looks_crashed(server_running: Callable[[], bool], probes: int) -> bool:
@@ -133,9 +152,7 @@ def run_with_crash_recovery(
                     restart_server()
                 except Exception as rexc:  # noqa: BLE001 - couldn't bring it back -> abandon
                     reason = f"ComfyUI restart failed ({rexc}); pausing the local queue."
-                    note(reason)
-                    on_abandon(reason)
-                    raise QueueAbandoned(reason) from rexc
+                    raise _abandon(note, on_abandon, reason) from rexc
                 # The production restart_server (comfy_client) already blocks until responsive
                 # and raises if it can't, so this re-probe normally confirms "up" immediately;
                 # it abandons only if the server died again in the gap after the restart returned
@@ -144,9 +161,7 @@ def run_with_crash_recovery(
                     reason = (f"ComfyUI still unreachable after a final restart (crashed "
                               f"{max_attempts}x on this take); pausing the local queue. "
                               "Check the GPU / ComfyUI before re-Generating.")
-                    note(reason)
-                    on_abandon(reason)
-                    raise QueueAbandoned(reason) from exc
+                    raise _abandon(note, on_abandon, reason) from exc
                 note("ComfyUI recovered after a final restart; failing this take but "
                      "keeping the local queue running.")
                 try:
@@ -160,7 +175,5 @@ def run_with_crash_recovery(
                 restart_server()
             except Exception as rexc:  # noqa: BLE001 - couldn't bring the server back -> abandon
                 reason = f"ComfyUI restart failed ({rexc}); pausing the local queue."
-                note(reason)
-                on_abandon(reason)
-                raise QueueAbandoned(reason) from rexc
+                raise _abandon(note, on_abandon, reason) from rexc
     raise QueueAbandoned("crash recovery exhausted")  # unreachable (loop returns or raises)

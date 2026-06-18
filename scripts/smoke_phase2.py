@@ -596,11 +596,14 @@ def test_inflight_stop_maps_to_cancelled() -> None:
 def test_recovered_crash_maps_to_interrupted() -> None:
     # A render error re-raised by crash recovery after a successful final restart carries the
     # CRASH_INTERRUPTED_ATTR stamp; the worker must record the take FAILED + interrupted=True so
-    # the bulk "Restart interrupted takes" action picks it up (card #68). A plain (unstamped)
-    # workflow error must still land FAILED + interrupted=False. Run the QRunnable directly.
+    # the bulk "Restart interrupted takes" action picks it up (card #68). The QueueAbandoned raised
+    # when the queue is abandoned (final restart failed / server stayed down) is ALSO stamped, so
+    # the crash VICTIM lands FAILED + interrupted=True like its abandon_local'd siblings, not
+    # interrupted=False (card #71). A plain (unstamped) workflow error must still land FAILED +
+    # interrupted=False. Run the QRunnable directly.
     from PySide6.QtWidgets import QApplication
 
-    from backends.crash_recovery import CRASH_INTERRUPTED_ATTR
+    from backends.crash_recovery import CRASH_INTERRUPTED_ATTR, _abandon
     from backends.jobs import GenerationJob, JobManager
     from store.models import STATUS_FAILED, STATUS_PENDING
 
@@ -626,6 +629,17 @@ def test_recovered_crash_maps_to_interrupted() -> None:
 
     GenerationJob(project, plain.id, "comfyui", plain_runner, jm._signals,
                   jm._cancelled, jm._stopping, jm._requeue, jm._on_job_done).run()
+
+    abandoned = project.add_take(shot.id, status=STATUS_PENDING)
+
+    def abandoned_runner(progress):
+        # The real abandon path raises a QueueAbandoned built (and stamped) by _abandon; the
+        # crash victim in the worker must land FAILED + interrupted=True too (card #71).
+        raise _abandon(lambda _r: None, lambda _r: None,
+                       "ComfyUI still unreachable after a final restart; pausing the local queue.")
+
+    GenerationJob(project, abandoned.id, "comfyui", abandoned_runner, jm._signals,
+                  jm._cancelled, jm._stopping, jm._requeue, jm._on_job_done).run()
     # The take state below is read straight from the write-through (project.update_take runs
     # inline in run()); processEvents only drains the emitted signals, which this test ignores.
     app.processEvents()
@@ -637,7 +651,12 @@ def test_recovered_crash_maps_to_interrupted() -> None:
     got_plain = project.get_take(plain.id)
     assert got_plain.status == STATUS_FAILED and got_plain.interrupted is False, (
         got_plain.status, got_plain.interrupted)
-    print("recovered crash OK: stamped re-raise -> FAILED+interrupted; plain error -> FAILED only")
+    got_abandoned = project.get_take(abandoned.id)
+    assert got_abandoned.status == STATUS_FAILED and got_abandoned.interrupted is True, (
+        got_abandoned.status, got_abandoned.interrupted)
+    assert "pausing the local queue" in (got_abandoned.error or ""), got_abandoned.error
+    print("recovered crash OK: stamped re-raise + abandon victim -> FAILED+interrupted; "
+          "plain error -> FAILED only")
 
 
 def test_request_stop_calls_backend() -> None:
@@ -986,8 +1005,10 @@ def test_crash_recovery() -> None:
             restart_server=lambda: restarts.append(1),
             note=notes.append, on_abandon=abandons.append, clock=make_clock())
         assert False, "expected QueueAbandoned"
-    except QueueAbandoned:
-        pass
+    except QueueAbandoned as e:
+        # The crash VICTIM (this take) is stamped interrupted, like its abandon_local'd
+        # siblings - it crashed 3x, so the bulk Restart must pick it up too (card #71).
+        assert getattr(e, CRASH_INTERRUPTED_ATTR, False) is True, "abandon victim must be stamped"
     assert len(restarts) == 3 and len(abandons) == 1, (restarts, abandons)
     assert "crashed 3x" in abandons[0] and "pausing the local queue" in abandons[0]
     assert "unreachable after a final restart" in abandons[0], abandons[0]
@@ -1015,8 +1036,8 @@ def test_crash_recovery() -> None:
             render=always_crash, server_running=lambda: False, restart_server=restart_boom,
             note=notes.append, on_abandon=abandons.append, clock=make_clock())
         assert False, "expected QueueAbandoned"
-    except QueueAbandoned:
-        pass
+    except QueueAbandoned as e:
+        assert getattr(e, CRASH_INTERRUPTED_ATTR, False) is True, "abandon victim must be stamped"
     assert len(abandons) == 1 and "restart failed" in abandons[0]
 
     # (f) hardened crash signal: a single transient "down" that re-probes "up" is a workflow
@@ -1119,8 +1140,8 @@ def test_crash_recovery() -> None:
             restart_server=restart_fails_on_last,
             note=notes.append, on_abandon=abandons.append, clock=make_clock())
         assert False, "expected QueueAbandoned"
-    except QueueAbandoned:
-        pass
+    except QueueAbandoned as e:
+        assert getattr(e, CRASH_INTERRUPTED_ATTR, False) is True, "abandon victim must be stamped"
     assert len(restarts) == 3 and len(abandons) == 1, (restarts, abandons)
     assert "restart failed" in abandons[0] and "did not come back up" in abandons[0], abandons[0]
 
