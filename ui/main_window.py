@@ -753,9 +753,8 @@ class MainWindow(QMainWindow):
             return
 
         take_ids: set[str] = set()
-        for shot, model, settings, est in plan.eligible:
-            for _ in range(n):
-                take_ids.add(self._queue_take(shot, model, settings, est))
+        for shot, model, settings, est in batch.queue_order(plan.eligible, n):
+            take_ids.add(self._queue_take(shot, model, settings, est))
         self._batch = batch.BatchRun(
             take_ids=take_ids, power_action=power,
             started=datetime.now().isoformat(timespec="seconds"))

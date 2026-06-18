@@ -1466,6 +1466,14 @@ def test_batch() -> None:
     assert batch.plan_batch([shots[0]], takes_per_shot=0, model_of=model_of,
                             aspects_of=aspects_of, est_of=est_of).take_count == 1
 
+    # queue_order: round-major (one take of every eligible shot per round, repeated N),
+    # NOT shot-major (all N of shot 1 then all N of shot 2). eligible items are
+    # (shot, model, settings, est); check the shot-name sequence.
+    order = [shot.name for shot, _m, _s, _e in batch.queue_order(plan.eligible, 3)]
+    assert order == ["ok1", "ok2", "ok1", "ok2", "ok1", "ok2"], order
+    assert [s.name for s, *_ in batch.queue_order(plan.eligible, 1)] == ["ok1", "ok2"]
+    assert batch.queue_order(plan.eligible, 0) == plan.eligible   # floors at 1 round
+
     # BatchRun completion: terminal-only, complete when all takes drained
     run = batch.BatchRun(take_ids={"a", "b"}, power_action=batch.POWER_NONE, started="t0")
     assert not run.complete
@@ -1488,7 +1496,8 @@ def test_batch() -> None:
 
     cmd = batch.sleep_command()
     assert cmd and isinstance(cmd, list)
-    print("batch OK: plan eligibility/N-per-shot, BatchRun completion, report, sleep cmd")
+    print("batch OK: plan eligibility/N-per-shot, round-major queue_order, "
+          "BatchRun completion, report, sleep cmd")
 
 
 def test_batch_finalize() -> None:

@@ -75,6 +75,20 @@ def plan_batch(shots, *, takes_per_shot: int,
     return BatchPlan(items=items, eligible=eligible, skipped=skipped, takes_per_shot=n)
 
 
+def queue_order(eligible, takes_per_shot):
+    """Round-major enqueue order: one take of every eligible shot per round, repeated N
+    rounds, instead of N takes of shot 1 then N of shot 2 (shot-major).
+
+    The local pool is serialized, so shot-major meant a multi-take batch finished all N
+    takes of the first shot before the second shot's first take even started. Round-major
+    produces an early take of *every* shot before piling extra takes onto any one - so a
+    triage pass can begin while later rounds are still rendering. Pure (just reshapes
+    `eligible`) so it's headless-testable; callers feed each item to _queue_take in order.
+    """
+    n = max(1, int(takes_per_shot))
+    return [item for _ in range(n) for item in eligible]
+
+
 @dataclass
 class BatchRun:
     """In-memory tracker for one in-flight batch (not persisted - a mid-batch app restart
