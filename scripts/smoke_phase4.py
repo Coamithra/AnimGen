@@ -23,7 +23,7 @@ import paths  # noqa: E402
 paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch out of data/
 
 from store.project import Project  # noqa: E402
-from store.models import STATUS_DONE  # noqa: E402
+from store.models import STATUS_DONE, STATUS_GENERATING  # noqa: E402
 
 
 def _png(path: Path, color=(0, 200, 0)) -> None:
@@ -221,9 +221,51 @@ def test_framed_row_thumbs() -> None:
     print("framed_thumb OK: start renders framed keypose, missing end -> placeholder")
 
 
+def test_take_progress_label() -> None:
+    """A generating take's grid tile shows its live render % (the Queue tab's number),
+    fed by the JobManager's progress_pct signal; a late tail after it finishes is ignored."""
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+    from ui.takes_view import TakesView, progress_percent, take_tile_label
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    # Pure label/percent helpers (headless, no widget).
+    assert progress_percent(0.5) == "50%"
+    assert progress_percent(0.0) == "0%" and progress_percent(1.0) == "100%"
+    assert progress_percent(1.4) == "100%" and progress_percent(-0.3) == "0%"   # clamped
+    assert take_tile_label("generating", False, "abc123xyz", "45%").endswith("45%")
+    assert "generating" in take_tile_label("generating", False, "abc123xyz", "")  # no pct -> word
+    assert "generating" not in take_tile_label("generating", False, "abc123xyz", "45%")
+    assert take_tile_label("done", True, "abc123xyz", "").startswith("★")
+    assert take_tile_label("done", False, "abc123xyz", "") == "abc123"           # bare -> id prefix
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    g = project.add_take(shot.id, status=STATUS_GENERATING)
+    jm = JobManager(project)
+    tv = TakesView(project, shot.id, jobs=jm)
+    assert tv.model.rowCount() == 1
+    assert "generating" in tv._items[g.id].text()           # no fraction yet -> bare word
+
+    jm.progress_pct.emit(g.id, 0.5, "step 10/20")           # live render fraction over the signal
+    assert "50%" in tv._items[g.id].text()
+    assert "generating" not in tv._items[g.id].text()
+
+    # The documented progress_state tail keeps arriving ~20-30s after completion (rule #11):
+    # once the take is done it must not be relabelled back to a percentage.
+    project.update_take(g.id, status=STATUS_DONE)
+    tv.load()
+    jm.progress_pct.emit(g.id, 0.9, "")
+    assert "90%" not in tv._items[g.id].text()
+    print("TakesView progress OK: generating tile shows live %, done tile ignores late tail")
+
+
 if __name__ == "__main__":
     test_bin_restore()
     test_takes_view()
+    test_take_progress_label()
     test_assets_view()
     test_asset_picker()
     test_card_and_window()
