@@ -204,8 +204,18 @@ class Project:
     def _migrate_flatten_keyposes(self) -> None:
         """Old projects baked per-shot keyposes into .assets/keyposes/<shot_id>/. Re-point
         such shots to an imported copy of their original source (framing params already
-        match the source, so gen-time framing stays correct), then drop the keyposes tree.
-        Best-effort + idempotent: shots already flat, or whose source is gone, are skipped."""
+        match the source, so gen-time framing stays correct), persist the re-point, then drop
+        the keyposes tree. Best-effort + idempotent: shots already flat, or whose source is
+        gone, are skipped.
+
+        The re-point is persisted to disk BEFORE the sources are deleted. Marking dirty alone
+        is unsafe: the destructive deletion would then happen while the only record of the
+        re-point lives in memory, so a Discard at the next save-prompt would revert the
+        re-point yet leave the sources already gone -- permanently stranding the shot's
+        keyframes. Writing now makes the re-point durable and leaves the freshly-loaded
+        project clean (no phantom '*' priming a misleading save-prompt). A persist failure
+        can orphan the just-imported copies (a later reload re-imports) -- a harmless leak,
+        never data loss, since the keypose sources are kept until a persist succeeds."""
         kp = self._assets_dir / "keyposes"
         if not kp.exists():
             return
@@ -222,6 +232,11 @@ class Project:
                     changed = True
         if not changed:
             return
+        try:
+            self._write_project_file()            # make the re-point durable before deleting
+        except OSError:
+            self.dirty = True                     # couldn't persist; keep sources, let Save retry
+            return
         referenced = {Path(getattr(s, f)).resolve()
                       for s in self._shots.values() for f in _SHOT_PATHS if getattr(s, f)}
         for sub in list(kp.iterdir()):
@@ -229,7 +244,6 @@ class Project:
                 shutil.rmtree(sub, ignore_errors=True)
         if not any(kp.iterdir()):
             kp.rmdir()
-        self.dirty = True
 
     # ---- save -----------------------------------------------------------
     def save(self) -> None:
@@ -464,20 +478,32 @@ class Project:
 
     def _load_shot_stars(self) -> None:
         """Apply shot stars from the write-through sidecar (authoritative when present).
-        When it's absent, migrate any legacy `starred` flags carried in the .animproj into
-        the sidecar so it becomes the source of truth going forward."""
+        When it's absent - or present but unreadable - migrate any legacy `starred` flags
+        carried in the .animproj into the sidecar (when there are any to save) so it becomes
+        the source of truth going forward. The unreadable case must migrate too, not bail:
+        _shot_to_dict strips `starred` from the .animproj, so leaving a corrupt sidecar in
+        place would let the next ordinary Save silently drop the legacy stars for good (the
+        in-memory flags are their only copy)."""
         sidecar = self._assets_dir / "shot_stars.json"
+        starred = None
         if sidecar.exists():
             try:
                 doc = json.loads(sidecar.read_text(encoding="utf-8"))
                 starred = set(doc.get("starred", []))
             except (OSError, ValueError):
-                return                              # unreadable -> leave the in-memory flags as
-                                                    # loaded (legacy .animproj stars, if any)
+                starred = None                      # present but unreadable -> fall through to
+                                                    # the migration branch below
+        if starred is not None:
             for shot in self._shots.values():
                 shot.starred = shot.id in starred
         elif any(s.starred for s in self._shots.values()):
-            self._write_shot_stars_file()           # legacy .animproj stars -> migrate
+            # Legacy .animproj stars OR an unreadable sidecar -> (re)materialize the sidecar
+            # from the in-memory flags. Best-effort: a write hiccup here must never stop the
+            # project from opening, so on failure the stars just stay live in memory for now.
+            try:
+                self._write_shot_stars_file()
+            except OSError:
+                pass
 
     def used_model_ids(self) -> list[str]:
         """Distinct model_ids across shots - powers the 'filter by model' dropdown."""

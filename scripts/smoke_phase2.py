@@ -9,6 +9,7 @@ pending -> generating -> done and the failure path.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -219,6 +220,43 @@ def test_comfy_prepare() -> None:
                    for n in wf3.values() for v in n.get("inputs", {}).values()), \
         "end-image node should have no consumers when no end frame is given"
 
+    # A single-LoadImage FLF template whose end image comes from a NON-LoadImage node:
+    # node 3 (WanFirstLastFrameToVideo) is fed end_image from node 2, and there is only
+    # one LoadImage (node 1, the start). With no declared end_image role an open-ended
+    # render can't pin the end node, so it must fail loudly rather than silently reuse the
+    # baked end conditioning (the old len(loads) > 1 gate left it connected).
+    flf_one_load = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "start.png"}},
+        "2": {"class_type": "ImageScale", "inputs": {"image": "start.png"}},
+        "3": {"class_type": "WanFirstLastFrameToVideo",
+              "inputs": {"start_image": ["1", 0], "end_image": ["2", 0]}},
+    }
+    try:
+        comfy_client.prepare_workflow(copy.deepcopy(flf_one_load), end_img=None)
+    except comfy_client.ComfyError:
+        pass
+    else:
+        raise AssertionError("single-LoadImage FLF + no role + no end frame must raise")
+
+    # Regression: a declared end_image role severs even when len(loads) == 1 — the role,
+    # not the LoadImage count, drives the disconnect.
+    wf_role = comfy_client.prepare_workflow(
+        copy.deepcopy(flf_one_load), end_img=None, node_roles={"end_image": "2"})
+    assert "end_image" not in wf_role["3"]["inputs"], \
+        "declared end_image role must sever the end conditioning with a single LoadImage"
+    assert wf_role["3"]["inputs"]["start_image"] == ["1", 0], "start link must survive"
+
+    # A genuine I2V template (single LoadImage, no end-image conditioning at all) must
+    # still no-op on a no-end-frame render — not raise. Guards against _has_end_image_-
+    # conditioning becoming over-broad and breaking the common open-ended path.
+    i2v_one_load = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "start.png"}},
+        "2": {"class_type": "WanImageToVideo", "inputs": {"start_image": ["1", 0]}},
+    }
+    wf_i2v = comfy_client.prepare_workflow(copy.deepcopy(i2v_one_load), end_img=None)
+    assert wf_i2v["2"]["inputs"]["start_image"] == ["1", 0], \
+        "genuine I2V template must be left intact when no end frame is given"
+
     # text_encoder_cpu pins CLIP-loader nodes to the CPU (frees ~6GB VRAM on the 12GB card);
     # default leaves the template's device untouched. Node 3 is the CLIPLoader.
     assert wf["3"]["inputs"]["device"] == "default", "default run must not force CPU"
@@ -229,7 +267,8 @@ def test_comfy_prepare() -> None:
     # _force_text_encoder_cpu only touches CLIP-loader class types, nothing else.
     assert comfy_client._force_text_encoder_cpu({"x": {"class_type": "KSamplerAdvanced",
                                                        "inputs": {}}}) == 0
-    print("comfy prepare_workflow OK: node-role map + heuristic fallback + --set + open-ended sever + cpu-text-enc")
+    print("comfy prepare_workflow OK: node-role map + heuristic fallback + --set + open-ended sever "
+          "(role-driven; single-load FLF raises; declared role severs at len(loads)==1) + cpu-text-enc")
 
 
 def test_dynamic_vram_gate() -> None:
@@ -373,6 +412,38 @@ def test_cost_summary() -> None:
     body2, total2, has_spend2 = build_summary([items[1]])
     assert total2 == 0.0 and has_spend2 is False
     print("cost_confirm build_summary OK: totals, spend flag, free-only")
+
+
+def test_launch_label() -> None:
+    from ui.cost_confirm import build_summary, launch_button_label
+
+    # All-unknown-cost batch: build_summary -> total=0, has_spend=True. The launch
+    # button must NOT read "free" (rule #1: the gate must not contradict its own
+    # "MAY spend money" header).
+    unknown_items = [
+        {"name": "a", "model_display": "Mystery v1", "est_cost": None, "params": {}},
+        {"name": "b", "model_display": "Mystery v2", "est_cost": None, "params": {}},
+    ]
+    _, total_u, has_spend_u = build_summary(unknown_items)
+    assert total_u == 0.0 and has_spend_u is True
+    label_u = launch_button_label(total_u, has_spend_u)
+    assert label_u != "Launch (spend ~free)"
+    assert label_u == "Launch (cost unknown)"
+
+    # No-spend (local $0) batch keeps "Launch (free)".
+    assert launch_button_label(0.0, False) == "Launch (free)"
+
+    # Known hosted cost keeps the dollar amount.
+    assert launch_button_label(2.0, True) == "Launch (spend ~$2.00)"
+
+    # Mixed known + unknown (total>0, has_spend) still shows the known total.
+    mixed_items = [
+        {"name": "a", "model_display": "Seedance", "est_cost": 0.72, "params": {}},
+        {"name": "b", "model_display": "Mystery", "est_cost": None, "params": {}},
+    ]
+    _, total_m, has_spend_m = build_summary(mixed_items)
+    assert launch_button_label(total_m, has_spend_m) == "Launch (spend ~$0.72)"
+    print("cost_confirm launch_button_label OK: unknown-not-free, free, known, mixed")
 
 
 def test_job_manager() -> None:
@@ -1726,6 +1797,27 @@ def test_restart_from_snapshot() -> None:
         # A non-cancelled selection has no Restart entry.
         project.update_take(good.id, status=STATUS_PENDING)
         assert not any("Restart" in a.text() for a in tv._build_context_menu([good.id]).actions())
+
+        # A crash-interrupted FAILED take (in-flight render lost to an app/ComfyUI death) ALSO offers
+        # a per-take Restart - mirroring the bulk action, which already picks it up (card #64).
+        project.update_take(failed_orphan.id, status=STATUS_FAILED, interrupted=True)  # bulk flipped it
+        restart_emits.clear()
+        fo_menu = tv._build_context_menu([failed_orphan.id])
+        assert any("Restart" in a.text() for a in fo_menu.actions()), [a.text() for a in fo_menu.actions()]
+        next(a for a in fo_menu.actions() if "Restart" in a.text()).trigger()
+        assert restart_emits == [[failed_orphan.id]], restart_emits
+        # ...but a deliberately-FAILED (non-interrupted) take does NOT - a plain render failure is
+        # not a restart candidate, only a crash-interrupted one is.
+        plain_failed = project.add_take(shot.id, status=STATUS_FAILED, interrupted=False,
+                                        settings_snapshot=snap)
+        assert not any("Restart" in a.text()
+                       for a in tv._build_context_menu([plain_failed.id]).actions())
+        # The by-ids handler enforces the same gate: it forwards the FAILED+interrupted take and a
+        # cancelled one to _restart_takes, but drops the deliberately-FAILED one.
+        forwarded = {}
+        win._restart_takes = lambda takes: forwarded.setdefault("ids", [t.id for t in takes])
+        win._restart_takes_by_ids([failed_orphan.id, plain_failed.id, user_cancelled.id])
+        assert forwarded["ids"] == [failed_orphan.id, user_cancelled.id], forwarded["ids"]
     finally:
         QMessageBox.information = orig_info
     print("restart from snapshot OK: in-place replay, unrestartable->failed, headless menu entry")
@@ -1946,6 +2038,7 @@ if __name__ == "__main__":
     test_stop_handler_nonbatch()
     test_total_price()
     test_cost_summary()
+    test_launch_label()
     test_cancel_pending()
     test_cancel_shot_takes()
     test_inflight_stop_maps_to_cancelled()

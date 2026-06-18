@@ -40,9 +40,18 @@ def video_info(video_path: str | Path) -> dict:
 def extract_frames(video_path: str | Path, out_dir: str | Path, prefix: str = "frame_") -> list[Path]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Zero-pad the frame index to a fixed width so a lexicographic sort (sprite-sheet
+    # assembly, frame-set reimport) always matches true frame order: a flat {i:03d} breaks
+    # once the count passes 999 (frame_1000 sorts before frame_999). Size the pad from the
+    # true decoded count via a counting pass rather than the container's declared
+    # stream.frames, which is often 0/None or an estimate (VFR, gif, streamed) — a wrong
+    # nonzero count would set the width too narrow and silently re-break the sort. The
+    # floor of 3 keeps the historic frame_000 look for short takes.
+    total = sum(1 for _ in iter_frames(video_path))
+    width = max(3, len(str(total - 1))) if total else 3
     paths = []
     for i, im in enumerate(iter_frames(video_path)):
-        p = out_dir / f"{prefix}{i:03d}.png"
+        p = out_dir / f"{prefix}{i:0{width}d}.png"
         im.save(p)
         paths.append(p)
     return paths
