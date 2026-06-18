@@ -658,6 +658,47 @@ def test_save_as_rollback_on_write_failure() -> None:
         "original assets untouched (copied, not moved)"
     assert not other_assets.exists(), "the half-made copy was cleaned up"
     assert not other.exists(), "no orphan .animproj for the copy path"
+
+    # --- (C) Save As OVER an occupied neighbour: a failed write must NOT wipe its assets ---
+    occupied = tmp / "D.animproj"
+    occ_assets = Project._assets_for(occupied)
+    occ_assets.mkdir(parents=True)
+    (occ_assets / "PRECIOUS.png").write_bytes(b"do not lose me")
+    occupied.write_text("{}", encoding="utf-8")        # a different project already lives here
+    p._write_project_file = boom
+    try:
+        p.save_as(occupied)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate the write failure (occupied target)")
+    assert p.path == target, "identity restored; not swapped onto the occupied target"
+    assert (occ_assets / "PRECIOUS.png").exists(), "neighbour's assets restored, not wiped"
+    assert occupied.read_text(encoding="utf-8") == "{}", "neighbour's .animproj untouched"
+    assert not list(occ_assets.parent.glob("D.assets.*.bak")), "move-aside backup cleaned up"
+    del p._write_project_file
+
+    # --- (a) partial failure: the .animproj write SUCCEEDS but takes.json fails. The orphan
+    #         .animproj at the fresh path must be removed and the moved scratch put back. ---
+    def boom_takes(*_a, **_k):
+        raise PermissionError("simulated lock on takes.json")
+    p2 = Project.new()
+    a2 = p2.import_asset(src)
+    p2.add_shot("punch", model_id="seedance-2.0-std", start_frame=str(a2))
+    scratch2 = p2._assets_dir
+    fresh = tmp / "E.animproj"
+    fresh_assets = Project._assets_for(fresh)
+    p2._write_takes_file = boom_takes                  # project file writes; takes file fails
+    try:
+        p2.save_as(fresh)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate a takes.json write failure")
+    assert p2.path is None and p2._assets_dir == scratch2, "identity rolled back after takes failure"
+    assert scratch2.exists() and (scratch2 / a2.name).exists(), "scratch moved back after takes failure"
+    assert not fresh.exists(), "the .animproj written before the takes failure was removed"
+    assert not fresh_assets.exists(), "no leftover assets dir at the fresh target"
     print("Project OK: save_as rolls back identity + assets on a failed document write")
 
 

@@ -182,8 +182,10 @@ Full mechanism + invariants in **Hard-won rule #13**.
   swaps identity (`path`/`name`/`_assets_dir`) and only commits once `save()` succeeds; if
   the write raises (e.g. `_atomic_write_json` exhausts its Windows AV/indexer retries) it
   rolls everything back — identity restored, remap reversed, the moved scratch moved back
-  (so untitled work is never lost), the copy/partial `.animproj` dropped — so a failed
-  Save-As leaves the project exactly as it was. Smoke-tested in
+  (so untitled work is never lost), the copy/partial `.animproj` dropped. A Save-As **over
+  an occupied target** moves that neighbour's existing `.assets` sidecar *aside* (not
+  `rmtree`) and restores it on failure, so a failed overwrite leaves both this project and
+  the neighbour exactly as they were. Smoke-tested in
   `smoke_phase5.test_save_as_rollback_on_write_failure`.
 - **Generate** saves the project first (untitled → Save As prompt) so a take never
   references an unsaved shot.
