@@ -340,6 +340,43 @@ def test_runner_self_cancel_during_submit() -> None:
     print("runner self-cancel OK: real on_submit cancels during create-POST window")
 
 
+def test_run_survives_deleted_signals() -> None:
+    """A worker that emits after its _JobSignals C++ object was deleted out from under it
+    (project / JobManager churn while a render is mid-flight) must NOT abort the process.
+    GenerationJob._emit guards every emit, so a deleted source degrades to a dropped signal
+    and run() still records the take terminally via write-through. Regression for the
+    RuntimeError('Signal source has been deleted') -> C++ std::terminate crash (card #48)."""
+    import shiboken6
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import GenerationJob, _JobSignals
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_PENDING,
+                            settings_snapshot={"backend": "replicate"})
+
+    signals = _JobSignals()
+    done = []
+
+    def runner(progress):
+        progress("rendering", frac=0.5, label="step")  # emits while the source is still alive
+        shiboken6.delete(signals)                      # tear down the C++ signals mid-render
+        assert not shiboken6.isValid(signals)
+        return {"video_path": "out.mp4"}
+
+    job = GenerationJob(project, take.id, "replicate", runner, signals,
+                        set(), set(), set(), lambda tid, st: done.append((tid, st)))
+    job.run()                                          # the DONE/finished emits hit a dead source
+
+    got = project.get_take(take.id)
+    assert got.status == STATUS_DONE, got.status       # take recorded despite dead signals
+    assert got.video_path == "out.mp4", got.video_path
+    assert done == [(take.id, STATUS_DONE)], done      # finally still ran done_cb
+    print("run survives deleted _JobSignals OK: emits no-op, take still recorded")
+
+
 if __name__ == "__main__":
     test_export()
     test_window_builds()
@@ -348,4 +385,5 @@ if __name__ == "__main__":
     test_snapshot_includes_framing()
     test_take_player_settings_panel()
     test_runner_self_cancel_during_submit()
+    test_run_survives_deleted_signals()
     print("PHASE 5 SMOKE: PASS")
