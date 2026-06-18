@@ -1352,7 +1352,9 @@ class MainWindow(QMainWindow):
         Used when the live active tab can't be represented (a pristine unsaved blank shot
         tab) so re-capturing the layout preserves the remembered active instead of nulling
         it. Returns None when that descriptor is no longer open - then active falls back to
-        the Shots tab on restore, the same as having no remembered active."""
+        the Shots tab on restore, the same as having no remembered active. `prior` is the
+        last *persisted* active (ui_state is only re-captured on save/close), not the live
+        focus, so closing the recorded-active tab before this fires also yields the fallback."""
         prior = self.project.ui_state or self._default_tab_state()
         tabs = prior.get("tabs") or []
         idx = prior.get("active")

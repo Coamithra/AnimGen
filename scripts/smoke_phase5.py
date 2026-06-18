@@ -377,6 +377,7 @@ def test_tab_state_blank_tab_preserves_active() -> None:
     from PySide6.QtWidgets import QApplication
 
     from ui.main_window import MainWindow
+    from ui.shot_tab import ShotTab
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
     path = Path(tempfile.mkdtemp()) / "blank.animproj"
@@ -397,7 +398,9 @@ def test_tab_state_blank_tab_preserves_active() -> None:
     w2 = MainWindow(Project.load(path))
     assert w2.tabs.currentWidget() is w2.assets_tab, "restored on Assets"
     w2.new_shot()
-    assert w2.tabs.currentWidget() not in w2.shot_tabs.values(), "blank tab is unregistered"
+    blank = w2.tabs.currentWidget()
+    assert isinstance(blank, ShotTab) and blank not in w2.shot_tabs.values(), \
+        "+ New Shot focuses a pristine, unregistered blank shot tab"
     assert not w2._has_unsaved_edits(), "a pristine blank tab is not an unsaved edit"
     state = w2._compute_tab_state()
     assert state["active"] is not None, "blank-tab focus must not null the active"
