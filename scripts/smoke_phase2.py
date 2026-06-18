@@ -1892,6 +1892,35 @@ def test_select_rows() -> None:
     print("select_rows OK: active-first, clear hides finished, active never hidden, recent cap")
 
 
+def test_queue_actions_in_queue_tab() -> None:
+    """The three generation-queue actions (Pause batch / Cancel pending / Restart interrupted
+    takes) render in the Queue tab header, not the Shots-tab control strip. The QActions are
+    still owned by MainWindow (so every _refresh_*_action site keeps driving them); QueueView
+    just shows them as QToolButtons whose defaultAction is the MainWindow-owned action."""
+    from PySide6.QtWidgets import QApplication, QToolBar, QToolButton
+
+    from ui.main_window import MainWindow
+
+    QApplication.instance() or QApplication([])
+    win = MainWindow(Project.new("Untitled"))
+    acts = [win.pause_act, win.cancel_act, win.restart_act]
+
+    # Each action is rendered as a QToolButton inside the Queue tab.
+    queue_btn_actions = {b.defaultAction() for b in win.queue_tab.findChildren(QToolButton)}
+    for act in acts:
+        assert act in queue_btn_actions, f"{act.text()!r} missing from the Queue tab header"
+
+    # ...and NOT present in any Shots-tab toolbar anymore.
+    shots_toolbar_actions = set()
+    for tb in win.shots_tab.findChildren(QToolBar):
+        shots_toolbar_actions.update(tb.actions())
+    for act in acts:
+        assert act not in shots_toolbar_actions, f"{act.text()!r} still in the Shots toolbar"
+
+    win.close()
+    print("queue_actions_in_queue_tab OK: pause/cancel/restart moved to Queue header")
+
+
 if __name__ == "__main__":
     test_build_input()
     test_capability_sync()
@@ -1929,6 +1958,7 @@ if __name__ == "__main__":
     test_progress_pct()
     test_done_elapsed()
     test_select_rows()
+    test_queue_actions_in_queue_tab()
     test_batch()
     test_batch_finalize()
     test_restart_plan()

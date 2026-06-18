@@ -140,25 +140,6 @@ class MainWindow(QMainWindow):
                              "with optional power-down when it finishes")
         batch_act.triggered.connect(self.start_batch)
         tb.addAction(batch_act)
-        self.pause_act = QAction("Pause batch", self)
-        self.pause_act.setToolTip("Pause the running batch: hold its queued local takes "
-                                  "(and optionally halt the current one), then Resume later")
-        self.pause_act.triggered.connect(self.toggle_pause_batch)
-        self.pause_act.setEnabled(False)
-        tb.addAction(self.pause_act)
-        self.cancel_act = QAction("Cancel pending", self)
-        self.cancel_act.setToolTip("Cancel all queued generations that haven't started yet")
-        self.cancel_act.triggered.connect(self.cancel_pending)
-        self.cancel_act.setEnabled(False)
-        tb.addAction(self.cancel_act)
-        self.restart_act = QAction("Restart interrupted takes", self)
-        self.restart_act.setToolTip("Re-run takes that were cancelled by a crash or by ComfyUI/the "
-                                    "app dying (not ones you cancelled yourself), from their frozen "
-                                    "settings (same seed + framing). Takes that can't be replayed "
-                                    "exactly are marked failed with a reason")
-        self.restart_act.triggered.connect(self.restart_cancelled_takes)
-        self.restart_act.setEnabled(False)
-        tb.addAction(self.restart_act)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -237,7 +218,30 @@ class MainWindow(QMainWindow):
             self._log(f"Remote control failed to start: {exc}")
             self._remote = None
 
+    def _build_queue_actions(self) -> None:
+        """The three generation-queue actions — Pause/Resume batch, Cancel pending, Restart
+        interrupted takes. They live (visually) in the Queue tab header, but the QActions are
+        owned by MainWindow so the many _refresh_*_action call sites keep driving their
+        enabled/text state; QueueView just renders them as buttons."""
+        self.pause_act = QAction("Pause batch", self)
+        self.pause_act.setToolTip("Pause the running batch: hold its queued local takes "
+                                  "(and optionally halt the current one), then Resume later")
+        self.pause_act.triggered.connect(self.toggle_pause_batch)
+        self.pause_act.setEnabled(False)
+        self.cancel_act = QAction("Cancel pending", self)
+        self.cancel_act.setToolTip("Cancel all queued generations that haven't started yet")
+        self.cancel_act.triggered.connect(self.cancel_pending)
+        self.cancel_act.setEnabled(False)
+        self.restart_act = QAction("Restart interrupted takes", self)
+        self.restart_act.setToolTip("Re-run takes that were cancelled by a crash or by ComfyUI/the "
+                                    "app dying (not ones you cancelled yourself), from their frozen "
+                                    "settings (same seed + framing). Takes that can't be replayed "
+                                    "exactly are marked failed with a reason")
+        self.restart_act.triggered.connect(self.restart_cancelled_takes)
+        self.restart_act.setEnabled(False)
+
     def _build_body(self) -> None:
+        self._build_queue_actions()   # created before QueueView, which renders them
         self.cards_container = QWidget()
         self.cards_layout = QVBoxLayout(self.cards_container)
         self.cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -255,7 +259,8 @@ class MainWindow(QMainWindow):
         # Model Library and ComfyUI Status used to be separate top-level windows; they're
         # now tabs alongside the shots view. The monitor only polls while its tab is on
         # screen (see _on_tab_changed) to avoid hammering a down port in the background.
-        self.queue_tab = QueueView(self.project, self.jobs)
+        self.queue_tab = QueueView(self.project, self.jobs,
+                                   queue_actions=[self.pause_act, self.cancel_act, self.restart_act])
         self.assets_tab = AssetsView(self.project)
         self.library_tab = ModelLibraryWindow(self)
         self.comfy_tab = ComfyMonitorWindow(self)
