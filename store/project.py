@@ -260,21 +260,54 @@ class Project:
             path = path.with_suffix(".animproj")
         new_assets = self._assets_for(path)
         with self._lock:
-            old_assets = self._assets_dir
-            if old_assets.exists() and old_assets.resolve() != new_assets.resolve():
-                if new_assets.exists():
-                    shutil.rmtree(new_assets)
-                # untitled (scratch) -> move; already-saved -> copy (keep the original)
-                if self.is_untitled:
-                    new_assets.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(old_assets), str(new_assets))
-                else:
-                    shutil.copytree(old_assets, new_assets)
-            self._remap_paths(old_assets, new_assets)
-            self._assets_dir = new_assets
-            self.path = path
-            self.name = path.stem
-        self.save()
+            old_assets, old_path, old_name = self._assets_dir, self.path, self.name
+            new_path_existed = path.exists()
+            moved = copied = remapped = False
+            displaced = None     # a pre-existing target sidecar, moved aside (not destroyed)
+            # The identity swap + asset move must NOT outlive a failed document write: if
+            # save() raises (e.g. _atomic_write_json exhausts its AV/indexer retries on
+            # Windows), the in-memory project would otherwise claim the new identity with no
+            # file on disk and, for an untitled project, its scratch already moved away
+            # (gone, not copied) -> unrecoverable. So do everything inside a try and fully
+            # roll back on any failure, leaving both this project and any clobbered neighbour
+            # exactly as they were.
+            try:
+                if old_assets.exists() and old_assets.resolve() != new_assets.resolve():
+                    if new_assets.exists():
+                        # move the target's existing sidecar aside so a rollback can restore
+                        # it; this also leaves a fresh dest for move/copytree below.
+                        displaced = new_assets.with_name(f"{new_assets.name}.{new_id()}.bak")
+                        shutil.move(str(new_assets), str(displaced))
+                    # untitled (scratch) -> move; already-saved -> copy (keep the original)
+                    if self.is_untitled:
+                        new_assets.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(old_assets), str(new_assets))
+                        moved = True
+                    else:
+                        shutil.copytree(old_assets, new_assets)
+                        copied = True
+                self._remap_paths(old_assets, new_assets)
+                remapped = True
+                self._assets_dir = new_assets
+                self.path = path
+                self.name = path.stem
+                self.save()
+            except Exception:
+                self.path, self.name, self._assets_dir = old_path, old_name, old_assets
+                if remapped:
+                    self._remap_paths(new_assets, old_assets)        # reverse the path remap
+                if moved:
+                    shutil.move(str(new_assets), str(old_assets))    # restore the scratch
+                elif copied:
+                    shutil.rmtree(new_assets, ignore_errors=True)    # drop the copy
+                if displaced is not None:
+                    shutil.rmtree(new_assets, ignore_errors=True)    # ensure dest is clear
+                    shutil.move(str(displaced), str(new_assets))     # restore the clobbered sidecar
+                if not new_path_existed:
+                    path.unlink(missing_ok=True)                     # drop a partial .animproj
+                raise
+            if displaced is not None:
+                shutil.rmtree(displaced, ignore_errors=True)         # committed: drop the old sidecar
 
     def _remap_paths(self, old_assets: Path, new_assets: Path) -> None:
         """Rewrite in-memory absolute paths that lived under old_assets to new_assets."""

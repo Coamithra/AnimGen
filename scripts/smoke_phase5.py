@@ -715,6 +715,111 @@ def test_run_survives_deleted_signals() -> None:
     print("run survives deleted _JobSignals OK: emits no-op, take recorded, slot freed on early fail")
 
 
+def test_save_as_rollback_on_write_failure() -> None:
+    """A save_as whose document write raises must leave the project exactly as it was:
+    identity (path/name/_assets_dir) unchanged, the in-memory path remap reversed, and the
+    source assets still on disk -- no half-swapped identity, no lost scratch. Covers the
+    untitled path (scratch is MOVED) and the already-saved path (assets are COPIED), and
+    confirms the rolled-back project is still healthy enough to save once the write recovers."""
+    tmp = Path(tempfile.mkdtemp())
+    src = tmp / "kf.png"
+    src.write_bytes(b"\x89PNG\r\n\x1a\n fake keyframe")
+
+    def boom(*_a, **_k):
+        raise PermissionError("simulated AV/indexer lock on the .animproj")
+
+    # --- (A) untitled -> Save As: scratch is MOVED, so a failed write must move it back ---
+    p = Project.new()
+    asset = p.import_asset(src)
+    shot = p.add_shot("kick", model_id="seedance-2.0-std", start_frame=str(asset))
+    old_assets, old_name = p._assets_dir, p.name
+    assert old_assets.exists() and asset.exists(), "scratch + imported asset present pre-save"
+
+    target = tmp / "B.animproj"
+    new_assets = Project._assets_for(target)
+    p._write_project_file = boom                       # the document write fails
+    try:
+        p.save_as(target)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate the write failure")
+
+    assert p.path is None, "identity not swapped: still untitled"
+    assert p.name == old_name and p._assets_dir == old_assets, "name + _assets_dir restored"
+    assert old_assets.exists() and asset.exists(), "scratch + asset preserved (not lost to the move)"
+    assert not new_assets.exists(), "the moved scratch was moved back (no B.assets left behind)"
+    assert not target.exists(), "no orphan .animproj written"
+    assert p._shots[shot.id].start_frame == str(asset), "in-memory path remap was reversed"
+
+    # The rolled-back project is still healthy: clearing the fault lets save_as succeed.
+    del p._write_project_file
+    p.save_as(target)
+    assert p.path == target and target.exists(), "real save swaps identity + writes the doc"
+    assert (new_assets / asset.name).exists(), "scratch moved on the successful save"
+    assert not old_assets.exists(), "scratch consumed by the successful move"
+
+    # --- (B) already-saved -> Save As elsewhere: assets are COPIED, original must survive ---
+    saved_assets = p._assets_dir                       # the B.assets from the real save above
+    other = tmp / "C.animproj"
+    other_assets = Project._assets_for(other)
+    p._write_project_file = boom
+    try:
+        p.save_as(other)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate the write failure (copy path)")
+
+    assert p.path == target, "identity restored to the original saved path"
+    assert saved_assets.exists() and (saved_assets / asset.name).exists(), \
+        "original assets untouched (copied, not moved)"
+    assert not other_assets.exists(), "the half-made copy was cleaned up"
+    assert not other.exists(), "no orphan .animproj for the copy path"
+
+    # --- (C) Save As OVER an occupied neighbour: a failed write must NOT wipe its assets ---
+    occupied = tmp / "D.animproj"
+    occ_assets = Project._assets_for(occupied)
+    occ_assets.mkdir(parents=True)
+    (occ_assets / "PRECIOUS.png").write_bytes(b"do not lose me")
+    occupied.write_text("{}", encoding="utf-8")        # a different project already lives here
+    p._write_project_file = boom
+    try:
+        p.save_as(occupied)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate the write failure (occupied target)")
+    assert p.path == target, "identity restored; not swapped onto the occupied target"
+    assert (occ_assets / "PRECIOUS.png").exists(), "neighbour's assets restored, not wiped"
+    assert occupied.read_text(encoding="utf-8") == "{}", "neighbour's .animproj untouched"
+    assert not list(occ_assets.parent.glob("D.assets.*.bak")), "move-aside backup cleaned up"
+    del p._write_project_file
+
+    # --- (a) partial failure: the .animproj write SUCCEEDS but takes.json fails. The orphan
+    #         .animproj at the fresh path must be removed and the moved scratch put back. ---
+    def boom_takes(*_a, **_k):
+        raise PermissionError("simulated lock on takes.json")
+    p2 = Project.new()
+    a2 = p2.import_asset(src)
+    p2.add_shot("punch", model_id="seedance-2.0-std", start_frame=str(a2))
+    scratch2 = p2._assets_dir
+    fresh = tmp / "E.animproj"
+    fresh_assets = Project._assets_for(fresh)
+    p2._write_takes_file = boom_takes                  # project file writes; takes file fails
+    try:
+        p2.save_as(fresh)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate a takes.json write failure")
+    assert p2.path is None and p2._assets_dir == scratch2, "identity rolled back after takes failure"
+    assert scratch2.exists() and (scratch2 / a2.name).exists(), "scratch moved back after takes failure"
+    assert not fresh.exists(), "the .animproj written before the takes failure was removed"
+    assert not fresh_assets.exists(), "no leftover assets dir at the fresh target"
+    print("Project OK: save_as rolls back identity + assets on a failed document write")
+
+
 if __name__ == "__main__":
     test_export()
     test_extract_frames_wide_padding()
@@ -730,4 +835,5 @@ if __name__ == "__main__":
     test_take_player_settings_panel()
     test_runner_self_cancel_during_submit()
     test_run_survives_deleted_signals()
+    test_save_as_rollback_on_write_failure()
     print("PHASE 5 SMOKE: PASS")
