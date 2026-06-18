@@ -269,6 +269,27 @@ def cancel_prediction(pred_id: str, token: Optional[str] = None) -> None:
     api_request(token or load_token(), f"{API}/predictions/{pred_id}/cancel", method="POST")
 
 
+def _output_video_url(output) -> str:
+    """Resolve a succeeded prediction's `output` to a video URL, raising ReplicateError
+    (quoting the raw output) when it carries no recognizable URL. A list whose first
+    element is neither a str nor a dict (e.g. ``[None]``, ``[[...]]``, ``[42]``) yields
+    no URL and falls through to the ReplicateError rather than an AttributeError."""
+    url = None
+    if isinstance(output, str):
+        url = output
+    elif isinstance(output, list) and output:
+        first = output[0]
+        if isinstance(first, str):
+            url = first
+        elif isinstance(first, dict):
+            url = first.get("url")
+    elif isinstance(output, dict):
+        url = output.get("url") or output.get("video")
+    if not url:
+        raise ReplicateError(f"No video URL in output: {json.dumps(output)[:500]}")
+    return url
+
+
 def run_prediction(token: str, replicate_model_id: str, inp: dict, out_path: Path,
                    progress_cb: ProgressCb = None, poll_s: int = 10,
                    timeout_s: int = 1800,
@@ -293,16 +314,7 @@ def run_prediction(token: str, replicate_model_id: str, inp: dict, out_path: Pat
         raise ReplicateError(f"Prediction {status}: {resp.get('error')}\n"
                              f"{(resp.get('logs') or '')[-800:]}")
 
-    output = resp.get("output")
-    url = None
-    if isinstance(output, str):
-        url = output
-    elif isinstance(output, list) and output:
-        url = output[0] if isinstance(output[0], str) else output[0].get("url")
-    elif isinstance(output, dict):
-        url = output.get("url") or output.get("video")
-    if not url:
-        raise ReplicateError(f"No video URL in output: {json.dumps(output)[:500]}")
+    url = _output_video_url(resp.get("output"))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _log(progress_cb, "downloading result")
