@@ -204,8 +204,16 @@ class Project:
     def _migrate_flatten_keyposes(self) -> None:
         """Old projects baked per-shot keyposes into .assets/keyposes/<shot_id>/. Re-point
         such shots to an imported copy of their original source (framing params already
-        match the source, so gen-time framing stays correct), then drop the keyposes tree.
-        Best-effort + idempotent: shots already flat, or whose source is gone, are skipped."""
+        match the source, so gen-time framing stays correct), persist the re-point, then drop
+        the keyposes tree. Best-effort + idempotent: shots already flat, or whose source is
+        gone, are skipped.
+
+        The re-point is persisted to disk BEFORE the sources are deleted. Marking dirty alone
+        is unsafe: the destructive deletion would then happen while the only record of the
+        re-point lives in memory, so a Discard at the next save-prompt would revert the
+        re-point yet leave the sources already gone -- permanently stranding the shot's
+        keyframes. Writing now makes the re-point durable and leaves the freshly-loaded
+        project clean (no phantom '*' priming a misleading save-prompt)."""
         kp = self._assets_dir / "keyposes"
         if not kp.exists():
             return
@@ -222,6 +230,11 @@ class Project:
                     changed = True
         if not changed:
             return
+        try:
+            self._write_project_file()            # make the re-point durable before deleting
+        except OSError:
+            self.dirty = True                     # couldn't persist; keep sources, let Save retry
+            return
         referenced = {Path(getattr(s, f)).resolve()
                       for s in self._shots.values() for f in _SHOT_PATHS if getattr(s, f)}
         for sub in list(kp.iterdir()):
@@ -229,7 +242,6 @@ class Project:
                 shutil.rmtree(sub, ignore_errors=True)
         if not any(kp.iterdir()):
             kp.rmdir()
-        self.dirty = True
 
     # ---- save -----------------------------------------------------------
     def save(self) -> None:
