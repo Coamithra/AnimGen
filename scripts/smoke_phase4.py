@@ -542,6 +542,92 @@ def test_takes_view_incremental_update() -> None:
     print("TakesView incremental OK: in-place tile update, icon cache, membership fallback")
 
 
+def test_queue_view() -> None:
+    """The Queue tab is a model + delegate with ZERO per-row widgets (rule #18 root cause):
+    the child-widget count stays bounded no matter how deep the pending queue is, a progress
+    tick repaints just one row's Progress cell, and a burst of status signals (the mass-cancel
+    storm that overflowed paintSiblingsRecursive) coalesces to a single rebuild - not one per
+    signal."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QProgressBar, QPushButton, QWidget
+
+    from backends.jobs import JobManager
+    from store.models import STATUS_CANCELLED, STATUS_GENERATING, STATUS_PENDING
+    from ui.queue_view import QueueView, _BAR_LABEL_ROLE, _BAR_ROLE, _PROGRESS_COL
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    jobs = JobManager(project)
+
+    def add(status, backend="replicate", model_id="seedance-2.0-std"):
+        return project.add_take(shot.id, status=status,
+                                settings_snapshot={"model_id": model_id, "backend": backend})
+
+    # Shallow queue first, to baseline the child-widget count.
+    for _ in range(3):
+        add(STATUS_PENDING)
+    qv = QueueView(project, jobs)
+    qv.refresh()
+    assert qv.findChildren(QProgressBar) == []                 # no per-row progress bars
+    assert qv.table.findChildren(QPushButton) == []            # no per-row Cancel buttons
+    shallow_children = len(qv.findChildren(QWidget))
+
+    # (a) Widget count does NOT scale with pending depth: add 200 more pending takes.
+    for _ in range(200):
+        add(STATUS_PENDING)
+    qv.refresh()
+    assert qv.model.rowCount() == 203                           # all active shown (never capped)
+    assert qv.findChildren(QProgressBar) == []
+    assert len(qv.findChildren(QWidget)) == shallow_children, "child count must stay bounded"
+
+    # (b) A progress tick on a still-rendering local take touches exactly one row's Progress cell.
+    g = add(STATUS_GENERATING, backend="comfyui", model_id="local-flf-wan14b")
+    qv.refresh()
+    # before any tick a local generating take already shows a determinate 0% bar (not text).
+    g_idx = qv.model.index(next(i for i, t in enumerate(qv.model.rows()) if t.id == g.id),
+                           _PROGRESS_COL)
+    assert qv.model.data(g_idx, _BAR_ROLE) == 0 and qv.model.data(g_idx, _BAR_LABEL_ROLE) == "0%"
+    touched: list = []
+    qv.model.dataChanged.connect(
+        lambda tl, br, *_: touched.append((tl.row(), tl.column(), br.row(), br.column())))
+    jobs.progress_pct.emit(g.id, 0.5, "step 1/2")
+    assert len(touched) == 1, touched
+    row, col, br_row, br_col = touched[0]
+    assert (row, col) == (br_row, br_col) == (row, _PROGRESS_COL)   # one cell, one row
+    # the model now feeds the delegate a determinate 50% bar + the WS step label for that take
+    assert qv.model.data(qv.model.index(row, _PROGRESS_COL), _BAR_ROLE) == 50
+    assert qv.model.data(qv.model.index(row, _PROGRESS_COL), _BAR_LABEL_ROLE) == "step 1/2"
+    # a hosted/queued take is plain text, no bar
+    pend_row = next(i for i, t in enumerate(qv.model.rows()) if t.status == STATUS_PENDING)
+    assert qv.model.data(qv.model.index(pend_row, _PROGRESS_COL), _BAR_ROLE) is None
+    assert qv.model.data(qv.model.index(pend_row, _PROGRESS_COL),
+                         Qt.ItemDataRole.DisplayRole) == "queued"
+
+    # (c) Coalescing: emitting status_changed per take (like cancel_pending / abandon_local)
+    #     arms the timer once; the actual rebuild fires a SINGLE time on the next loop turn.
+    before = qv._rebuild_count
+    for t in project.list_takes():
+        jobs.status_changed.emit(t.id, STATUS_CANCELLED)
+    assert qv._rebuild_count == before                         # nothing rebuilt yet - just armed
+    app.processEvents()                                        # fire the coalescing timer
+    assert qv._rebuild_count == before + 1, qv._rebuild_count  # one rebuild, not 204
+
+    # (d) The queued-take right-click menu (no exec()) only offers Cancel for PENDING takes.
+    pending_id = next(t.id for t in qv.model.rows() if t.status == STATUS_PENDING)
+    menu = qv._build_context_menu([pending_id])
+    assert [a.text() for a in menu.actions()] == ["Cancel queued generation"]
+    assert qv._build_context_menu([g.id]).actions() == []      # a generating take: nothing to cancel
+
+    # (e) Force a real paint so _ProgressDelegate.paint actually runs (the determinate-bar
+    #     branch for the local take + the plain-text branch for the rest) - the model-role
+    #     asserts above don't exercise the paint path.
+    qv.resize(900, 360)
+    assert not qv.grab().isNull()
+    print("QueueView OK: zero per-row widgets, bounded child count, 1-row progress, coalesced rebuild, cancel menu, paint")
+
+
 if __name__ == "__main__":
     test_bin_restore()
     test_takes_view()
@@ -555,4 +641,5 @@ if __name__ == "__main__":
     test_runner_uses_snapshot_not_live_shot()
     test_snapshot_detached_from_live_shot_at_creation()
     test_param_enum_preserves_out_of_schema_value()
+    test_queue_view()
     print("PHASE 4 SMOKE: PASS")
