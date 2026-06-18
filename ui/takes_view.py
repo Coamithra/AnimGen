@@ -233,7 +233,9 @@ class TakesView(QWidget):
         self.jobs = jobs
         self._latest_pct: dict[str, float] = {}       # take_id -> live render fraction 0..1
         self._items: dict[str, QStandardItem] = {}    # take_id -> grid item (for live frames)
+        self._icon_cache: dict[str, tuple] = {}       # take_id -> (signature, QIcon); skip disk re-decode
         self._strips: dict[str, list] = {}            # take_id -> list[QPixmap] (decoded loop)
+        self._strip_pending: set[str] = set()         # take_ids with an in-flight single-take strip decode
         self._frame_idx: dict[str, int] = {}          # take_id -> current frame in its strip
         self._animating = True
         self._anim_gen = 0                            # bumped on each (re)load to drop stale strips
@@ -299,8 +301,9 @@ class TakesView(QWidget):
     def load(self) -> None:
         fav = self.filter.currentText() == "Favorites"
         takes = self.project.list_takes(self.shot_id, starred_only=fav)
-        live = {t.id for t in takes}                  # drop cached pcts for evicted takes
+        live = {t.id for t in takes}                  # drop cached pcts/icons for evicted takes
         self._latest_pct = {k: v for k, v in self._latest_pct.items() if k in live}
+        self._icon_cache = {k: v for k, v in self._icon_cache.items() if k in live}
         self._reset_anim()
         self.model.clear()
         self._items.clear()
@@ -316,6 +319,36 @@ class TakesView(QWidget):
         if self._animating:
             self._start_strip_load(takes)
 
+    def update_take(self, take_id: str) -> None:
+        """Refresh a single take's tile in place on a status signal - the cheap sibling of the
+        full model.clear()+reload load() does. A plain status transition keeps the same rows, so
+        the common per-signal path (including the status_changed+finished double-fire on
+        completion, and every take's transitions during a batch) updates just one item's
+        badge/%/star/thumbnail instead of recreating N items and re-decoding N thumbnails+strips
+        (card #75). Falls back to load() only when the take's membership in the current view
+        actually changed: a newly-visible take, a deletion, or a filter boundary crossed."""
+        fav = self.filter.currentText() == "Favorites"
+        t = self.project.get_take(take_id)
+        should_show = bool(t and (not fav or t.starred))
+        item = self._items.get(take_id)
+        if item is None:
+            if should_show:
+                self.load()       # queued / now-matching take not yet in the grid
+            return                # correctly absent - nothing to update
+        if not should_show:
+            self.load()           # take deleted or no longer matches the filter
+            return
+        item.setText(self._label(t))
+        item.setData(bool(t.starred), _STAR_ROLE)
+        if take_id not in self._strips and take_id not in self._strip_pending:
+            # Not animating yet: refresh the static thumbnail, and if the take just became
+            # playable (e.g. it finished rendering) kick off a single-take strip decode so it
+            # starts looping - without re-decoding every other take's strip the way load() would.
+            item.setIcon(self._icon_for(t))
+            if self._animating and take_source(t):
+                self._strip_pending.add(take_id)
+                self._start_strip_load([t])
+
     # ---- animated previews (decoded frame loop over the static thumbnails) ----
     # The grid tiles animate by cycling a small decoded frame strip per take. This goes
     # through PyAV (decode_strip) rather than QMovie so it animates the real .mp4 renders -
@@ -327,6 +360,7 @@ class TakesView(QWidget):
         self._anim_timer.stop()
         self._strips.clear()
         self._frame_idx.clear()
+        self._strip_pending.clear()
         self._loader = None
 
     def _start_strip_load(self, takes) -> None:
@@ -342,6 +376,7 @@ class TakesView(QWidget):
         self._loader.start()
 
     def _on_strip_ready(self, take_id: str, qimages: list, gen: int) -> None:
+        self._strip_pending.discard(take_id)
         if gen != self._anim_gen or take_id not in self._items:
             return                                          # superseded by a newer load
         self._strips[take_id] = [QPixmap.fromImage(im) for im in qimages]
@@ -414,6 +449,32 @@ class TakesView(QWidget):
         item.setText(self._label(t))
 
     def _icon_for(self, t) -> QIcon:
+        """The take's static tile icon, cached per take by a content signature (thumbnail path +
+        mtime, else status placeholder) so a repeated load() / status update doesn't re-decode
+        the same image off disk each time (card #75). The animation strip, once decoded, paints
+        over this; the cache only covers the static fill and non-animating tiles."""
+        key = self._icon_cache_key(t)
+        cached = self._icon_cache.get(t.id)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        icon = self._build_icon(t)
+        self._icon_cache[t.id] = (key, icon)
+        return icon
+
+    def _icon_cache_key(self, t) -> tuple:
+        """What `_icon_for`'s result depends on: the thumbnail file (path + mtime) if present,
+        else the source video path, else the status placeholder. A change here invalidates the
+        cached QIcon."""
+        if t.thumbnail and Path(t.thumbnail).exists():
+            try:
+                return ("thumb", t.thumbnail, Path(t.thumbnail).stat().st_mtime_ns)
+            except OSError:
+                return ("thumb", t.thumbnail, None)
+        if t.video_path and Path(t.video_path).exists():
+            return ("video", t.video_path)
+        return ("placeholder", t.status)
+
+    def _build_icon(self, t) -> QIcon:
         if t.thumbnail and Path(t.thumbnail).exists():
             return QIcon(t.thumbnail)
         if t.video_path and Path(t.video_path).exists():

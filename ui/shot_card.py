@@ -203,6 +203,14 @@ class ShotCard(QFrame):
             self.takes_view.load()
         self.refresh_counts()
 
+    def update_take(self, take_id: str) -> None:
+        """Incremental sibling of refresh_takes for a single take's status signal: refresh the
+        header badge (cheap) and update just that take's tile in the grid, instead of a full
+        model rebuild + every-thumbnail reload (card #75)."""
+        if self.takes_view is not None:
+            self.takes_view.update_take(take_id)
+        self.refresh_counts()
+
     def _row_export_ids(self) -> list:
         """Take ids to export for this row: what the takes view currently shows
         (obeying its favorite/all filter), or all takes if not yet expanded."""
