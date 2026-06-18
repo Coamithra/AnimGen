@@ -349,9 +349,11 @@ Full mechanism + invariants in **Hard-won rule #13**.
     so a legitimately-broken GPU can't trigger a restart loop, but a recoverable one isn't condemned
     on count alone. If the final restart brings ComfyUI back, the render error is **re-raised so only
     *this* take fails** and the rest of the local queue keeps rendering. (That recovered-but-failed
-    take currently records `FAILED` with `interrupted=False`, so the bulk *Restart interrupted takes*
-    action doesn't yet pick it up even though it was crash-killed — flagging it `interrupted` is a
-    tracked follow-up, since it'd touch the worker's terminal-write path.) The retry/abandon notes
+    take is recorded `FAILED` with **`interrupted=True`** so the bulk *Restart interrupted takes*
+    action picks it up like its `abandon_local`'d siblings — card #68: `crash_recovery` stamps the
+    re-raised render error with `CRASH_INTERRUPTED_ATTR` and the worker's else branch reads it via
+    `getattr`, distinguishing a crash-killed take from a genuine workflow error, which stays
+    `interrupted=False`; the original error message is kept verbatim.) The retry/abandon notes
     ("failed in XmYs, retrying (attempt n/3)", "attempting a final restart…", "recovered after a
     final restart…") flow through the normal `progress(line)` path, so they show on the take in the
     Queue tab and the main log.
@@ -466,10 +468,14 @@ Full mechanism + invariants in **Hard-won rule #13**.
     crash damage — takes the user *deliberately* cancelled, and genuine render *failures*, vs takes
     a crash / ComfyUI-or-app *death* cut short: orphan recovery's CANCEL (a queued take never
     submitted) **and its FAIL** (an in-flight render lost to the restart — `generating`→FAILED when
-    ComfyUI is unreachable, card from PR #52), plus the 3-strike `abandon_local`. The
+    ComfyUI is unreachable, card from PR #52), the 3-strike `abandon_local`, **and a take whose
+    in-flight render was lost to a GPU TDR that crash recovery recovered from on the final restart
+    (card #68 — re-raised FAILED, stamped `CRASH_INTERRUPTED_ATTR`, read in `jobs.py`'s else
+    branch)**. The
     `interrupted: bool` field on `Take` records the difference: the **crash/death paths set it
-    True** (both recovery CANCEL and FAIL, abandon_local), every **manual cancel AND every genuine
-    render failure set it False** — set explicitly at each terminal site, so a take crash-cancelled
+    True** (both recovery CANCEL and FAIL, abandon_local, recovered-crash FAIL), every **manual
+    cancel AND every genuine render failure set it False** — set explicitly at each terminal site,
+    so a take crash-cancelled
     → restarted → user-cancelled (or genuinely failed) doesn't keep a stale True; `_restart_in_place`
     clears it too, and marking a take unrestartable-FAILED clears it (drops it from the set so it
     isn't retried forever). The **bulk** "Restart interrupted takes" re-runs every take with

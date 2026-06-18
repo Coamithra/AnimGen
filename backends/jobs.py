@@ -17,6 +17,7 @@ from typing import Callable
 import shiboken6
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
+from backends.crash_recovery import CRASH_INTERRUPTED_ATTR
 from store.project import Project
 from store.models import (
     STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
@@ -154,7 +155,13 @@ class GenerationJob(QRunnable):
                 self._emit("status_changed", tid, STATUS_CANCELLED)
                 final = STATUS_CANCELLED
             else:
-                self.project.update_take(tid, status=STATUS_FAILED, error=err, interrupted=False)
+                # A genuine workflow error is interrupted=False, but crash recovery re-raises the
+                # original render error (verbatim) after a successful final restart - the GPU
+                # recovered yet this take's in-flight render was lost. It stamps the exception so
+                # this take is flagged interrupted, letting the bulk "Restart interrupted takes"
+                # action pick it up like its abandon_local'd siblings (rule #17, card #68).
+                interrupted = bool(getattr(e, CRASH_INTERRUPTED_ATTR, False))
+                self.project.update_take(tid, status=STATUS_FAILED, error=err, interrupted=interrupted)
                 self.project.update_job(job.id, state="failed", log="\n".join(log_lines + [err]))
                 self._emit("status_changed", tid, STATUS_FAILED)
                 self._emit("failed", tid, err)

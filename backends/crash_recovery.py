@@ -28,6 +28,14 @@ from typing import Callable
 MAX_ATTEMPTS = 3   # total tries per take before the whole local queue is abandoned
 CRASH_PROBES = 3   # times to reconfirm "server down" before treating a failure as a crash
 
+# Stamped on the render exception re-raised after a SUCCESSFUL final restart (the GPU recovered,
+# but this take's in-flight render was already lost to the crash). The worker
+# (backends.jobs.GenerationJob) reads it via getattr to record the take FAILED + interrupted=True,
+# so the bulk "Restart interrupted takes" action picks it up alongside its abandon_local'd siblings
+# - it WAS crash-killed, not a genuine workflow error (rule #17, card #68). An attribute (vs a
+# wrapper exception) keeps the original error message verbatim.
+CRASH_INTERRUPTED_ATTR = "animgen_crash_interrupted"
+
 
 class QueueAbandoned(RuntimeError):
     """A take crashed MAX_ATTEMPTS times (or the server couldn't be restarted); the caller
@@ -141,6 +149,10 @@ def run_with_crash_recovery(
                     raise QueueAbandoned(reason) from exc
                 note("ComfyUI recovered after a final restart; failing this take but "
                      "keeping the local queue running.")
+                try:
+                    setattr(exc, CRASH_INTERRUPTED_ATTR, True)  # crash-killed -> bulk-restartable
+                except Exception:  # noqa: BLE001 - an exotic exception type may reject attrs
+                    pass
                 raise
             note(f"comfy crashed - failed in {elapsed}, retrying "
                  f"(attempt {attempt + 1}/{max_attempts})")
