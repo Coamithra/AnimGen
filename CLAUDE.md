@@ -346,9 +346,12 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     and `/history` (not the last WS message) stays the authoritative *done* signal, because
     a documented `progress_state` tail keeps arriving ~20–30s after completion. Requires
     `websocket-client` (in `requirements.txt`). **Hosted (Replicate) exposes no native
-    %** — progress lives only as free text in `logs` — so the Queue tab shows an
-    indeterminate *busy* bar labelled with the elapsed-time line `run_prediction` already
-    emits, rather than a percentage.
+    %** — progress lives only as free text in `logs` — so the Queue tab shows the
+    elapsed-time line `run_prediction` already emits as **plain text**, not a percentage.
+    (Card #72: the Queue's Progress column is now delegate-painted and draws a determinate
+    bar ONLY on a still-rendering *local* take; a hosted running take, a queued take and a
+    finished take are all plain text - no per-row widget. The old indeterminate *busy*
+    QProgressBar is gone, since it was a per-row widget and part of the rule #18 pileup.)
 12. **Local renders auto-recover from a ComfyUI crash; 3 strikes pauses the queue.** A 14B
     render can still occasionally trip the 2s GPU watchdog (TDR) even with
     `--disable-dynamic-vram`, killing the ComfyUI *process* mid-render. **First, though, the
@@ -530,7 +533,8 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     crashed batch is recognised on load. Smoke-tested in `smoke_phase2` (`test_restart_plan`,
     `test_restart_take`, `test_restart_from_snapshot`, `test_interrupted_flag`).
 18. **The 2026-06-18 native stack-overflow crash is ROOT-CAUSED: a runaway
-    `QWidgetPrivate::paintSiblingsRecursive` (a targeted fix is still pending).** The genuine
+    `QWidgetPrivate::paintSiblingsRecursive`. Card #72 has since REMOVED the prime suspect's
+    mechanism (the Queue's per-row widgets) - see "FIX LANDED" at the end of this rule.** The genuine
     crash was the **overnight run at 03:34 on 2026-06-18** (pid 42392), logged as `Windows fatal
     exception: stack overflow` in `animgen_faults.log`. It is a **native (C/C++) overflow on the
     GUI thread**, not Python: faulthandler dumped only shallow Python frames ("Current thread" =
@@ -586,3 +590,23 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     same day was NOT this crash** — an nvlddmkm **GPU fault (System Event 153)** wedged ComfyUI
     mid-render and the python processes were terminated with **no** WER/minidump/faulthandler
     artifact (external kill, not a fault). Smoke: `smoke_phase2.test_ws_progress_diagnostics`.
+    **FIX LANDED (card #72, 2026-06-18):** the earlier "exoneration" of the Queue cell widgets
+    above was WRONG - it used a `processEvents()` probe (which skips `DeferredDelete`) at shallow
+    depth. A GPU-free deep-queue soak (`scripts/mock_comfy.py`) then caught the real mechanism:
+    driving a mass-cancel (`cancel_pending` / `abandon_local` emit `status_changed` PER take) at
+    ~390 pending made the old `ui/queue_view.py` `QTableWidget.refresh()` rebuild EVERY row and
+    reconstruct a `QProgressBar` per pending/generating row on EACH per-take signal, with no
+    `DeferredDelete` flush between - a widget census hit **75,132 QProgressBars** (~390x the steady
+    ~388), well past the ~6900 overlapping children that overflow `paintSiblingsRecursive`. The fix
+    rewrote the Queue as a `QAbstractTableModel` + a **delegate-painted Progress column**
+    (`QStyle.CE_ProgressBar`; a determinate bar only on a still-rendering *local* take, everything
+    else plain text) with **ZERO per-row widgets** - so the child count is bounded regardless of
+    queue depth and a mass-cancel can no longer construct any widgets. It also **coalesces** the
+    status_changed / finished / failed signals through a 0-delay `QTimer` into ONE rebuild per
+    event-loop turn (a completion no longer triggers ~3 rebuilds; a mass-cancel storm collapses to a
+    single model reset), and makes the high-frequency progress / progress_pct ticks a granular
+    single-row `dataChanged`. Per-take cancel of a queued take moved to the row's right-click menu
+    (`_build_context_menu`, no `exec()`); the bulk *Cancel pending* button is unchanged. So the
+    rule-#18 overflow's most likely trigger is removed at the source. Smoke:
+    `smoke_phase4.test_queue_view` (child-widget count stays bounded vs queue depth; a progress tick
+    touches one row; a per-take signal storm coalesces to a single rebuild).
