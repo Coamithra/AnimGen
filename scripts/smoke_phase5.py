@@ -435,8 +435,9 @@ def test_snapshot_includes_framing() -> None:
 
 def test_generate_shot_missing_shot() -> None:
     """generate_shot is fed a deleted/unknown shot_id (generate_requested is a queued
-    signal; the shot can vanish between emit and slot). It must bail quietly - no
-    AttributeError, no launch, the cost gate never shown - matching the guarded siblings."""
+    signal; the shot can vanish between emit and slot). Both guards - the top-level one
+    and the one after the keyframe picker reloads the shot - must bail quietly: no
+    AttributeError, no launch (_queue_take never reached), the cost gate never shown."""
     from PySide6.QtWidgets import QApplication
 
     from ui import main_window
@@ -444,23 +445,42 @@ def test_generate_shot_missing_shot() -> None:
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
     project = Project.new()
-    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
     project.save_as(Path(tempfile.mkdtemp()) / "p.animproj")
     win = MainWindow(project)
 
-    gate_shown = []
+    gate_shown, queued = [], []
     orig_confirm = main_window.confirm_launch
     main_window.confirm_launch = lambda *a, **k: gate_shown.append(True) or True
+    win._queue_take = lambda *a, **k: queued.append(True)   # records any launch attempt
     try:
-        win.generate_shot("does-not-exist")        # never existed
-        project.delete_shot(shot.id)
-        win.generate_shot(shot.id)                  # existed, now deleted (stale signal)
+        # (a) top guard: an id that never existed, and one deleted between emit and slot.
+        win.generate_shot("never-existed")
+        ghost = project.add_shot("ghost", model_id="seedance-2.0-std", prompt="p")
+        project.delete_shot(ghost.id)
+        win.generate_shot(ghost.id)
+
+        # (b) picker-reload guard: a shot with no start_frame, deleted while the keyframe
+        # picker is open, so the re-fetch after import_asset returns None (line ~665).
+        shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+        orig_qfd, orig_import = main_window.QFileDialog, project.import_asset
+
+        class _PickerThenDelete:
+            @staticmethod
+            def getOpenFileName(*a, **k):
+                project.delete_shot(shot.id)        # vanishes while the dialog is open
+                return ("frame.png", "")
+        main_window.QFileDialog = _PickerThenDelete
+        project.import_asset = lambda src: Path("frame.png")   # no real file needed
+        try:
+            win.generate_shot(shot.id)
+        finally:
+            main_window.QFileDialog, project.import_asset = orig_qfd, orig_import
     finally:
         main_window.confirm_launch = orig_confirm
 
     assert not gate_shown, "cost gate must never be shown for a missing shot"
-    assert project.list_takes(shot.id) == [], "no take queued for a missing shot"
-    print("MainWindow OK: generate_shot on a missing/deleted shot is a quiet no-op")
+    assert not queued, "no launch (_queue_take) for a missing shot"
+    print("MainWindow OK: generate_shot on a missing/deleted shot is a quiet no-op (both guards)")
 
 
 def test_take_player_settings_panel() -> None:
