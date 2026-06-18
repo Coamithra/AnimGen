@@ -145,11 +145,16 @@ class ComfyMonitorWindow(QWidget):
         self.shutdown_btn = QPushButton("Shut down")
         self.shutdown_btn.setToolTip("Stop the ComfyUI server process")
         self.shutdown_btn.clicked.connect(self._shutdown)
+        self.clear_cache_btn = QPushButton("Clear GPU cache")
+        self.clear_cache_btn.setToolTip(
+            "Delete videogen's CUDA kernel cache (data/gpu_cache); it regenerates on the next render")
+        self.clear_cache_btn.clicked.connect(self._clear_gpu_cache)
         head = QHBoxLayout()
         head.addWidget(self.status_lbl, 1)
         head.addWidget(self.launch_btn)
         head.addWidget(self.stop_work_btn)
         head.addWidget(self.shutdown_btn)
+        head.addWidget(self.clear_cache_btn)
         root.addLayout(head)
 
         self.versions_lbl = QLabel("-")
@@ -302,6 +307,29 @@ class ComfyMonitorWindow(QWidget):
         self.stop_intent.emit()   # pause an active batch first (see stop_intent)
         self.activity_lbl.setText("shutting down...")
         self._run_action(comfy_client.stop_server, "ComfyUI shut down")
+
+    def _clear_gpu_cache(self) -> None:
+        """Wipe videogen's isolated CUDA kernel cache (data/gpu_cache). Best-effort + off the
+        GUI thread; independent of the server-control buttons, so it works server up or down."""
+        mb = comfy_client.gpu_cache_size_mb()
+        if QMessageBox.question(
+                self, "Clear GPU cache",
+                f"Delete videogen's CUDA kernel cache ({mb:.0f} MB in data/gpu_cache)?\n"
+                "It regenerates automatically on the next render.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self.clear_cache_btn.setEnabled(False)
+        self.activity_lbl.setText("clearing GPU cache...")
+        self._clear_action = _AsyncCall(comfy_client.clear_gpu_cache, "GPU cache cleared")
+        self._clear_action.done.connect(self._on_clear_done)
+        self._clear_action.start()
+
+    def _on_clear_done(self, ok: bool, message: str) -> None:
+        self.clear_cache_btn.setEnabled(True)
+        self.activity_lbl.setText(message if ok else "GPU cache clear failed")
+        if not ok:
+            QMessageBox.warning(self, "Clear GPU cache", message)
 
     def _run_action(self, fn, ok_msg: str) -> None:
         self._busy = True

@@ -33,7 +33,9 @@ def main(argv: list[str]) -> int:
         return 2
     cmd = comfy_client.build_launch_command(argv)
     print("launching:", " ".join(cmd))
-    return subprocess.call(cmd, cwd=str(comfy_client.COMFY_DIR))
+    # env redirects the CUDA kernel cache into data/gpu_cache (isolated + capped) - see
+    # comfy_client.launch_env(); matches the detached "Launch ComfyUI" button + the .bat.
+    return subprocess.call(cmd, cwd=str(comfy_client.COMFY_DIR), env=comfy_client.launch_env())
 
 
 if __name__ == "__main__":
