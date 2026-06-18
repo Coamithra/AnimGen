@@ -162,7 +162,8 @@ def test_take_star_badge() -> None:
     handled = tv._star_delegate.editorEvent(_release(badge.center()), tv.model, opt, idx)
     assert handled is True
     assert project.get_take(take.id).starred, "badge click must star the take"
-    assert tv.model.index(0, 0).data(_STAR_ROLE) is True, "reload reflects the new star"
+    # toggle_star reloads the grid in place, so the item's star role reflects the new state
+    assert tv.model.index(0, 0).data(_STAR_ROLE) is True, "grid role refreshed after toggle"
 
     # A click outside the badge is NOT consumed and doesn't change the star.
     outside = QPoint(cell.center().x(), cell.center().y())

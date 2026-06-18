@@ -34,7 +34,8 @@ class Shot:
     negative_prompt: str = ""
     model_id: str = ""                      # ref into model_library.json
     settings: dict = field(default_factory=dict)  # model params (seed, duration, ...)
-    starred: bool = False                   # user flag (authoring; buffers like other edits)
+    starred: bool = False                   # user flag; write-through to the shot_stars.json
+                                            # sidecar (NOT serialized into the .animproj)
     created: str = ""
     updated: str = ""
 

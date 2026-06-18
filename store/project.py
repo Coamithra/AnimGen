@@ -405,7 +405,8 @@ class Project:
                 doc = json.loads(sidecar.read_text(encoding="utf-8"))
                 starred = set(doc.get("starred", []))
             except (OSError, ValueError):
-                return                              # unreadable -> keep legacy in-memory flags
+                return                              # unreadable -> leave the in-memory flags as
+                                                    # loaded (legacy .animproj stars, if any)
             for shot in self._shots.values():
                 shot.starred = shot.id in starred
         elif any(s.starred for s in self._shots.values()):
