@@ -414,6 +414,38 @@ def test_cost_summary() -> None:
     print("cost_confirm build_summary OK: totals, spend flag, free-only")
 
 
+def test_launch_label() -> None:
+    from ui.cost_confirm import build_summary, launch_button_label
+
+    # All-unknown-cost batch: build_summary -> total=0, has_spend=True. The launch
+    # button must NOT read "free" (rule #1: the gate must not contradict its own
+    # "MAY spend money" header).
+    unknown_items = [
+        {"name": "a", "model_display": "Mystery v1", "est_cost": None, "params": {}},
+        {"name": "b", "model_display": "Mystery v2", "est_cost": None, "params": {}},
+    ]
+    _, total_u, has_spend_u = build_summary(unknown_items)
+    assert total_u == 0.0 and has_spend_u is True
+    label_u = launch_button_label(total_u, has_spend_u)
+    assert label_u != "Launch (spend ~free)"
+    assert label_u == "Launch (cost unknown)"
+
+    # No-spend (local $0) batch keeps "Launch (free)".
+    assert launch_button_label(0.0, False) == "Launch (free)"
+
+    # Known hosted cost keeps the dollar amount.
+    assert launch_button_label(2.0, True) == "Launch (spend ~$2.00)"
+
+    # Mixed known + unknown (total>0, has_spend) still shows the known total.
+    mixed_items = [
+        {"name": "a", "model_display": "Seedance", "est_cost": 0.72, "params": {}},
+        {"name": "b", "model_display": "Mystery", "est_cost": None, "params": {}},
+    ]
+    _, total_m, has_spend_m = build_summary(mixed_items)
+    assert launch_button_label(total_m, has_spend_m) == "Launch (spend ~$0.72)"
+    print("cost_confirm launch_button_label OK: unknown-not-free, free, known, mixed")
+
+
 def test_job_manager() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -1765,6 +1797,27 @@ def test_restart_from_snapshot() -> None:
         # A non-cancelled selection has no Restart entry.
         project.update_take(good.id, status=STATUS_PENDING)
         assert not any("Restart" in a.text() for a in tv._build_context_menu([good.id]).actions())
+
+        # A crash-interrupted FAILED take (in-flight render lost to an app/ComfyUI death) ALSO offers
+        # a per-take Restart - mirroring the bulk action, which already picks it up (card #64).
+        project.update_take(failed_orphan.id, status=STATUS_FAILED, interrupted=True)  # bulk flipped it
+        restart_emits.clear()
+        fo_menu = tv._build_context_menu([failed_orphan.id])
+        assert any("Restart" in a.text() for a in fo_menu.actions()), [a.text() for a in fo_menu.actions()]
+        next(a for a in fo_menu.actions() if "Restart" in a.text()).trigger()
+        assert restart_emits == [[failed_orphan.id]], restart_emits
+        # ...but a deliberately-FAILED (non-interrupted) take does NOT - a plain render failure is
+        # not a restart candidate, only a crash-interrupted one is.
+        plain_failed = project.add_take(shot.id, status=STATUS_FAILED, interrupted=False,
+                                        settings_snapshot=snap)
+        assert not any("Restart" in a.text()
+                       for a in tv._build_context_menu([plain_failed.id]).actions())
+        # The by-ids handler enforces the same gate: it forwards the FAILED+interrupted take and a
+        # cancelled one to _restart_takes, but drops the deliberately-FAILED one.
+        forwarded = {}
+        win._restart_takes = lambda takes: forwarded.setdefault("ids", [t.id for t in takes])
+        win._restart_takes_by_ids([failed_orphan.id, plain_failed.id, user_cancelled.id])
+        assert forwarded["ids"] == [failed_orphan.id, user_cancelled.id], forwarded["ids"]
     finally:
         QMessageBox.information = orig_info
     print("restart from snapshot OK: in-place replay, unrestartable->failed, headless menu entry")
@@ -1985,6 +2038,7 @@ if __name__ == "__main__":
     test_stop_handler_nonbatch()
     test_total_price()
     test_cost_summary()
+    test_launch_label()
     test_cancel_pending()
     test_cancel_shot_takes()
     test_inflight_stop_maps_to_cancelled()

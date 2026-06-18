@@ -76,7 +76,7 @@ class ShotCard(QFrame):
     star_toggled = Signal(str)              # toggle the shot's own star
     export_takes_requested = Signal(list)   # take ids (row obeys its view filter)
     open_take_requested = Signal(str)       # take id -> open in the frame-by-frame viewer
-    restart_requested = Signal(list)        # cancelled take ids -> re-run them
+    restart_requested = Signal(list)        # cancelled / crash-interrupted-failed take ids -> re-run them
     changed = Signal()
 
     def __init__(self, project: Project, shot, jobs=None):

@@ -638,6 +638,13 @@ class MainWindow(QMainWindow):
 
     def generate_shot(self, shot_id: str) -> None:
         shot = self.project.get_shot(shot_id)
+        if not shot:
+            # generate_requested is a queued signal; the shot can be deleted between the
+            # emit and this slot running (benign double-click / stale-tab race). Guard the
+            # deref like open_shot/toggle_shot_star/delete_shot do, plus a log line since a
+            # silently-dropped Generate is the confusing case (the siblings stay silent).
+            self._log("generate ignored: shot no longer exists")
+            return
         model = library.get_model(shot.model_id)
         if not model:
             QMessageBox.warning(self, "Generate", f"Unknown model: {shot.model_id}")
@@ -657,6 +664,9 @@ class MainWindow(QMainWindow):
                 return
             self.project.update_shot(shot.id, start_frame=str(self.project.import_asset(start)))
             shot = self.project.get_shot(shot_id)
+            if not shot:
+                self._log("generate ignored: shot deleted while picking a keyframe")
+                return
 
         settings = {**model.get("default_params", {}), **shot.settings}
         est = library.estimate_cost(shot.model_id, settings)
@@ -857,10 +867,13 @@ class MainWindow(QMainWindow):
         self._restart_takes(interrupted)
 
     def _restart_takes_by_ids(self, ids: list) -> None:
-        """Restart just the given takes (the takes-grid context-menu entry). Non-cancelled ids
-        are ignored - the menu only offers Restart when a cancelled take is selected."""
+        """Restart just the given takes (the takes-grid context-menu entry). Restarts any cancelled
+        take (an explicit user override) plus a crash-interrupted FAILED take (its in-flight render
+        was lost to an app/ComfyUI death); a deliberately-failed (non-interrupted) take is ignored,
+        mirroring the menu gate in takes_view._build_context_menu."""
         takes = [t for t in (self.project.get_take(i) for i in ids)
-                 if t and t.status == STATUS_CANCELLED]
+                 if t and (t.status == STATUS_CANCELLED
+                           or (t.status == STATUS_FAILED and t.interrupted))]
         self._restart_takes(takes)
 
     def _restart_takes(self, takes: list) -> None:
@@ -1318,7 +1331,10 @@ class MainWindow(QMainWindow):
         Window metadata, not authoring data - written on save, never sets dirty. Pristine
         unsaved blank shot tabs (no id yet, not in shot_tabs) are skipped; commit them
         first via Save. `active` is the index into the captured descriptor list (not a raw
-        tab position) so it survives a later tab being skipped on restore."""
+        tab position) so it survives a later tab being skipped on restore. When the active
+        tab is itself a skipped blank shot tab (it maps to no descriptor), `active` is
+        re-pointed at the previously-recorded active descriptor rather than left None - else
+        focusing such a tab at save/close would silently wipe the remembered active (#65)."""
         fixed_titles = {w: title for w, title in self._fixed_tabs}
         shot_id_by_tab = {t: sid for sid, t in self.shot_tabs.items()}
         active_widget = self.tabs.currentWidget()
@@ -1340,7 +1356,24 @@ class MainWindow(QMainWindow):
             if w is active_widget:
                 active = len(entries)
             entries.append(entry)
+        if active is None and active_widget is not None:
+            active = self._prior_active_index(entries)
         return {"tabs": entries, "active": active}
+
+    def _prior_active_index(self, entries: list[dict]) -> Optional[int]:
+        """Resolve the previously-recorded active descriptor to its position in `entries`.
+        Used when the live active tab can't be represented (a pristine unsaved blank shot
+        tab) so re-capturing the layout preserves the remembered active instead of nulling
+        it. Returns None when that descriptor is no longer open - then active falls back to
+        the Shots tab on restore, the same as having no remembered active. `prior` is the
+        last *persisted* active (ui_state is only re-captured on save/close), not the live
+        focus, so closing the recorded-active tab before this fires also yields the fallback."""
+        prior = self.project.ui_state or self._default_tab_state()
+        tabs = prior.get("tabs") or []
+        idx = prior.get("active")
+        if isinstance(idx, int) and 0 <= idx < len(tabs) and tabs[idx] in entries:
+            return entries.index(tabs[idx])
+        return None
 
     def _default_tab_state(self) -> dict:
         """The layout an empty ui_state restores to: every fixed tab in order, Shots active

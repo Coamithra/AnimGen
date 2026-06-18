@@ -28,26 +28,42 @@ _GB = 1024 ** 3
 
 
 class _MonitorPoller(QObject):
-    """Polls live ComfyUI state on a daemon thread until stopped."""
+    """Polls live ComfyUI state on a daemon thread until stopped.
+
+    A generation token (bumped on every start()/stop()) guards against leaking a second
+    concurrent poller: each worker captures the token it launched with and exits the moment
+    it no longer matches the live one. So a quick stop()->start() - e.g. flipping off the
+    ComfyUI Status tab and back within the ~2s socket-probe window, while the old worker is
+    still blocked in monitor_snapshot - supersedes the stale worker instead of reviving it:
+    the old thread drops its in-flight snapshot and exits, leaving exactly one live poller
+    (card #62). start() is deliberately NOT a no-op-while-alive - after a stop() the old
+    worker is already doomed, so a no-op would leave nothing polling.
+    """
     snapshot = Signal(object)  # the monitor_snapshot() dict
 
     def __init__(self, interval: float = 2.0):
         super().__init__()
         self._interval = interval
-        self._stop = False
+        self._generation = 0  # bumped on each start()/stop(); only the GUI thread writes it
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self._stop = False
-        threading.Thread(target=self._run, daemon=True).start()
+        self._generation += 1
+        gen = self._generation
+        self._thread = threading.Thread(target=self._run, args=(gen,), daemon=True)
+        self._thread.start()
 
     def stop(self) -> None:
-        self._stop = True
+        self._generation += 1  # supersede the running worker; it exits at its next check
 
-    def _run(self) -> None:
-        while not self._stop:
-            self.snapshot.emit(comfy_client.monitor_snapshot(timeout=2))
+    def _run(self, gen: int) -> None:
+        while gen == self._generation:
+            snap = comfy_client.monitor_snapshot(timeout=2)
+            if gen != self._generation:  # superseded mid-probe -> drop the stale snapshot
+                return
+            self.snapshot.emit(snap)
             for _ in range(max(1, int(self._interval / 0.1))):  # responsive to stop()
-                if self._stop:
+                if gen != self._generation:
                     return
                 time.sleep(0.1)
 

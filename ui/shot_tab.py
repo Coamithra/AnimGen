@@ -52,7 +52,7 @@ class ShotTab(QWidget):
     generate_requested = Signal(str)  # shot_id
     export_requested = Signal(list)   # take ids
     open_take_requested = Signal(str)  # take id -> open in the frame-by-frame viewer tab
-    restart_requested = Signal(list)   # cancelled take ids -> re-run them
+    restart_requested = Signal(list)   # cancelled / crash-interrupted-failed take ids -> re-run them
     dirty_changed = Signal()          # this tab's unsaved-edits state flipped
 
     def __init__(self, project: Project, shot=None, parent=None, jobs=None):
@@ -662,9 +662,19 @@ class ShotTab(QWidget):
                 w.setCurrentText(str(value))
             w.currentTextChanged.connect(lambda _t: self._refresh_price())
             return w, lambda: w.currentText()
-        if enum:
-            w = QComboBox(); w.addItems([str(o) for o in enum])
-            w.setCurrentText(str(value))
+        if enum:                                  # generic enum: preserve an out-of-schema stored
+            items = [str(o) for o in enum]        # value (renamed/removed by a refresh) instead of
+            w = QComboBox(); w.addItems(items)    # silently snapping to enum[0]; flag it red to re-pick
+            sval = str(value)
+            if sval not in items:                 # keep the stale choice visible (mirrors _populate_aspects)
+                w.addItem(sval)
+            w.setCurrentText(sval)
+
+            def _flag_enum(_t=None, _w=w, _items=items) -> None:
+                _w.setStyleSheet("" if _w.currentText() in _items
+                                 else "QComboBox { border: 2px solid #d9534f; }")
+            _flag_enum()
+            w.currentTextChanged.connect(_flag_enum)
             return w, lambda: w.currentText()
         if isinstance(value, bool):
             w = QCheckBox(); w.setChecked(value)

@@ -224,7 +224,7 @@ class TakesView(QWidget):
     changed = Signal()
     export_requested = Signal(list)   # list[take_id]
     open_take_requested = Signal(str)  # take_id -> open it in the frame-by-frame viewer tab
-    restart_requested = Signal(list)   # list[take_id] -> re-run cancelled takes (MainWindow drives it)
+    restart_requested = Signal(list)   # list[take_id] -> re-run cancelled / crash-interrupted-failed takes (MainWindow drives it)
 
     def __init__(self, project: Project, shot_id: str, jobs=None):
         super().__init__()
@@ -487,18 +487,21 @@ class TakesView(QWidget):
     def _build_context_menu(self, ids: list) -> QMenu:
         """Build the per-take right-click menu with its actions wired (no exec()), so the menu
         and its wiring are headless-testable (rule #4 / the shot_card pattern). A Restart entry
-        appears only when the selection holds a cancelled take; it bubbles up to MainWindow,
-        which owns the cost gate + queue."""
+        appears when the selection holds a cancelled take or a crash-interrupted FAILED take (an
+        in-flight render lost to an app/ComfyUI death); it bubbles up to MainWindow, which owns
+        the cost gate + queue."""
         menu = QMenu(self)
         menu.addAction("Open in viewer").triggered.connect(self._open_in_viewer)
         menu.addAction("Open in external player").triggered.connect(self._open_selected)
         menu.addSeparator()
-        cancelled = [tid for tid in ids
-                     if (t := self.project.get_take(tid)) and t.status == "cancelled"]
-        if cancelled:
-            label = "Restart take" if len(cancelled) == 1 else f"Restart {len(cancelled)} takes"
+        restartable = [tid for tid in ids
+                       if (t := self.project.get_take(tid))
+                       and (t.status == "cancelled"
+                            or (t.status == "failed" and t.interrupted))]
+        if restartable:
+            label = "Restart take" if len(restartable) == 1 else f"Restart {len(restartable)} takes"
             menu.addAction(label).triggered.connect(
-                lambda: self.restart_requested.emit(cancelled))
+                lambda: self.restart_requested.emit(restartable))
             menu.addSeparator()
         menu.addAction("Toggle star").triggered.connect(lambda: self.toggle_star(ids))
         menu.addAction("Delete (to bin)").triggered.connect(lambda: self.delete(ids))
