@@ -191,6 +191,66 @@ def test_close_dirty_tab_guard() -> None:
     print("MainWindow OK: close-dirty-tab guard (clean/Cancel/Discard/Save)")
 
 
+def test_tab_state_persistence() -> None:
+    """Closing/opening tabs is captured into project.ui_state on save and rebuilt on the
+    next open: closed fixed tabs stay closed, open shot tabs reopen, order + active tab are
+    preserved, and a descriptor for a since-deleted shot is skipped (no crash). A project
+    with no saved layout builds the default full fixed-tab set."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "tabs.animproj"
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p")
+    project.save_as(path)
+
+    win = MainWindow(project)
+    assert win.tabs.count() == 5, "default layout shows every fixed tab"
+
+    # Close Assets + Model Library, open the shot tab, focus it, then Save.
+    win._on_tab_close(win.tabs.indexOf(win.assets_tab))
+    win._on_tab_close(win.tabs.indexOf(win.library_tab))
+    win.open_shot(shot.id)
+    shot_tab = win.shot_tabs[shot.id]
+    win.tabs.setCurrentWidget(shot_tab)
+    assert win.save_project(), "titled save succeeds (no dialog)"
+
+    layout = win.project.ui_state["tabs"]
+    keys = [(e["kind"], e.get("key") or e.get("id")) for e in layout]
+    assert keys == [("fixed", "Shots"), ("fixed", "Queue"),
+                    ("fixed", "ComfyUI Status"), ("shot", shot.id)], keys
+    assert win.project.ui_state["active"] == win.tabs.indexOf(shot_tab)
+
+    # Reopen from disk in a fresh window: the layout (closed fixed tabs, reopened shot tab,
+    # order, active) is rebuilt.
+    reopened = Project.load(path)
+    win2 = MainWindow(reopened)
+    titles = [win2.tabs.tabText(i) for i in range(win2.tabs.count())]
+    assert titles == ["Shots", "Queue", "ComfyUI Status", "kick"], titles
+    assert win2.tabs.indexOf(win2.assets_tab) < 0, "closed Assets tab stays closed"
+    assert win2.tabs.indexOf(win2.library_tab) < 0, "closed Model Library tab stays closed"
+    assert shot.id in win2.shot_tabs, "the open shot tab was reopened"
+    assert isinstance(win2.tabs.currentWidget(), ShotTab), "active tab restored to the shot"
+
+    # A descriptor that points at a since-deleted shot is silently skipped (no crash).
+    reopened.delete_shot(shot.id)
+    reopened.save()
+    win3 = MainWindow(Project.load(path))
+    assert shot.id not in win3.shot_tabs, "deleted-shot descriptor produces no tab"
+    titles3 = [win3.tabs.tabText(i) for i in range(win3.tabs.count())]
+    assert titles3 == ["Shots", "Queue", "ComfyUI Status"], titles3
+
+    # A project with no saved ui_state falls back to the full default fixed-tab set.
+    fresh = Project.new()
+    fresh.add_shot("x", model_id="seedance-2.0-std")
+    win4 = MainWindow(fresh)
+    assert win4.tabs.count() == 5 and win4.tabs.tabText(0) == "Shots"
+    print("MainWindow OK: open-tab layout captured on save + restored on open")
+
+
 def test_format_generation_settings() -> None:
     """The take-viewer settings formatter renders a full snapshot and degrades cleanly."""
     from store.models import Take
@@ -344,6 +404,7 @@ if __name__ == "__main__":
     test_export()
     test_window_builds()
     test_close_dirty_tab_guard()
+    test_tab_state_persistence()
     test_format_generation_settings()
     test_snapshot_includes_framing()
     test_take_player_settings_panel()

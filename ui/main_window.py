@@ -104,6 +104,7 @@ class MainWindow(QMainWindow):
         self._build_body()
         self._build_menu()
         self.reload()
+        self._restore_tab_state()   # reopen the tabs this project was last saved with
         self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
         self._maybe_refresh_schemas_on_startup()
         self._remote = None
@@ -332,6 +333,7 @@ class MainWindow(QMainWindow):
         self.assets_tab.set_project(project)
         self.queue_tab.set_project(project)
         self.reload()
+        self._restore_tab_state()   # reopen the tabs this project was last saved with
         self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
 
     def _maybe_save_changes(self) -> bool:
@@ -376,6 +378,7 @@ class MainWindow(QMainWindow):
         if self.project.is_untitled:
             return self.save_project_as()
         self._commit_open_shot_tabs()
+        self._capture_tab_state()
         self.project.save()
         self._remember_last()
         self._update_title()
@@ -389,6 +392,7 @@ class MainWindow(QMainWindow):
         if not path:
             return False
         self._commit_open_shot_tabs()
+        self._capture_tab_state()
         self.project.save_as(path)
         self._remember_last()
         self._update_title()
@@ -1176,6 +1180,62 @@ class MainWindow(QMainWindow):
         if self.tabs.indexOf(widget) < 0:
             self.tabs.addTab(widget, title)
         self.tabs.setCurrentWidget(widget)
+
+    # ---- tab-layout persistence (stored per project in the .animproj) ----
+    def _capture_tab_state(self) -> None:
+        """Snapshot the live tab bar into project.ui_state so a save records the layout.
+        Window metadata, not authoring data - written on save, never sets dirty. Pristine
+        unsaved blank shot tabs (no id yet) are skipped; commit them first via Save."""
+        fixed_titles = {w: title for w, title in self._fixed_tabs}
+        shot_id_by_tab = {t: sid for sid, t in self.shot_tabs.items()}
+        entries: list[dict] = []
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if w in fixed_titles:
+                entries.append({"kind": "fixed", "key": fixed_titles[w]})
+            elif isinstance(w, ShotTab):
+                sid = shot_id_by_tab.get(w)
+                if sid:
+                    entries.append({"kind": "shot", "id": sid})
+            elif isinstance(w, TakePlayerTab):
+                entries.append({"kind": "take", "id": w.take_id})
+        self.project.ui_state = {"tabs": entries, "active": self.tabs.currentIndex()}
+
+    def _restore_tab_state(self) -> None:
+        """Rebuild the tab bar from the project's saved layout (or the default full set of
+        fixed tabs when there's none). Detaching first keeps the fixed-tab widgets alive
+        (removeTab doesn't delete them); shot/take tabs are reopened by id, skipping any
+        that no longer exist."""
+        state = self.project.ui_state or {}
+        desc = state.get("tabs")
+        while self.tabs.count():
+            self.tabs.removeTab(0)
+        if desc:
+            self._apply_tab_descriptors(desc)
+        else:
+            for widget, title in self._fixed_tabs:   # default: all fixed tabs, original order
+                self.tabs.addTab(widget, title)
+        if self.tabs.count() == 0:                    # never leave an empty tab bar
+            w, t = self._fixed_tabs[0]
+            self.tabs.addTab(w, t)
+        active = state.get("active")
+        if isinstance(active, int) and 0 <= active < self.tabs.count():
+            self.tabs.setCurrentIndex(active)
+        else:
+            self.tabs.setCurrentIndex(0)
+
+    def _apply_tab_descriptors(self, desc: list) -> None:
+        fixed_by_key = {title: w for w, title in self._fixed_tabs}
+        for entry in desc:
+            kind = entry.get("kind")
+            if kind == "fixed":
+                w = fixed_by_key.get(entry.get("key"))
+                if w is not None and self.tabs.indexOf(w) < 0:
+                    self.tabs.addTab(w, entry["key"])
+            elif kind == "shot":
+                self.open_shot(entry.get("id"))      # no-op on a missing/already-open shot
+            elif kind == "take":
+                self.open_take(entry.get("id"))      # no-op on a missing/already-open take
 
     def _maybe_close_shot_tab(self, tab: ShotTab) -> bool:
         """Confirm before closing a shot tab that has uncommitted editor edits. Returns
