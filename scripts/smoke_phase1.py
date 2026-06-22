@@ -394,6 +394,58 @@ def test_output_url_parsing() -> None:
     print("output url parsing OK: bad shapes -> ReplicateError (no AttributeError), good resolve")
 
 
+def test_http_error_handling() -> None:
+    """api_request humanizes known HTTP statuses and retries transient 5xx/429: a 504 on the
+    create POST is no longer a bare 'HTTP 504' and recovers on retry; a 402 fails fast with a
+    'out of credit' note. No real network (urlopen + sleep are stubbed)."""
+    import io
+    import urllib.error
+
+    from backends import replicate_client as rc
+
+    # Pure formatter: a recognised code gets a plain-English note + endpoint + raw body.
+    msg = rc._http_error_message(504, "https://api.replicate.com/v1/models/vidu/q3-pro", "error code: 504")
+    assert "HTTP 504" in msg and "gateway timeout" in msg.lower() and "vidu/q3-pro" in msg, msg
+    assert "out of credit" in rc._http_error_message(402, "u", "")          # billing, not a timeout
+    assert rc._http_error_message(418, "u", "").startswith("HTTP 418")      # unknown code still clean
+    assert rc._retry_wait(429, '{"retry_after": 9}', 0) == 12               # honours retry_after + 3
+    assert rc._retry_wait(504, "error code: 504", 2) == 12                  # 5xx escalating backoff
+
+    class _Resp:                                                            # context-manager stand-in for urlopen
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"ok": true}'
+
+    calls = {"n": 0}
+    def fake_urlopen(req, timeout=0):
+        calls["n"] += 1
+        if calls["n"] == 1:                                                 # first attempt: transient 504
+            raise urllib.error.HTTPError(req.full_url, 504, "Gateway Timeout", {},
+                                         io.BytesIO(b"error code: 504"))
+        return _Resp()                                                      # retry succeeds
+
+    saved_open, saved_sleep = rc.urllib.request.urlopen, rc.time.sleep
+    rc.urllib.request.urlopen, rc.time.sleep = fake_urlopen, (lambda *_: None)
+    try:
+        out = rc.api_request("tok", "https://api.replicate.com/v1/x")
+        assert out == {"ok": True} and calls["n"] == 2, (out, calls)       # retried once, then ok
+
+        calls["n"] = 0                                                      # 402 is NOT retried
+        def fail_402(req, timeout=0):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(req.full_url, 402, "Payment Required", {}, io.BytesIO(b"{}"))
+        rc.urllib.request.urlopen = fail_402
+        try:
+            rc.api_request("tok", "https://api.replicate.com/v1/x")
+            raise AssertionError("expected ReplicateError on 402")
+        except rc.ReplicateError as e:
+            assert "HTTP 402" in str(e) and "out of credit" in str(e), str(e)
+            assert calls["n"] == 1, calls                                   # failed fast, no retry
+    finally:
+        rc.urllib.request.urlopen, rc.time.sleep = saved_open, saved_sleep
+    print("replicate_client OK: humanized HTTP errors + transient 504/429 retry, 402 fails fast")
+
+
 def test_purge_takes() -> None:
     """Hard-delete: purge_takes drops takes from takes.json entirely (no bin/restore), deletes
     each take's MANAGED media (files under .assets) but leaves an EXTERNAL ref in place (gotcha
@@ -493,6 +545,7 @@ if __name__ == "__main__":
     test_keypose_migration_persist()
     test_keypose_migration_persist_failure()
     test_output_url_parsing()
+    test_http_error_handling()
     test_purge_takes()
     test_remove_cancelled_takes_action()
     test_gui_build()

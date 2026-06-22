@@ -64,6 +64,46 @@ def load_token() -> str:
     raise ReplicateError("No REPLICATE_TOKEN in environment, repo .env, or source-project .env")
 
 
+# Replicate's edge returns these HTTP statuses; map each to a plain-English note so a failed
+# take says WHY instead of a bare "HTTP 504". A 504/502/503/500 is a TRANSIENT server-side
+# hiccup (NOT a billing/quota problem - that's 402/429), so those + 429 are retried.
+_HTTP_EXPLAIN = {
+    400: "the request was malformed",
+    401: "authentication failed - check REPLICATE_TOKEN",
+    402: "payment required - the Replicate account is out of credit",
+    403: "forbidden - the token can't access this model",
+    404: "not found - wrong model id or endpoint",
+    422: "the model rejected the inputs",
+    429: "rate-limited - accounts under $5 credit are throttled to ~1 create/min",
+    500: "Replicate had an internal server error (transient - retried, then gave up)",
+    502: "Replicate gateway error (transient - retried, then gave up)",
+    503: "Replicate is temporarily unavailable (transient - retried, then gave up)",
+    504: "Replicate gateway timeout, their server was slow to respond "
+         "(transient - retried, then gave up)",
+}
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})  # transient - safe to retry the request
+
+
+def _http_error_message(code: int, url: str, detail: str) -> str:
+    """A human-readable one-liner for a failed Replicate HTTP call: the status, a plain-English
+    explanation when the code is recognised, the endpoint, then the raw response body. Pure."""
+    note = _HTTP_EXPLAIN.get(code)
+    head = f"HTTP {code}" + (f" - {note}" if note else "") + f" (from {url})"
+    detail = (detail or "").strip()
+    return f"{head}\n{detail}" if detail else head
+
+
+def _retry_wait(code: int, detail: str, attempt: int) -> int:
+    """Seconds to wait before retrying a transient response: honour a 429's retry_after; give a
+    transient 5xx a short escalating backoff. Pure (no sleep)."""
+    if code == 429:
+        try:
+            return int(json.loads(detail).get("retry_after", 15)) + 3
+        except (ValueError, AttributeError, TypeError):
+            return 15
+    return min(4 * (attempt + 1), 20)
+
+
 def api_request(token: str, url: str, payload=None, method=None,
                 raw_body=None, content_type=None) -> dict:
     headers = {"Authorization": f"Bearer {token}", "User-Agent": _UA}
@@ -75,22 +115,19 @@ def api_request(token: str, url: str, payload=None, method=None,
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    # Accounts under $5 credit are throttled to ~1 prediction-create burst/min (429).
+    # 429 (low-credit throttle) and transient 5xx (gateway timeout / unavailable) are retried;
+    # any other status fails fast with a humanized message (see _http_error_message).
     for attempt in range(8):
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
-            if e.code == 429 and attempt < 7:
-                try:
-                    wait = int(json.loads(detail).get("retry_after", 15)) + 3
-                except (ValueError, AttributeError):
-                    wait = 15
-                time.sleep(wait)
+            if e.code in _RETRY_STATUS and attempt < 7:
+                time.sleep(_retry_wait(e.code, detail, attempt))
                 continue
-            raise ReplicateError(f"HTTP {e.code} from {url}\n{detail}") from e
-    raise ReplicateError(f"Gave up after repeated throttling: {url}")
+            raise ReplicateError(_http_error_message(e.code, url, detail)) from e
+    raise ReplicateError(f"Gave up retrying Replicate after repeated transient errors: {url}")
 
 
 def check_token() -> dict:
