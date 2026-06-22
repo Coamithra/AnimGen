@@ -28,7 +28,7 @@
         "1080p": 0.45
       },
       "duration_range": [
-        1,
+        4,
         15
       ],
       "resolution_options": [
@@ -68,7 +68,7 @@
         "720p": 0.15
       },
       "duration_range": [
-        1,
+        4,
         15
       ],
       "resolution_options": [

@@ -28,6 +28,14 @@ from pipeline import export, extract  # noqa: E402
 from store.project import Project  # noqa: E402
 from store.models import STATUS_DONE, STATUS_FAILED, STATUS_PENDING  # noqa: E402
 
+# Keep the suite hermetic: a MainWindow built here must NOT fire the opt-in startup Replicate
+# schema fetch. With the user's app_settings opting in AND a token resolvable via the source
+# project's .env, that fetch is a real network call on a daemon thread that outlives the test
+# and can race a later monkeypatch (it polluted the _ReplicateRefresher stop-flag test with a
+# stray real-roster fetch). Stub it in-memory only - never touch data/app_settings.json.
+from ui.main_window import MainWindow  # noqa: E402
+MainWindow._maybe_refresh_schemas_on_startup = lambda self: None  # type: ignore[assignment,method-assign]
+
 
 def _make_mp4(path: Path, n: int = 5) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -464,6 +472,42 @@ def test_format_generation_settings() -> None:
     print("take_player OK: format_generation_settings (full + sparse + empty)")
 
 
+def test_take_player_failure_message() -> None:
+    """A failed take surfaces its recorded backend error in place of the video; a cancelled
+    take shows a note; a pending/None take shows nothing special. Pure helper + viewer wiring."""
+    from PySide6.QtWidgets import QApplication
+
+    from store.models import (STATUS_CANCELLED, STATUS_FAILED, STATUS_GENERATING, Take)
+    from ui.take_player import TakePlayerTab, failure_message
+
+    err = "ReplicateError: ... Duration must be between 4 and 15 seconds, or -1."
+    failed = Take(id="f", shot_id="s", status=STATUS_FAILED, error=err)
+    msg = failure_message(failed)
+    assert msg and err in msg and "failed to generate" in msg
+
+    # A failed take with no recorded error still reads as a failure, not a blank.
+    bare = failure_message(Take(id="b", shot_id="s", status=STATUS_FAILED))
+    assert bare and "No error detail" in bare
+
+    # Cancelled vs crash-interrupted get distinct notes; pending / None get nothing.
+    assert "cancelled" in (failure_message(
+        Take(id="c", shot_id="s", status=STATUS_CANCELLED)) or "").lower()
+    assert "restarted" in (failure_message(
+        Take(id="i", shot_id="s", status=STATUS_CANCELLED, interrupted=True)) or "").lower()
+    assert failure_message(Take(id="p", shot_id="s", status=STATUS_GENERATING)) is None
+    assert failure_message(None) is None
+
+    # The viewer shows the error on its canvas (no video -> no decode thread spawned).
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-fast")
+    take = project.add_take(shot.id, status=STATUS_FAILED, error=err)
+    tab = TakePlayerTab(project, take.id)
+    assert err in tab.canvas.text()
+    tab.close_player()
+    print("take_player OK: failure_message (failed error + cancelled note + viewer canvas)")
+
+
 def test_snapshot_includes_framing() -> None:
     """generate_shot freezes canvas + crop into the take's immutable snapshot, so framing
     is preserved per take even after the shot is re-framed (the export/panel read it)."""
@@ -779,7 +823,9 @@ def test_refresher_survives_deleted_signals() -> None:
         app.processEvents()
     finally:
         (replicate_client.load_token, replicate_client.get_input_schema) = saved_c
-    assert fetched == [], fetched                       # stop flag bailed before any fetch
+    # stop flag bailed before ref3 fetched any of ITS OWN models (assert on ref3's models, not
+    # `fetched == []`, so a stray fetch from any other background refresher can't flake this).
+    assert "owner/m1" not in fetched and "owner/m2" not in fetched, fetched
     assert fired == [("finished", (0, 0, 0))], fired    # no per-model result, just finished
     print("model_library OK: refresher survives deleted signals (token/success) + cooperative stop")
 
@@ -993,6 +1039,7 @@ if __name__ == "__main__":
     test_tab_state_persists_on_close()
     test_tab_state_blank_tab_preserves_active()
     test_format_generation_settings()
+    test_take_player_failure_message()
     test_snapshot_includes_framing()
     test_generate_shot_missing_shot()
     test_take_player_settings_panel()

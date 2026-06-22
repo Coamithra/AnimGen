@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 import library
+from store.models import STATUS_CANCELLED, STATUS_FAILED
 from store.project import Project
 from ui.placement_widget import pil_to_qimage
 
@@ -88,6 +89,25 @@ def take_source(take) -> Optional[str]:
     for cand in (take.video_path, take.preview_gif):
         if cand and Path(cand).exists():
             return cand
+    return None
+
+
+def failure_message(take) -> Optional[str]:
+    """Why a take with no playable video has nothing to show: the recorded backend error for
+    a FAILED take, a short note for a CANCELLED one, else None (it's just still pending /
+    generating, or there's no take). Pure / Qt-free so it's headless-testable; the viewer
+    shows this on the canvas in place of the video."""
+    if take is None:
+        return None
+    status = getattr(take, "status", "")
+    if status == STATUS_FAILED:
+        err = (getattr(take, "error", None) or "").strip()
+        head = "This take failed to generate."
+        return f"{head}\n\n{err}" if err else f"{head}\n\n(No error detail was recorded.)"
+    if status == STATUS_CANCELLED:
+        if getattr(take, "interrupted", False):
+            return "This take was interrupted before it finished — it can be restarted."
+        return "This take was cancelled before it started generating."
     return None
 
 
@@ -192,6 +212,7 @@ class TakePlayerTab(QWidget):
         self.canvas = QLabel("Decoding frames…")
         self.canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.canvas.setMinimumSize(320, 240)
+        self.canvas.setWordWrap(True)          # so a failed take's error text wraps, not clips
         self.canvas.setStyleSheet("background:#111; color:#888;")
         # Right-click the video -> show the take's original generation settings.
         self.canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -386,7 +407,10 @@ class TakePlayerTab(QWidget):
         take = self.project.get_take(self.take_id)
         source = take_source(take) if take else None
         if not source:
-            self.canvas.setText("This take has no playable video yet.")
+            self.canvas.setText(failure_message(take) or "This take has no playable video yet.")
+            if take is not None and take.status == STATUS_FAILED:
+                # Make a failure read as a failure, not a still-decoding placeholder.
+                self.canvas.setStyleSheet("background:#1a1111; color:#e89090; padding:24px;")
             return
         self._loader = _FrameLoader(source)        # kept on self so it isn't GC'd mid-decode
         self._loader.done.connect(self._on_loaded)
