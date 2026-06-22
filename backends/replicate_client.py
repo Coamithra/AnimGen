@@ -10,6 +10,7 @@ uploading or creating a prediction (no network spend), for cost-gate previews.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import mimetypes
 import time
@@ -135,18 +136,78 @@ def check_token() -> dict:
     return api_request(load_token(), f"{API}/account")
 
 
-def upload_file(token: str, path: str | Path, as_data_uri: bool = False) -> str:
+DATA_URI_B64_CAP = 250_000     # ~183KB binary; Replicate's inline data-URI ceiling for
+                               # requires_data_uri models (vidu/q3-pro - no Files API there).
+_DATA_URI_BG = (255, 0, 255)   # pipeline/framing.MAGENTA - the keying-contract background.
+
+
+def _b64_len(raw: bytes) -> int:
+    return len(base64.b64encode(raw))
+
+
+def _flatten_to_bg(im, bg=_DATA_URI_BG):
+    """Composite any transparency onto the magenta keying background, returning an RGB image, so
+    quantizing can't leave a halo. A keypose rendered by the framing pipeline is already RGB on
+    magenta (this is a no-op there); it only guards a stray RGBA asset."""
+    from PIL import Image
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+        rgba = im.convert("RGBA")
+        canvas = Image.new("RGBA", rgba.size, bg + (255,))
+        canvas.alpha_composite(rgba)
+        return canvas.convert("RGB")
+    return im.convert("RGB")
+
+
+def _encode_png_quantized(im, colors: int) -> bytes:
+    """PNG-encode `im` reduced to an adaptive `colors`-entry palette - crisp sprite edges and the
+    flat magenta survive (unlike JPEG), at a fraction of a truecolor PNG's size."""
+    from PIL import Image
+    buf = io.BytesIO()
+    im.quantize(colors=colors, method=Image.Quantize.MEDIANCUT).save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def fit_data_uri(raw: bytes, cap: int = DATA_URI_B64_CAP) -> tuple[bytes, str]:
+    """Shrink an image so its base64 data-URI fits under `cap` chars, for models that inline the
+    input (vidu/q3-pro: no Files API). Quantize-first at full resolution - a flat-bg sprite often
+    fits on palette reduction alone - then progressively downscale + re-quantize. Returns
+    (png_bytes, "image/png"). Pure (no network); raises ReplicateError only if it can't get under
+    the cap even at the floor resolution (i.e. the bytes aren't a real image)."""
+    from PIL import Image
+    im = _flatten_to_bg(Image.open(io.BytesIO(raw)))
+    palettes = (256, 128, 64)
+    for colors in palettes:                                  # 1) palette reduction at full res
+        out = _encode_png_quantized(im, colors)
+        if _b64_len(out) <= cap:
+            return out, "image/png"
+    w, h = im.size                                           # 2) downscale + re-quantize to fit
+    floor = 64
+    for _ in range(16):
+        w, h = max(floor, int(w * 0.85)), max(floor, int(h * 0.85))
+        small = im.resize((w, h), Image.Resampling.LANCZOS)
+        for colors in palettes:
+            out = _encode_png_quantized(small, colors)
+            if _b64_len(out) <= cap:
+                return out, "image/png"
+        if w <= floor and h <= floor:
+            break
+    raise ReplicateError(
+        f"Could not shrink the image under the ~{cap // 1000}KB data-URI cap even after "
+        f"downscaling + quantizing - is it valid image data?")
+
+
+def upload_file(token: str, path: str | Path, as_data_uri: bool = False,
+                progress_cb: ProgressCb = None) -> str:
     path = Path(path)
     if not path.exists():
         raise ReplicateError(f"Input image not found: {path}")
     if as_data_uri:
-        b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-        if len(b64) > 250_000:
-            raise ReplicateError(
-                f"{path.name} encodes to {len(b64) // 1024}KB of base64 - over the "
-                f"~256KB data URI cap. Compress to <~185KB binary first.")
+        raw = path.read_bytes()
         mime = mimetypes.guess_type(str(path))[0] or "image/png"
-        return f"data:{mime};base64,{b64}"
+        if _b64_len(raw) > DATA_URI_B64_CAP:                 # too big to inline -> auto-shrink it
+            _log(progress_cb, f"input image over the data-URI cap, shrinking {path.name}")
+            raw, mime = fit_data_uri(raw)
+        return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
     mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
     boundary = uuid.uuid4().hex
     part = (
@@ -382,11 +443,11 @@ def generate(replicate_model_id: str, *, start: str, out_path: Path,
 
     props, _ = get_input_schema(token, replicate_model_id)
     _log(progress_cb, "uploading start frame")
-    start_url = upload_file(token, start, data_uri)
+    start_url = upload_file(token, start, data_uri, progress_cb)
     end_url = None
     if end:
         _log(progress_cb, "uploading end frame")
-        end_url = upload_file(token, end, data_uri)
+        end_url = upload_file(token, end, data_uri, progress_cb)
     inp = build_input(props, start_url=start_url, end_url=end_url, prompt=prompt,
                       negative=negative, duration=duration, resolution=resolution,
                       seed=seed, extra=extra)

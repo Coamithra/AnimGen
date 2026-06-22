@@ -446,6 +446,49 @@ def test_http_error_handling() -> None:
     print("replicate_client OK: humanized HTTP errors + transient 504/429 retry, 402 fails fast")
 
 
+def test_data_uri_fit() -> None:
+    """For requires_data_uri models (vidu/q3-pro) an oversized input is auto-shrunk under the
+    ~256KB base64 cap instead of being refused; a small image passes through untouched; the
+    fitter flattens transparency onto magenta. No network (the data-URI path never uploads)."""
+    import base64 as b64mod
+    import io as iomod
+    import tempfile
+    from pathlib import Path
+
+    import numpy as np
+    from PIL import Image
+
+    from backends import replicate_client as rc
+
+    cap = rc.DATA_URI_B64_CAP
+    tmp = Path(tempfile.mkdtemp())
+
+    # A hard-to-compress noise image starts well over the cap...
+    arr = np.random.default_rng(7).integers(0, 256, size=(525, 700, 3), dtype=np.uint8)
+    big = tmp / "big.png"
+    Image.fromarray(arr, "RGB").save(big)
+    assert rc._b64_len(big.read_bytes()) > cap, "test image must start over the cap"
+
+    uri = rc.upload_file("tok", big, as_data_uri=True)          # data-URI path: no network
+    assert uri.startswith("data:image/png;base64,"), uri[:40]
+    data = uri.split(",", 1)[1]
+    assert len(data) <= cap, f"shrunk data-URI still over cap: {len(data)} > {cap}"
+    Image.open(iomod.BytesIO(b64mod.b64decode(data))).load()     # still a decodable image
+
+    # A small image is returned byte-for-byte (no needless re-encode).
+    small = tmp / "small.png"
+    Image.new("RGB", (32, 32), (255, 0, 255)).save(small)
+    uri2 = rc.upload_file("tok", small, as_data_uri=True)
+    assert b64mod.b64decode(uri2.split(",", 1)[1]) == small.read_bytes(), "small image must pass through"
+
+    # The fitter flattens a transparent image onto magenta -> no alpha survives, fits the cap.
+    buf = iomod.BytesIO(); Image.new("RGBA", (300, 300), (0, 255, 0, 0)).save(buf, format="PNG")
+    out, mime = rc.fit_data_uri(buf.getvalue())
+    assert mime == "image/png" and rc._b64_len(out) <= cap
+    assert Image.open(iomod.BytesIO(out)).mode in ("RGB", "P")   # opaque, no transparency band
+    print("replicate_client OK: data-URI auto-shrink (oversized fits, small passes, alpha flattened)")
+
+
 def test_purge_takes() -> None:
     """Hard-delete: purge_takes drops takes from takes.json entirely (no bin/restore), deletes
     each take's MANAGED media (files under .assets) but leaves an EXTERNAL ref in place (gotcha
@@ -546,6 +589,7 @@ if __name__ == "__main__":
     test_keypose_migration_persist_failure()
     test_output_url_parsing()
     test_http_error_handling()
+    test_data_uri_fit()
     test_purge_takes()
     test_remove_cancelled_takes_action()
     test_gui_build()
