@@ -582,7 +582,10 @@ class TakesView(QWidget):
             t = self.project.get_take(tid)
             if t:
                 self.project.set_starred(tid, not t.starred)
-        self.load()
+                # Incremental in-place refresh, not load()'s model.clear()+rebuild + every-take PyAV
+                # strip re-decode, which froze the UI for seconds on a many-take row. update_take
+                # owns the membership-cross fallback to load() (card #75 incremental path).
+                self.update_take(tid)
         self.changed.emit()
 
     def _toggle_star_by_id(self, take_id: str) -> None:
