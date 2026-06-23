@@ -983,8 +983,60 @@ def test_take_player_gif_export() -> None:
     print("TakePlayerTab OK: GIF menu (source-gated), default name, encode + clipboard URL")
 
 
+def test_take_media_probe() -> None:
+    """A finished take must carry fps/frame_count probed off its produced video - no backend
+    runner reports them, so without the probe settings.txt prints 'fps: None' (card #80).
+    Covers the pure helper, the GenerationJob stamping path, and the export line."""
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import GenerationJob, _JobSignals
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    tmp = Path(tempfile.mkdtemp())
+    mp4 = _make_mp4(tmp / "clip.mp4", n=5)  # _make_mp4 encodes at rate=8 -> 8 fps, 5 frames
+
+    # pure helper: fills missing, preserves already-set, no-ops on missing path / unreadable file
+    assert extract.probe_media_fields(str(mp4)) == (8.0, 5)
+    assert extract.probe_media_fields(str(mp4), fps=12.0, frame_count=2) == (12.0, 2)
+    assert extract.probe_media_fields(None) == (None, None)
+    assert extract.probe_media_fields(str(tmp / "missing.mp4")) == (None, None)  # best-effort
+
+    # GenerationJob stamps the take from the runner's video_path
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_PENDING,
+                            settings_snapshot={"backend": "replicate", "seed": 7})
+    job = GenerationJob(project, take.id, "replicate", lambda p: {"video_path": str(mp4)},
+                        _JobSignals(), set(), set(), set(), lambda tid, st: None)
+    job.run()
+    got = project.get_take(take.id)
+    assert got.status == STATUS_DONE, got.status
+    assert got.fps == 8.0, got.fps
+    assert got.frame_count == 5, got.frame_count
+
+    # a take whose video can't be probed still completes cleanly (fields stay None, no crash)
+    take2 = project.add_take(shot.id, status=STATUS_PENDING,
+                             settings_snapshot={"backend": "replicate"})
+    job2 = GenerationJob(project, take2.id, "replicate",
+                         lambda p: {"video_path": str(tmp / "gone.mp4")},
+                         _JobSignals(), set(), set(), set(), lambda tid, st: None)
+    job2.run()
+    got2 = project.get_take(take2.id)
+    assert got2.status == STATUS_DONE and got2.fps is None and got2.frame_count is None
+
+    # export now writes real fps + frame_count into settings.txt (was 'fps: None')
+    res = export.export_takes(project, [take.id], dest_root=tmp / "exports")
+    flines = (res["parent"] / "settings.txt").read_text(encoding="utf-8").splitlines()
+    fps_line = next(l for l in flines if l.startswith("# fps:"))
+    fc_line = next(l for l in flines if l.startswith("# frame_count:"))
+    assert fps_line.split()[-1] == "8.0", fps_line
+    assert fc_line.split()[-1] == "5", fc_line
+    print("take media probe OK: fps/frame_count stamped (helper + job + export), best-effort")
+
+
 if __name__ == "__main__":
     test_export()
+    test_take_media_probe()
     test_extract_frames_wide_padding()
     test_window_builds()
     test_close_dirty_tab_guard()

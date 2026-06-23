@@ -18,6 +18,7 @@ import shiboken6
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
 from backends.crash_recovery import CRASH_INTERRUPTED_ATTR
+from pipeline import extract
 from store.project import Project
 from store.models import (
     STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
@@ -122,6 +123,12 @@ class GenerationJob(QRunnable):
 
         try:
             result = self.runner(progress) or {}
+            # No backend runner reports fps/frame_count, so probe the produced video to stamp
+            # them on the take (consumed by export's settings.txt and the shot editor's
+            # measured-fps readout). Best-effort - a probe failure leaves them None.
+            if result.get("video_path"):
+                result["fps"], result["frame_count"] = extract.probe_media_fields(
+                    result["video_path"], result.get("fps"), result.get("frame_count"))
             fields = {"status": STATUS_DONE,
                       "completed": datetime.now().isoformat(timespec="seconds")}
             for k in _TAKE_FIELDS:

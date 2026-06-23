@@ -38,7 +38,7 @@ import library
 import paths
 from backends import batch, comfy_client, crash_recovery, recovery, replicate_client, restart
 from backends.jobs import JobManager
-from pipeline import export, framing
+from pipeline import export, extract, framing
 from store import app_settings
 from store.project import Project
 from store.models import (
@@ -1297,9 +1297,12 @@ class MainWindow(QMainWindow):
                     dst = self.project.takes_dir / f"{p.take_id}.mp4"
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(p.output_path, dst)
+                    # Stamp fps/frame_count off the reclaimed video too - this path sets
+                    # video_path outside GenerationJob, so it'd otherwise leave them None.
+                    fps, frame_count = extract.probe_media_fields(str(dst))
                     self.project.update_take(
                         p.take_id, status=STATUS_DONE, video_path=str(dst),
-                        backend_job_id=p.prompt_id,
+                        fps=fps, frame_count=frame_count, backend_job_id=p.prompt_id,
                         completed=datetime.now().isoformat(timespec="seconds"))
                 except Exception as e:  # noqa: BLE001 - a failed copy must not abort the rest
                     self.project.update_take(p.take_id, status=STATUS_FAILED,
