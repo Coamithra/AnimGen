@@ -542,6 +542,54 @@ def test_takes_view_incremental_update() -> None:
     print("TakesView incremental OK: in-place tile update, icon cache, membership fallback")
 
 
+def test_take_star_toggle_incremental() -> None:
+    """toggle_star (badge click + right-click 'Toggle star') updates the starred take's tile IN
+    PLACE - same QStandardItem, no model.clear()+rebuild + every-take PyAV strip re-decode - which
+    was the seconds-long UI freeze. Only the one genuine membership cross (un-starring a shown take
+    under the Favorites filter) falls back to a full load()."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.takes_view import TakesView, _STAR_ROLE
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    t1 = project.add_take(shot.id, status=STATUS_DONE)
+    t2 = project.add_take(shot.id, status=STATUS_DONE)
+    tv = TakesView(project, shot.id)
+    assert tv.model.rowCount() == 2
+
+    # Star a take via toggle_star: the EXISTING item object survives (a load() would replace it),
+    # the star role flips, and the row count is unchanged (no rebuild).
+    item1 = tv._items[t1.id]
+    tv.toggle_star([t1.id])
+    assert tv._items[t1.id] is item1, "star toggle must not rebuild the model"
+    assert tv._items[t1.id].data(_STAR_ROLE) is True
+    assert project.get_take(t1.id).starred is True       # write-through persisted
+    assert tv.model.rowCount() == 2
+
+    # Un-star it again (still no membership change outside Favorites) - same in-place path.
+    tv.toggle_star([t1.id])
+    assert tv._items[t1.id] is item1
+    assert tv._items[t1.id].data(_STAR_ROLE) is False
+
+    # The badge-click entry point (_toggle_star_by_id) routes through the same in-place path.
+    item2 = tv._items[t2.id]
+    tv._toggle_star_by_id(t2.id)
+    assert tv._items[t2.id] is item2 and tv._items[t2.id].data(_STAR_ROLE) is True
+
+    # The `is item1`/`is item2` identity checks above are the regression guard for the optimization
+    # itself: a revert to the old unconditional load() rebuilds _items with fresh QStandardItems and
+    # would fail them. This last case instead guards the one correct fallback - un-starring a SHOWN
+    # starred take under the Favorites filter must drop it from the view (membership cross -> load()).
+    tv.filter.setCurrentText("Favorites")
+    assert tv.model.rowCount() == 1 and t2.id in tv._items
+    tv.toggle_star([t2.id])
+    assert tv.model.rowCount() == 0 and t2.id not in tv._items
+    print("TakesView star toggle OK: in-place tile update, no rebuild, Favorites membership fallback")
+
+
 def test_queue_view() -> None:
     """The Queue tab is a model + delegate with ZERO per-row widgets (rule #18 root cause):
     the child-widget count stays bounded no matter how deep the pending queue is, a progress
@@ -645,6 +693,7 @@ if __name__ == "__main__":
     test_takes_view()
     test_takes_view_incremental_update()
     test_take_star_badge()
+    test_take_star_toggle_incremental()
     test_take_progress_label()
     test_assets_view()
     test_asset_picker()
