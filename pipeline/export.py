@@ -42,6 +42,7 @@ def _settings_text(shot, take) -> str:
         lines.append(f"# cost_actual:      ${take.cost_actual}")
     lines += [
         f"# fps:              {take.fps}",
+        f"# frame_count:      {take.frame_count}",
         f"# source video:     {take.video_path}",
         "",
         "## settings_snapshot (the exact settings that produced this take)",

@@ -37,6 +37,28 @@ def video_info(video_path: str | Path) -> dict:
         container.close()
 
 
+def probe_media_fields(video_path: str | Path | None,
+                       fps: Optional[float] = None,
+                       frame_count: Optional[int] = None) -> tuple[Optional[float], Optional[int]]:
+    """Return (fps, frame_count), filling any that is None by probing video_path.
+
+    Backend runners report neither fps nor frame_count, so a finished take would carry
+    None for both (settings.txt then prints 'fps: None'). This stamps them off the produced
+    video. Best-effort: a missing/unreadable file leaves the unfilled field None and never
+    raises, so it can't fail a take that actually rendered."""
+    if not video_path or (fps is not None and frame_count is not None):
+        return fps, frame_count
+    try:
+        info = video_info(video_path)
+    except Exception:  # noqa: BLE001 - probing is best-effort; a bad file leaves fields None
+        return fps, frame_count
+    if fps is None:
+        fps = info.get("fps")
+    if frame_count is None:
+        frame_count = info.get("frames")
+    return fps, frame_count
+
+
 def extract_frames(video_path: str | Path, out_dir: str | Path, prefix: str = "frame_") -> list[Path]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
