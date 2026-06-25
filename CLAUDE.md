@@ -17,9 +17,21 @@ references assets for its start/end keyframes.
 
 - **GitHub:** https://github.com/Coamithra/AnimGen  (public, `main`)
 - **Trello (build board):** https://trello.com/b/7SycR6UZ  ("Animation Generator Tool").
-  **When grabbing a ticket from Trello, follow @CONTRIBUTING.md** — it's the
-  card-pickup runbook (two-phase claim handshake, worktree flow, smoke-gate, ship steps).
+  **When grabbing a ticket from Trello, follow the contributing runbook
+  (`~/.claude/CONTRIBUTING.md`)** — the card-pickup runbook (atomic grab claim, worktree
+  flow, smoke-gate, ship steps); AnimGen specifics are in the **Contributing workflow**
+  section below.
 - Origin/source project: *Fighter* (`../Fighter`), referenced at runtime — see "External wiring".
+
+## Contributing workflow
+
+Card -> worktree -> PR runbook: follow `~/.claude/CONTRIBUTING.md` (the global generic runbook). AnimGen specifics:
+
+- **Board:** Animation Generator Tool (https://trello.com/b/7SycR6UZ), id `6a2d752eee5f9d7478ad3250`, remote `trello` backend. Lists: To Do -> In Progress -> Done (plus a Notes / Decisions list). Atomic pickup: `trello --board 6a2d752eee5f9d7478ad3250 grab --from "To Do" --to "In Progress"`.
+- **Default branch:** `main`. **GitHub:** `Coamithra/AnimGen` (public; unprotected `main` -> PR + self-merge, no approval needed).
+- **Worktrees:** `.trees/wt<k>` (fixed slots `wt1`..`wt8`, gitignored). Bootstrap before running anything: `python -m venv .venv` then `.venv/Scripts/python.exe -m pip install -r requirements.txt`. A fresh worktree also lacks `data/` (runtime projects) - re-seed the starter project if the card needs it. From a worktree, smoke phase 6 needs the real Fighter root - prefix `ANIMGEN_FIGHTER_ROOT=C:/Programming/Fighter`.
+- **Verification gate:** the headless smoke suite IS the gate (no typecheck/build). Run phases 1-7 and **gate on the EXIT CODE, not the "PASS" line** (a teardown segfault after PASS still exits 139): `QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/smoke_phase<n>.py` for n in 1..7, breaking on a non-zero rc. Add/extend a phase for behaviour you changed; smoke tests stay headless (never `.exec()` a modal). Phase 8 (offline mock-ComfyUI integration) is opt-in. Manual UI verification via the built-in control server (`ANIMGEN_REMOTE=1` + `scripts/remote_cli.py`), NOT desktop computer-use.
+- **Cost/GPU gate:** a live hosted (Replicate) or local (ComfyUI) take spends money / GPU - fire one ONLY with the user's explicit go-ahead for that card. Driving the UI is free; verify backends offline (`scripts/mock_comfy.py` is the GPU-free harness). The cost-confirm gate still appears and must be driven, never bypassed.
 
 ## Status (2026-06-16)
 
@@ -659,3 +671,75 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     slicing left the freshly-finished result buried and the section frozen on old completions; ordering
     by completion surfaces it. Active rows still come first; `Clear finished` is how the user prunes the
     now-unbounded finished list. Smoke: `smoke_phase2.test_select_rows`.
+
+19. **Triaging an "AnimGen died" report - there are THREE distinct death modes; do NOT
+    assume it's the rule #18 crash.** The processes have died from at least three unrelated
+    causes - classify by *artifact* before concluding anything. (This decision tree + checklist
+    was built live during the **2026-06-19 00:54** death, which turned out to be Mode C.)
+
+    **Mode A - native stack-overflow crash (rule #18).** Tells: a faulthandler dump in
+    `data/animgen_faults.log` with the GUI thread deep in `QWidgetPrivate::paintSiblingsRecursive`;
+    WER **Event 1000** naming `Qt6Widgets.dll`, exception `0xC00000FD` (STATUS_STACK_OVERFLOW); a
+    **fresh minidump** in `data/crashdumps/` (WER LocalDumps is armed for `python.exe` via
+    `scripts/enable_crashdumps.py`); and the heartbeat *just before* death showing `max_widgets`
+    climbing into the thousands. Card #72 removed the prime trigger (the Queue's per-row widgets),
+    so this should no longer fire - if it does, that's a regression.
+
+    **Mode B - GPU TDR / nvlddmkm fault (rules #10/#15).** Tells: the System event log carries
+    **Event 153 (nvlddmkm)** and/or **4101 (display driver stopped responding / recovered)** at the
+    death time; ComfyUI's `data/comfyui_server.log` cuts off mid-render; and there is NO faulthandler
+    dump / NO minidump (a TDR is an external kill, not a Python/Qt fault). Per rule #15 AnimGen's
+    software-GL UI is meant to **survive** a TDR (only ComfyUI dies, then rule #12 restarts it) - so
+    if *both* died at a TDR, suspect `ANIMGEN_ALLOW_GPU_UI=1` was set, or it isn't actually a TDR.
+    (Recorded TDRs on this box: 2026-06-18 12:27 and 16:27.)
+
+    **Mode C - external force-kill of `python.exe` (what happened 2026-06-19 00:54).** Tells: **both**
+    `python.exe` processes (the AnimGen GUI **and** the ComfyUI server) vanish at the *same instant*;
+    the heartbeat is **healthy to its very last line** (`max_widgets` bounded ~16, `max_pydepth` flat
+    ~14, RSS flat ~760mb, mid-batch with `generating=1`); there is **no** faulthandler dump, **no new**
+    minidump (despite LocalDumps being armed), **no** System Event 153/4101, **no** Kernel-Power event;
+    and the machine stays **up** (no reboot). That exact combination means something *outside* the app
+    called `TerminateProcess` on `python.exe` - overwhelmingly a blanket **`taskkill /F /IM python.exe`**
+    (the image-name match kills *every* python at once, which is why the GUI and ComfyUI die together),
+    most plausibly a cleanup step in *another* Claude Code agent session (worktree cleanup is supposed
+    to kill by **PID**, never `/IM` - see the global "never blanket-kill python.exe" rule). **AnimGen
+    never does this to itself:** `comfy_client._kill_pid` only ever runs `taskkill /F /T /PID <specific
+    pid>`, and nothing else in the repo - including the `_`-prefixed diagnostic watchers, which only run
+    `netstat`/`tasklist` - blanket-kills python. No stop/shutdown/abandon/power line precedes the death
+    in `animgen.log` either, confirming it wasn't a self-inflicted batch-stop / power action.
+
+    **Forensic checklist (classify any death with these - all read-only):**
+    - `data/animgen.log` tail - the last heartbeat's `max_widgets` / `max_pydepth` / `rss`; the last
+      timestamp == the death time; grep the tail for `stop|shutdown|abandon|power|sleep` to rule out a
+      self-inflicted stop.
+    - `data/animgen_faults.log` - a faulthandler dump => native crash (Mode A); none => external kill (B/C).
+    - `data/comfyui_server.log` tail + mtime - did ComfyUI die at the same instant? (a clean mid-render
+      cut with no traceback => external kill, not a ComfyUI error).
+    - `data/crashdumps/` - a *new* `.dmp` => a real WER-caught crash; only the old
+      `python.exe.42392.0334.stackoverflow.dmp` => NOT a crash this time.
+    - `Get-WinEvent System` for **153 / 4101** (GPU) and **41 / 6008 / 109 / Kernel-Power** (power /
+      reboot / sleep); `Get-WinEvent Application` Id **1000** (WER crash).
+    - `tasklist //FI "IMAGENAME eq python.exe"` - is anything still alive?
+
+    **Catching the Mode-C killer - process-creation auditing (enabled 2026-06-19).** *Audit Process
+    Creation* (Security **Event 4688**) was turned on so the next external kill logs the
+    `taskkill.exe`/`wmic` process **and its `Creator Process Name` (the parent == the actual culprit)**.
+    Three gotchas, all hit while setting it up:
+    1. **Reading the Security log needs admin or *Event Log Readers* membership.** The non-elevated
+       Claude Code Bash shell **cannot** read it - `Get-WinEvent -LogName Security` comes back empty and
+       `auditpol /get` fails with `0x00000522 "A required privilege is not held by the client"`. So run
+       the post-mortem query in an **elevated** shell, or add `coami` to the *Event Log Readers* group
+       (only takes effect on the next logon, since group membership is baked into the logon token).
+    2. **Command-line capture is a SEPARATE setting** from the audit subcategory. Without
+       `HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit\ProcessCreationIncludeCmdLine_Enabled = 1`
+       (REG_DWORD, admin), the 4688 names `taskkill.exe` + its parent but **not** its `/IM python.exe`
+       argument. As of 2026-06-19 the subcategory is on but this key is **not yet set** - enable it for
+       the full picture.
+    3. **Auditing only catches kills that SPAWN a process** - `taskkill.exe`, `wmic process delete` -
+       which does cover the #1 suspect (an agent's Bash `taskkill /F /IM python.exe`). An **API-based**
+       kill (PowerShell `Stop-Process`, Task Manager *End task*, a python `os.kill`) spawns nothing and
+       leaves **no 4688** - so a textbook Mode-C death with *no* matching 4688 is itself the clue: it
+       points to an in-process/API kill (Task Manager / `Stop-Process`), not a spawned `taskkill`.
+
+    Post-death query (elevated): `Get-WinEvent -FilterHashtable @{LogName='Security';Id=4688;StartTime=(Get-Date).AddHours(-1)} | ? { $_.Message -match 'taskkill|wmic|Stop-Process' } | fl TimeCreated,Message`
+    - the `Creator Process Name` line in the matching event names who did it.
