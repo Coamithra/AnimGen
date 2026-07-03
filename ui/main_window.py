@@ -182,6 +182,11 @@ class MainWindow(QMainWindow):
         exp_view = QAction("Export view", self)
         exp_view.triggered.connect(self.export_current_view)
         tb.addAction(exp_view)
+        exp_starred = QAction("Export starred takes", self)
+        exp_starred.setToolTip("Export every starred take across the shots currently shown "
+                               "(obeys the model / starred-shot view filters)")
+        exp_starred.triggered.connect(self.export_starred_takes)
+        tb.addAction(exp_starred)
         batch_act = QAction("Generate batch...", self)
         batch_act.setToolTip("Queue every eligible shot for an unattended (overnight) run, "
                              "with optional power-down when it finishes")
@@ -598,8 +603,15 @@ class MainWindow(QMainWindow):
         shot = self.project.get_shot(take.shot_id)
         title = f"▶ {shot.name if shot else take.shot_id[:6]} · {take_id[:6]}"
         tab = TakePlayerTab(self.project, take_id)
+        tab.star_changed.connect(self._on_take_star_changed)
         self.take_tabs[take_id] = tab
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, title))
+
+    def _on_take_star_changed(self, take_id: str) -> None:
+        """A take's star was toggled from its player tab: refresh the matching grid tile in
+        place (card #75 incremental path) so the shot card / shot tab shows the new star, and
+        the header star-filter counts stay accurate."""
+        self._refresh_shot_for_take(take_id)
 
     def duplicate_shot(self, shot_id: str) -> None:
         dup = self.project.duplicate_shot(shot_id)
@@ -1469,6 +1481,19 @@ class MainWindow(QMainWindow):
         for card in self.cards.values():
             ids.extend(card._row_export_ids())
         self.export_takes(ids, label="view")
+
+    def export_starred_takes(self) -> None:
+        """Export every starred take across the shots currently shown (obeys the view
+        filters, like Export view). Iterates the displayed cards so the model/starred-shot
+        filters apply, and delegates to the shared export path."""
+        ids = []
+        for shot_id in self.cards:
+            ids.extend(t.id for t in self.project.list_takes(shot_id, starred_only=True))
+        if not ids:
+            QMessageBox.information(self, "Export starred takes",
+                                    "No starred takes in the current view.")
+            return
+        self.export_takes(ids, label="starred")
 
     def _report_export(self, res: dict) -> None:
         parent = res.get("parent")

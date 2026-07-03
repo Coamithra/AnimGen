@@ -312,6 +312,99 @@ def test_take_progress_label() -> None:
     print("TakesView progress OK: generating tile shows live %, done tile ignores late tail")
 
 
+def test_take_tile_tooltip() -> None:
+    """A take tile's rich hover tooltip surfaces the per-take metadata the tile can't (status,
+    when queued, seed, render duration, cost, model/backend) and the full error text for a
+    FAILED take, so a failed tile reveals *why* without opening the viewer (card UX7). The
+    helper is pure (Take in -> string out): no disk/PyAV/library access, so it stays cheap to
+    build per tile on the GUI thread."""
+    from PySide6.QtWidgets import QApplication
+
+    from store.models import Take
+    from ui.takes_view import TakesView, take_tile_tooltip, _render_duration
+
+    # Pure duration helper (headless): started -> completed, "" on missing / unparseable / skew.
+    assert _render_duration("2026-06-18T10:00:00", "2026-06-18T10:00:12") == "12s"
+    assert _render_duration("2026-06-18T10:00:00", "2026-06-18T10:03:15") == "3m15s"
+    assert _render_duration("2026-06-18T10:00:00", "2026-06-18T11:02:03") == "1h2m3s"
+    assert _render_duration("", "2026-06-18T10:00:12") == ""          # missing start
+    assert _render_duration("2026-06-18T10:00:12", "2026-06-18T10:00:00") == ""  # negative -> ""
+    assert _render_duration("garbage", "2026-06-18T10:00:12") == ""   # unparseable -> ""
+
+    assert take_tile_tooltip(None) == ""
+
+    # A done take: status, model+backend, created, render time, seed, and (actual) cost.
+    done = Take(
+        id="d1", shot_id="s", status=STATUS_DONE,
+        settings_snapshot={"model_id": "seedance-2.0-std", "backend": "replicate",
+                           "settings": {"seed": 777}},
+        seed=1234, cost_estimate=0.05, cost_actual=0.042,
+        created="2026-06-18T10:00:00", started="2026-06-18T10:00:03",
+        completed="2026-06-18T10:00:15",
+    )
+    tip = take_tile_tooltip(done)
+    assert "Status: done" in tip
+    assert "Model: seedance-2.0-std (replicate)" in tip
+    assert "Created: 2026-06-18T10:00:00" in tip
+    assert "Render time: 12s" in tip                     # started -> completed, not created
+    assert "Seed: 1234" in tip                            # take.seed (authoritative post-roll)
+    assert "Cost: $0.042" in tip and "Est. cost" not in tip   # actual present -> actual shown
+
+    # A failed take: the FULL error text is in the tooltip so the tile reveals why.
+    failed = Take(
+        id="f1", shot_id="s", status=STATUS_FAILED,
+        error="CUDA out of memory: tried to allocate 2.5 GiB",
+    )
+    ftip = take_tile_tooltip(failed)
+    assert "Status: failed" in ftip
+    assert "Error:" in ftip
+    assert "CUDA out of memory: tried to allocate 2.5 GiB" in ftip
+
+    # A failed take with no recorded error still gets an explicit note (not a bare "Error:").
+    assert "(no error detail was recorded)" in take_tile_tooltip(
+        Take(id="f2", shot_id="s", status=STATUS_FAILED))
+
+    # A crash-interrupted FAILED take is restartable (rule #17) - the error label says so, so a
+    # hover distinguishes a crash victim from a genuine workflow failure.
+    itip = take_tile_tooltip(
+        Take(id="f3", shot_id="s", status=STATUS_FAILED, interrupted=True, error="lost render"))
+    assert "restartable" in itip and "lost render" in itip
+    assert "restartable" not in ftip                     # a genuine failure is NOT labelled restartable
+
+    # Est. cost is labelled as an estimate when no actual is recorded; a not-yet-rolled take
+    # shows no seed (the snapshot's pre-roll placeholder is deliberately not surfaced) and no
+    # render-time line (not finished).
+    pend = Take(id="p1", shot_id="s", status=STATUS_PENDING, cost_estimate=0.08,
+                settings_snapshot={"settings": {"seed": 999}})
+    ptip = take_tile_tooltip(pend)
+    assert "Est. cost: $0.080" in ptip
+    assert "Seed" not in ptip                             # no post-roll seed yet -> no seed line
+    assert "Render time" not in ptip                     # not finished -> no duration line
+
+    # Wired live: the tooltip is set on the item in load() (full metadata) and refreshed in
+    # update_take() on a status transition - both go through the real widget, not just the helper.
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    d = project.add_take(
+        shot.id, status=STATUS_DONE, seed=1234, cost_estimate=0.05,
+        settings_snapshot={"model_id": "seedance-2.0-std", "backend": "replicate"},
+        started="2026-06-18T10:00:00", completed="2026-06-18T10:00:12")
+    tv = TakesView(project, shot.id)
+    dtip = tv._items[d.id].toolTip()                      # what actually landed on the item via load()
+    assert "Status: done" in dtip
+    assert "Model: seedance-2.0-std (replicate)" in dtip
+    assert "Render time: 12s" in dtip and "Seed: 1234" in dtip and "Est. cost: $0.050" in dtip
+    t = project.add_take(shot.id, status=STATUS_PENDING, cost_estimate=0.05)
+    tv.load()
+    assert "Status: pending" in tv._items[t.id].toolTip()
+    project.update_take(t.id, status=STATUS_FAILED, error="boom")
+    tv.update_take(t.id)
+    assert "Status: failed" in tv._items[t.id].toolTip()
+    assert "boom" in tv._items[t.id].toolTip()           # error refreshed on the transition
+    print("TakesView tooltip OK: rich per-take metadata, full error + interrupted note, live on load/update")
+
+
 def test_bin_neutralizes_queued_take() -> None:
     """Deleting a non-terminal take to the bin must first neutralize it in the queue (H2):
     a PENDING take is cancelled (so its runnable never fires the backend), a GENERATING one
@@ -374,6 +467,46 @@ def test_bin_neutralizes_queued_take() -> None:
     assert project2.get_take(binned2.id).status == STATUS_CANCELLED
     assert project2.get_take(binned3.id).status == STATUS_CANCELLED
     print("TakesView bin OK: pending cancelled + generating stopped on bin; scans sweep binned")
+
+
+def test_takes_view_stop_rendering_menu() -> None:
+    """The takes-grid right-click menu (no exec()) offers 'Stop rendering' for a GENERATING take
+    when a JobManager is wired in, routing to request_stop so spend/GPU halts in place (UX1). A
+    non-generating take (or a view with no jobs) offers no such entry."""
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+    from ui.takes_view import TakesView
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    jm = JobManager(project)
+    g = project.add_take(shot.id, status=STATUS_GENERATING,
+                         settings_snapshot={"backend": "replicate"})
+    d = project.add_take(shot.id, status=STATUS_DONE)
+
+    tv = TakesView(project, shot.id, jobs=jm)
+    # A GENERATING take offers Stop rendering.
+    assert "Stop rendering" in [a.text() for a in tv._build_context_menu([g.id]).actions()]
+    # A DONE take does not.
+    assert "Stop rendering" not in [a.text() for a in tv._build_context_menu([d.id]).actions()]
+    # A mixed selection offers it (acting only on the generating take).
+    labels = [a.text() for a in tv._build_context_menu([g.id, d.id]).actions()]
+    assert "Stop rendering" in labels
+
+    # Firing it routes to JobManager.request_stop, which flags the take in _stopping (the worker
+    # would unwind it to CANCELLED). replicate + no backend_job_id keeps the backend cancel a
+    # no-op, so no network is touched.
+    tv.stop_rendering([g.id])
+    assert g.id in jm._stopping
+
+    # A view with NO JobManager (plain viewer / headless) offers nothing to stop and no-ops safely.
+    tv_nojobs = TakesView(project, shot.id)
+    assert "Stop rendering" not in [a.text() for a in tv_nojobs._build_context_menu([g.id]).actions()]
+    tv_nojobs.stop_rendering([g.id])   # no jobs -> silent no-op, must not raise
+    print("TakesView stop-rendering menu OK: generating-only, jobs-gated, routes to request_stop")
 
 
 def test_runner_uses_snapshot_not_live_shot() -> None:
@@ -654,6 +787,62 @@ def test_take_star_toggle_incremental() -> None:
     print("TakesView star toggle OK: in-place tile update, no rebuild, Favorites membership fallback")
 
 
+def test_takes_view_keyboard() -> None:
+    """Keyboard triage in the takes grid (card UX4): Delete bins the selection, S toggles its
+    star, Enter/Return opens the first selected take in the viewer. All route through the same
+    delete/toggle_star/open_take_requested the mouse uses; a no-selection triage key is consumed
+    but harmless; an unrelated key falls through (handle_grid_key returns False)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from ui.takes_view import TakesView, _STAR_ROLE, _TakesListView
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    t1 = project.add_take(shot.id, status=STATUS_DONE)
+    t2 = project.add_take(shot.id, status=STATUS_DONE)
+    tv = TakesView(project, shot.id)
+    assert isinstance(tv.view, _TakesListView)
+
+    def select(*take_ids):
+        sm = tv.view.selectionModel()
+        sm.clear()
+        for tid in take_ids:
+            sm.select(tv.model.indexFromItem(tv._items[tid]),
+                      sm.SelectionFlag.Select)
+
+    # S on a selection toggles its star (write-through), in place - the item survives.
+    select(t1.id)
+    item1 = tv._items[t1.id]
+    assert tv.handle_grid_key(int(Qt.Key.Key_S)) is True
+    assert project.get_take(t1.id).starred is True
+    assert tv._items[t1.id] is item1 and tv._items[t1.id].data(_STAR_ROLE) is True
+
+    # Enter/Return opens the first selected take in the viewer (bubbles up to MainWindow).
+    opened: list[str] = []
+    tv.open_take_requested.connect(opened.append)
+    select(t2.id, t1.id)
+    assert tv.handle_grid_key(int(Qt.Key.Key_Return)) is True
+    assert len(opened) == 1 and opened[0] in (t1.id, t2.id)   # ids[0] of the selection
+    assert tv.handle_grid_key(int(Qt.Key.Key_Enter)) is True   # numpad Enter is also handled
+    assert len(opened) == 2
+
+    # Delete bins the whole selection (same neutralize+move_to_bin path as the menu).
+    select(t1.id, t2.id)
+    assert tv.handle_grid_key(int(Qt.Key.Key_Delete)) is True
+    assert project.get_take(t1.id).deleted and project.get_take(t2.id).deleted
+    assert tv.model.rowCount() == 0
+
+    # A triage key with nothing selected is consumed (so it doesn't type-ahead search) but is
+    # otherwise a no-op; a non-triage key falls through to QListView (returns False).
+    select()
+    assert tv.handle_grid_key(int(Qt.Key.Key_Delete)) is True
+    assert tv.handle_grid_key(int(Qt.Key.Key_A)) is False
+    print("TakesView keyboard OK: Delete bins, S stars, Enter opens; empty-sel no-op; other keys fall through")
+
+
 def test_queue_view() -> None:
     """The Queue tab is a model + delegate with ZERO per-row widgets (rule #18 root cause):
     the child-widget count stays bounded no matter how deep the pending queue is, a progress
@@ -726,11 +915,23 @@ def test_queue_view() -> None:
     app.processEvents()                                        # fire the coalescing timer
     assert qv._rebuild_count == before + 1, qv._rebuild_count  # one rebuild, not 204
 
-    # (d) The queued-take right-click menu (no exec()) only offers Cancel for PENDING takes.
+    # (d) The queue-row right-click menu (no exec()): a PENDING take offers Cancel, a GENERATING
+    #     take offers Stop rendering (UX1), and a mixed selection offers both.
     pending_id = next(t.id for t in qv.model.rows() if t.status == STATUS_PENDING)
     menu = qv._build_context_menu([pending_id])
     assert [a.text() for a in menu.actions()] == ["Cancel queued generation"]
-    assert qv._build_context_menu([g.id]).actions() == []      # a generating take: nothing to cancel
+    menu = qv._build_context_menu([g.id])                      # a GENERATING take: Stop rendering
+    assert [a.text() for a in menu.actions()] == ["Stop rendering"]
+    menu = qv._build_context_menu([pending_id, g.id])         # mixed: both entries present
+    assert [a.text() for a in menu.actions()] == ["Cancel queued generation", "Stop rendering"]
+    # Firing Stop rendering routes to JobManager.request_stop, which flags the generating take in
+    # _stopping (the worker would then unwind it to CANCELLED). Use a REPLICATE take with no
+    # backend_job_id so the backend cancel is a no-op - no live GPU/network is touched (a comfyui
+    # stop would POST /interrupt to a down server and block on the socket timeout).
+    gr = add(STATUS_GENERATING, backend="replicate")
+    qv.refresh()
+    qv._stop([gr.id])
+    assert gr.id in jobs._stopping
 
     # (d2) Header gains a cumulative 'N done' counter and the 'Last finished' strip surfaces the
     #      newest finished take, so a result is visible without scrolling the queue (card #77).
@@ -749,7 +950,7 @@ def test_queue_view() -> None:
     #     asserts above don't exercise the paint path.
     qv.resize(900, 360)
     assert not qv.grab().isNull()
-    print("QueueView OK: zero per-row widgets, bounded child count, 1-row progress, coalesced rebuild, cancel menu, done counter, last-finished strip, paint")
+    print("QueueView OK: zero per-row widgets, bounded child count, 1-row progress, coalesced rebuild, cancel + stop-rendering menu, done counter, last-finished strip, paint")
 
 
 def test_recovery_banner_predicate() -> None:
@@ -837,8 +1038,11 @@ if __name__ == "__main__":
     test_takes_view_incremental_update()
     test_take_star_badge()
     test_take_star_toggle_incremental()
+    test_takes_view_keyboard()
     test_take_progress_label()
+    test_take_tile_tooltip()
     test_bin_neutralizes_queued_take()
+    test_takes_view_stop_rendering_menu()
     test_assets_view()
     test_asset_picker()
     test_card_and_window()

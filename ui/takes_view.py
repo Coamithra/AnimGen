@@ -12,6 +12,7 @@ user drag an explicit height (double-click it to return to auto-fit).
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal
@@ -81,6 +82,84 @@ def take_tile_label(status: str, take_id: str, pct: str = "") -> str:
     else:
         tail = f"  {status}"
     return f"{badge}{tail}".strip() or take_id[:6]
+
+
+def _render_duration(started: str, completed: str) -> str:
+    """Human render duration between two second-precision ISO stamps (started -> completed),
+    e.g. "3m15s". Both come from store.project._now() / jobs.GenerationJob (no timezone), so a
+    plain fromisoformat diff is safe. Returns "" if either is missing/unparseable or the span is
+    negative (clock skew). Same arithmetic as queue_view._elapsed, kept local so this module stays
+    pure and Qt-free without importing the queue view; unlike queue_view.done_elapsed it does NOT
+    fall back to `created` for the start, so a take with no `started` stamp shows no duration line
+    rather than mislabelling its queue wait as render time. Pure so it's unit-testable headlessly."""
+    if not started or not completed:
+        return ""
+    try:
+        secs = int((datetime.fromisoformat(completed)
+                    - datetime.fromisoformat(started)).total_seconds())
+    except ValueError:
+        return ""
+    if secs < 0:
+        return ""
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m}m{s}s"
+    if m:
+        return f"{m}m{s}s"
+    return f"{s}s"
+
+
+def take_tile_tooltip(take) -> str:
+    """Rich hover tooltip for a take's grid tile: the per-take metadata the tile itself can't
+    show (status, when queued, seed, render duration, cost, model/backend) plus the full error
+    text for a FAILED take - so a failed tile reveals *why* without opening the viewer (card UX7).
+
+    Reads only fields already in memory on the Take + its immutable settings_snapshot (rule #3) -
+    no disk/PyAV access, so it's cheap to build per tile on the GUI thread. Model shows the raw
+    snapshot `model_id` rather than the roster display name, so it stays a pure, Qt/library-free
+    helper and doesn't re-parse model_library.json per tile (review finding #3). Pure so it's
+    unit-testable headlessly."""
+    if take is None:
+        return ""
+    snap = take.settings_snapshot or {}
+    lines: list[str] = []
+
+    status = take.status or ""
+    lines.append(f"Status: {status}" if status else "Status: (unknown)")
+
+    model_id = snap.get("model_id")
+    if model_id:
+        backend = snap.get("backend")
+        lines.append(f"Model: {model_id}" + (f" ({backend})" if backend else ""))
+
+    if take.created:
+        lines.append(f"Created: {take.created}")
+
+    dur = _render_duration(take.started or "", take.completed or "")
+    if dur:
+        lines.append(f"Render time: {dur}")
+
+    # take.seed is the authoritative post-roll value; the snapshot's settings seed is the
+    # pre-roll value frozen at launch (a placeholder before a batch take's per-take reroll in
+    # _queue_take), so only show a seed once the take actually has one assigned.
+    if take.seed is not None:
+        lines.append(f"Seed: {take.seed}")
+
+    cost = take.cost_actual if take.cost_actual is not None else take.cost_estimate
+    if cost is not None:
+        prefix = "Cost" if take.cost_actual is not None else "Est. cost"
+        lines.append(f"{prefix}: ${cost:.3f}")
+
+    if status == "failed":
+        err = (take.error or "").strip()
+        lines.append("")
+        # A crash/death-interrupted take (rule #17) is restartable; a genuine workflow failure
+        # is not - surface which one this is so a hover distinguishes them without the viewer.
+        lines.append("Error (interrupted by crash - restartable):" if take.interrupted else "Error:")
+        lines.append(err or "(no error detail was recorded)")
+
+    return "\n".join(lines)
 
 
 def columns_for(viewport_width: int, icon_size: int) -> int:
@@ -220,6 +299,22 @@ class _ResizeHandle(QFrame):
         event.accept()
 
 
+class _TakesListView(QListView):
+    """The grid's QListView with keyboard triage shortcuts, so a review pass over N takes
+    never has to leave the keyboard (card UX4). Keys act on the current selection through the
+    owner TakesView's existing action methods (delete / toggle_star / open-in-viewer), so the
+    same queue-neutralize + write-through invariants apply as the mouse paths - the view only
+    supplies the key binding. Unhandled keys (arrows, page-up/down, type-ahead) fall through to
+    QListView so its native selection navigation is unchanged."""
+    def __init__(self, owner: "TakesView"):
+        super().__init__()
+        self._owner = owner
+
+    def keyPressEvent(self, event):  # noqa: N802 - Qt override
+        if not self._owner.handle_grid_key(event.key()):
+            super().keyPressEvent(event)
+
+
 class TakesView(QWidget):
     changed = Signal()
     export_requested = Signal(list)   # list[take_id]
@@ -274,7 +369,7 @@ class TakesView(QWidget):
         head.addWidget(export_btn)
 
         self.model = QStandardItemModel()
-        self.view = QListView()
+        self.view = _TakesListView(self)
         self.view.setModel(self.model)
         self.view.setViewMode(QListView.ViewMode.IconMode)
         self.view.setResizeMode(QListView.ResizeMode.Adjust)
@@ -311,6 +406,7 @@ class TakesView(QWidget):
             item = QStandardItem(self._icon_for(t), self._label(t))
             item.setData(t.id, _USER_ROLE)
             item.setData(bool(t.starred), _STAR_ROLE)
+            item.setToolTip(take_tile_tooltip(t))
             item.setEditable(False)
             self.model.appendRow(item)
             self._items[t.id] = item
@@ -342,6 +438,7 @@ class TakesView(QWidget):
             return
         item.setText(self._label(t))
         item.setData(bool(t.starred), _STAR_ROLE)
+        item.setToolTip(take_tile_tooltip(t))
         if take_id not in self._strips and take_id not in self._strip_pending:
             # Not animating yet: refresh the static thumbnail, and if the take just became
             # playable (e.g. it finished rendering) kick off a single-take strip decode so it
@@ -546,6 +643,27 @@ class TakesView(QWidget):
     def all_take_ids(self) -> list:
         return [self.model.item(r).data(_USER_ROLE) for r in range(self.model.rowCount())]
 
+    def handle_grid_key(self, key: int) -> bool:
+        """Map a triage key to a selection action (card UX4). Delete -> bin, S -> toggle star,
+        Enter/Return -> open the first selected take in the viewer. Returns True when the key was
+        consumed (so the view doesn't also run its default handling), False to fall through to
+        QListView's native navigation. A no-selection triage key is consumed but does nothing, so
+        it doesn't accidentally type-ahead search. Routed through the same delete/toggle_star/
+        _open_in_viewer the mouse uses, so the queue-neutralize + write-through invariants hold."""
+        if key in (int(Qt.Key.Key_Delete), int(Qt.Key.Key_S),
+                   int(Qt.Key.Key_Return), int(Qt.Key.Key_Enter)):
+            ids = self.selected_take_ids()
+            if not ids:
+                return True
+            if key == int(Qt.Key.Key_Delete):
+                self.delete(ids)
+            elif key == int(Qt.Key.Key_S):
+                self.toggle_star(ids)
+            else:                                      # Return / Enter
+                self.open_take_requested.emit(ids[0])
+            return True
+        return False
+
     def _context_menu(self, pos) -> None:
         ids = self.selected_take_ids()
         if not ids:
@@ -571,6 +689,17 @@ class TakesView(QWidget):
             menu.addAction(label).triggered.connect(
                 lambda: self.restart_requested.emit(restartable))
             menu.addSeparator()
+        # Stop an in-flight render in place (halts spend/GPU on both backends). Only offered
+        # when a JobManager is wired in (plain viewers / headless tests have none) and the
+        # selection holds a GENERATING take; request_stop records it CANCELLED as it unwinds.
+        if self.jobs is not None:
+            generating = [tid for tid in ids
+                          if (t := self.project.get_take(tid)) and t.status == "generating"]
+            if generating:
+                label = ("Stop rendering" if len(generating) == 1
+                         else f"Stop rendering {len(generating)} takes")
+                menu.addAction(label).triggered.connect(lambda: self.stop_rendering(generating))
+                menu.addSeparator()
         menu.addAction("Toggle star").triggered.connect(lambda: self.toggle_star(ids))
         menu.addAction("Delete (to bin)").triggered.connect(lambda: self.delete(ids))
         menu.addAction("Export selected").triggered.connect(
@@ -592,6 +721,18 @@ class TakesView(QWidget):
         """Flip one take's star (from the clickable badge). Write-through via toggle_star, so
         it persists instantly - same as the right-click 'Toggle star'."""
         self.toggle_star([take_id])
+
+    def stop_rendering(self, ids: list) -> None:
+        """Stop each in-flight (GENERATING) render in place - halts spend/GPU on both backends
+        (comfy interrupt / replicate cancel) via JobManager.request_stop, which also flags the
+        take so the worker records it CANCELLED, not FAILED, as it unwinds. Best-effort and a
+        no-op for a take that isn't GENERATING. The tile refreshes when the resulting
+        status_changed reaches update_take; no full reload here (the worker unwinds async)."""
+        if self.jobs is None:
+            return
+        for tid in ids:
+            self.jobs.request_stop(tid)
+        self.changed.emit()
 
     def delete(self, ids: list) -> None:
         for tid in ids:
