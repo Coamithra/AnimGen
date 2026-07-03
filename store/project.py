@@ -33,7 +33,9 @@ worker threads can update takes off the GUI thread.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
+import logging
 import os
 import shutil
 import threading
@@ -46,8 +48,19 @@ from typing import Iterable, Optional
 import paths
 from store.models import STATUS_CANCELLED, STATUS_FAILED, Job, Shot, Take
 
+# Child of the "animgen" logger applog configures, so store-side warnings reach the log file
+# + console (e.g. the L3 orphan-take-preserved notice) without store importing applog.
+_log = logging.getLogger("animgen.store.project")
+
 FORMAT = "animgen-project"
 VERSION = 1
+
+# Declared field names per dataclass - update_shot/update_take reject any kwarg not in these
+# (L4). setattr of an arbitrary key would serialize into the .animproj/takes.json and then make
+# Shot(**d)/Take(**d) TypeError on the NEXT load, bricking the file; filtering keeps one stray
+# key (a typo, a dropped field from a newer build) from being persisted in the first place.
+_SHOT_FIELDS = frozenset(f.name for f in dataclasses.fields(Shot))
+_TAKE_FIELDS = frozenset(f.name for f in dataclasses.fields(Take))
 
 # Dataclass path fields that may point into assets_dir (and so get relativized on save).
 _SHOT_PATHS = ("start_frame", "end_frame")
@@ -91,16 +104,23 @@ def new_id() -> str:
 def _atomic_write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{new_id()}.tmp")  # unique tmp: no concurrent clobber
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    for attempt in range(5):                              # Windows: AV/indexer can hold a brief lock
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            if attempt == 4:
-                tmp.unlink(missing_ok=True)
-                raise
-            time.sleep(0.05)
+    # finally-unlink so NO failure path leaks the uniquely-named tmp: a write_text error (disk
+    # full, encode error), a non-PermissionError os.replace failure, or the exhausted-retry
+    # re-raise all clean up. On success os.replace has already consumed tmp, so the unlink is a
+    # harmless no-op (missing_ok). (L19: previously only the exhausted-retry path unlinked, so
+    # every other failure orphaned a *.tmp beside the target.)
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        for attempt in range(5):                          # Windows: AV/indexer can hold a brief lock
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 class Project:
@@ -121,6 +141,12 @@ class Project:
         # any concurrent write-through keeps them on disk; save() clears the buffer, making the
         # purge durable exactly when the authoring deletion lands.
         self._pending_take_purge: dict[str, Take] = {}
+        # Takes loaded from takes.json whose shot_id matches no shot (L3). Kept out of the live
+        # view/queue but STILL serialized by _write_takes_file, so a write-through can't
+        # permanently erase a take whose shot is only transiently missing (a half-written
+        # .animproj, a shot deleted-but-unsaved in a prior session). UNLIKE _pending_take_purge
+        # this is NOT cleared by save() - orphans are preserved indefinitely, not purged.
+        self._orphan_takes: dict[str, Take] = {}
         self._jobs: dict[str, Job] = {}          # in-memory only, never persisted
         self.dirty = False                       # unsaved *authoring* edits
         self.ui_state: dict = {}                 # per-project window layout (open tabs); UI-owned
@@ -143,11 +169,38 @@ class Project:
             proj._shots[shot.id] = shot
         takes_file = assets / "takes.json"
         if takes_file.exists():
-            tdoc = json.loads(takes_file.read_text(encoding="utf-8"))
+            try:
+                tdoc = json.loads(takes_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                # L2: a corrupt/unreadable takes.json must NOT make the whole project
+                # unopenable. Degrade to zero takes + warn, and move the bad file ASIDE (not
+                # overwrite it) so the first write-through can't clobber whatever might be
+                # manually recoverable. The project opens with its shots intact.
+                tdoc = {"takes": []}
+                try:
+                    bad = takes_file.with_name(f"{takes_file.name}.corrupt.{new_id()}.bak")
+                    takes_file.rename(bad)
+                    _log.warning("takes.json unreadable for %s (%s); opened with zero takes, "
+                                 "moved the bad file aside to %s", path, e, bad.name)
+                except OSError as move_err:
+                    _log.warning("takes.json unreadable for %s (%s); opened with zero takes "
+                                 "(could not move the bad file aside: %s)", path, e, move_err)
+            orphans = 0
             for td in tdoc.get("takes", []):
                 take = proj._take_from_dict(td)
-                if take.shot_id in proj._shots:      # drop orphans defensively
+                if take.shot_id in proj._shots:
                     proj._takes[take.id] = take
+                else:
+                    # L3: a take whose shot_id no longer matches any shot is HELD (out of the
+                    # live view/queue) but still re-serialized, NOT dropped - so the next
+                    # write-through doesn't PERMANENTLY erase it. (A shot temporarily missing -
+                    # a partially-written .animproj, or a shot deleted-but-not-yet-saved in an
+                    # earlier session - can reappear; dropping the take made that loss final.)
+                    proj._orphan_takes[take.id] = take
+                    orphans += 1
+            if orphans:
+                _log.warning("loaded %s: %d take(s) reference a missing shot; preserved in "
+                             "takes.json (out of the live view) rather than dropped", path, orphans)
         proj._load_shot_stars()
         proj.dirty = False
         proj._migrate_flatten_keyposes()
@@ -192,8 +245,15 @@ class Project:
 
     def import_asset(self, src: Path | str) -> Path:
         """Copy an image into the project's .assets/ root (leaving the original) and
-        return the new path. Names are made filesystem-safe and collision-free."""
+        return the new path. Names are made filesystem-safe and collision-free.
+
+        Rejects a non-image source (L19): list_assets only surfaces files whose suffix is in
+        _IMAGE_EXTS, so importing e.g. a .txt copied a file the Assets grid could never show -
+        a silent no-op that only left cruft in .assets/. Raise instead so the caller (picker /
+        drag-drop / migration) can report it rather than pretend it worked."""
         src = Path(src)
+        if src.suffix.lower() not in _IMAGE_EXTS:
+            raise ValueError(f"not an importable image (expected {', '.join(_IMAGE_EXTS)}): {src.name}")
         self._assets_dir.mkdir(parents=True, exist_ok=True)
         stem, ext = _safe_name(src.stem), (src.suffix.lower() or ".png")
         dest = self._assets_dir / f"{stem}{ext}"
@@ -236,10 +296,28 @@ class Project:
                     continue
                 source = crop.get(src_key)
                 if source and Path(source).exists():
-                    setattr(shot, field, str(self.import_asset(source)))
+                    try:
+                        imported = self.import_asset(source)
+                    except (OSError, ValueError):
+                        continue          # unreadable / non-image legacy source: skip, keep the
+                                          # keypose file in place (best-effort, never aborts load)
+                    setattr(shot, field, str(imported))
                     changed = True
         if not changed:
             return
+        # L17: _write_project_file below strips `starred` from the .animproj (stars live in the
+        # sidecar). If a legacy .animproj carried stars but their sidecar write failed earlier
+        # (_load_shot_stars is best-effort, keeping the flags in memory only), rewriting the
+        # .animproj now would erase the stars from BOTH sources. So flush the star sidecar FIRST;
+        # if that flush fails, abort this keypose rewrite (keep sources + dirty) rather than let
+        # the destructive .animproj write lose the migrated stars. The untouched legacy .animproj
+        # still carries them, so a later reload/Save can re-migrate.
+        if any(s.starred for s in self._shots.values()):
+            try:
+                self._write_shot_stars_file()
+            except OSError:
+                self.dirty = True
+                return
         try:
             self._write_project_file()            # make the re-point durable before deleting
         except OSError:
@@ -281,9 +359,9 @@ class Project:
         new_assets = self._assets_for(path)
         with self._lock:
             old_assets, old_path, old_name = self._assets_dir, self.path, self.name
-            new_path_existed = path.exists()
             moved = copied = remapped = False
             displaced = None     # a pre-existing target sidecar, moved aside (not destroyed)
+            doc_displaced = None # a pre-existing target .animproj, moved aside (not destroyed)
             # The identity swap + asset move must NOT outlive a failed document write: if
             # save() raises (e.g. _atomic_write_json exhausts its AV/indexer retries on
             # Windows), the in-memory project would otherwise claim the new identity with no
@@ -292,6 +370,15 @@ class Project:
             # roll back on any failure, leaving both this project and any clobbered neighbour
             # exactly as they were.
             try:
+                # M1: move the target's existing .animproj aside too (not just its sidecar).
+                # save() writes the .animproj FIRST, then takes.json; a takes.json failure used
+                # to roll back identity + sidecar but leave OUR .animproj sitting at the target,
+                # so the neighbour ended up with this project's document paired with its own
+                # restored sidecar. Displacing it up front means the rollback restores the
+                # neighbour's original document verbatim; a clean save drops the .bak.
+                if path.exists() and (old_path is None or path.resolve() != old_path.resolve()):
+                    doc_displaced = path.with_name(f"{path.name}.{new_id()}.bak")
+                    shutil.move(str(path), str(doc_displaced))
                 if old_assets.exists() and old_assets.resolve() != new_assets.resolve():
                     if new_assets.exists():
                         # move the target's existing sidecar aside so a rollback can restore
@@ -323,11 +410,16 @@ class Project:
                 if displaced is not None:
                     shutil.rmtree(new_assets, ignore_errors=True)    # ensure dest is clear
                     shutil.move(str(displaced), str(new_assets))     # restore the clobbered sidecar
-                if not new_path_existed:
-                    path.unlink(missing_ok=True)                     # drop a partial .animproj
+                # Drop whatever save() wrote at the target, then restore the neighbour's original
+                # .animproj (if any). Order matters: our written doc must go before the move-back.
+                path.unlink(missing_ok=True)
+                if doc_displaced is not None:
+                    shutil.move(str(doc_displaced), str(path))       # restore the clobbered doc
                 raise
             if displaced is not None:
                 shutil.rmtree(displaced, ignore_errors=True)         # committed: drop the old sidecar
+            if doc_displaced is not None:
+                doc_displaced.unlink(missing_ok=True)                # committed: drop the old doc
 
     def _remap_paths(self, old_assets: Path, new_assets: Path) -> None:
         """Rewrite in-memory absolute paths that lived under old_assets to new_assets."""
@@ -342,7 +434,8 @@ class Project:
         for shot in self._shots.values():
             for f in _SHOT_PATHS:
                 setattr(shot, f, remap(getattr(shot, f)))
-        for take in (*self._takes.values(), *self._pending_take_purge.values()):
+        for take in (*self._takes.values(), *self._pending_take_purge.values(),
+                     *self._orphan_takes.values()):
             for f in _TAKE_PATHS:
                 setattr(take, f, remap(getattr(take, f)))
 
@@ -371,9 +464,11 @@ class Project:
             # Include _pending_take_purge: takes of a deleted-but-unsaved shot must stay on disk
             # so a Discard can bring them back (card H1). They live outside the view/queue; save()
             # empties the buffer before this runs, so a committed deletion drops them for good.
-            # Invariant: the two dicts are DISJOINT - delete_shot pops a take out of _takes into
-            # the buffer, ids are uuid4, and nothing moves a take back - so merge order is moot.
-            merged = {**self._pending_take_purge, **self._takes}
+            # Include _orphan_takes: takes whose shot was missing at load must ALSO survive a
+            # write-through, not be permanently erased (L3) - unlike the purge buffer these are
+            # never cleared. All three dicts are DISJOINT (uuid4 ids; nothing moves a take
+            # between them), so merge order is moot.
+            merged = {**self._orphan_takes, **self._pending_take_purge, **self._takes}
             doc = {"version": VERSION,
                    "takes": [self._take_to_dict(t) for t in self._ordered(merged)]}
             _atomic_write_json(self._assets_dir / "takes.json", doc)
@@ -443,7 +538,12 @@ class Project:
         return self._shots.get(shot_id)
 
     def list_shots(self) -> list[Shot]:
-        return self._ordered(self._shots)
+        # Snapshot under the lock (M12): _ordered iterates _shots.values(), and a concurrent
+        # add_shot/delete_shot resizing the dict mid-iteration would raise "dictionary changed
+        # size during iteration". Copy the dict inside the lock, sort outside it.
+        with self._lock:
+            snap = dict(self._shots)
+        return self._ordered(snap)
 
     def update_shot(self, shot_id: str, **fields) -> None:
         with self._lock:
@@ -451,6 +551,8 @@ class Project:
             if not shot:
                 return
             for k, v in fields.items():
+                if k not in _SHOT_FIELDS:
+                    continue          # L4: drop a stray key so it can't be persisted + brick load
                 setattr(shot, k, v)
             shot.updated = _now()
             self.dirty = True
@@ -536,7 +638,9 @@ class Project:
 
     def used_model_ids(self) -> list[str]:
         """Distinct model_ids across shots - powers the 'filter by model' dropdown."""
-        seen = {s.model_id for s in self._shots.values() if s.model_id}
+        with self._lock:                          # M12: snapshot before iterating _shots
+            shots = list(self._shots.values())
+        seen = {s.model_id for s in shots if s.model_id}
         return sorted(seen)
 
     # ---- takes (write-through to takes.json; do NOT set dirty) ----------
@@ -552,8 +656,14 @@ class Project:
 
     def list_takes(self, shot_id: Optional[str] = None, *, include_deleted: bool = False,
                    starred_only: bool = False) -> list[Take]:
+        # Snapshot under the lock (M12): abandon_local iterates list_takes on the crashing
+        # WORKER thread while the GUI thread may add_take/purge_takes; without the copy a resize
+        # mid-iteration raises "dictionary changed size during iteration" and aborts the abandon,
+        # leaving part of the local queue un-cancelled. Copy inside the lock, filter/sort outside.
+        with self._lock:
+            snap = dict(self._takes)
         out = []
-        for t in self._ordered(self._takes):
+        for t in self._ordered(snap):
             if shot_id is not None and t.shot_id != shot_id:
                 continue
             if not include_deleted and t.deleted:
@@ -572,6 +682,8 @@ class Project:
             if not take:
                 return
             for k, v in fields.items():
+                if k not in _TAKE_FIELDS:
+                    continue          # L4: drop a stray key so it can't be persisted + brick load
                 setattr(take, k, v)
         self._write_takes_file()
 
