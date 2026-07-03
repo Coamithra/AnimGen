@@ -254,6 +254,26 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
   `smoke_phase5.test_delete_shot_discard_preserves_takes` (discard restores; a
   surviving-shot write-through preserves; a held take's update routes; a failed save
   restores the buffer; save drops for good).
+- **Load robustness (Wave3 B, 2026-07-03):** a project must open even with a damaged
+  `takes.json`. A **corrupt/unreadable `takes.json`** (L2) degrades to zero takes: `load`
+  warns via `logging.getLogger("animgen.store.project")`, moves the bad file aside to
+  `takes.json.corrupt.<id>.bak` (so the first write-through can't clobber whatever might be
+  manually recoverable), and opens with the shots intact. A **take whose `shot_id` matches no
+  shot** (L3) is NOT dropped — it's held in a dedicated `_orphan_takes` buffer that
+  `_write_takes_file` serializes alongside `_takes`/`_pending_take_purge` (all three DISJOINT
+  by uuid4 id) but which — **unlike `_pending_take_purge` — is never cleared by `save()`**, so
+  a transiently-missing shot's take can't be permanently erased by a write-through; `_remap_paths`
+  covers it too. `app._resolve_project` **logs** its fall-throughs (L2) instead of the old silent
+  `except: pass`. `update_shot`/`update_take` **filter kwargs against `dataclasses.fields()`**
+  (`_SHOT_FIELDS`/`_TAKE_FIELDS`, L4) so a stray key can't be persisted and then `TypeError`
+  `Shot(**d)`/`Take(**d)` on the next load. `list_takes`/`list_shots`/`used_model_ids` **snapshot
+  the dict under the RLock** before iterating (M12) so a concurrent GUI-thread mutation can't
+  `RuntimeError: dictionary changed size during iteration` on the crashing worker's abandon path.
+  `_atomic_write_json` **finally-unlinks its tmp** on every failure (L19), and `import_asset`
+  **rejects a non-image source** (raises `ValueError` — `list_assets` would never surface it).
+  Smoke-tested in `smoke_phase5` (`test_load_corrupt_takes_json_degrades`,
+  `test_load_orphan_takes_preserved`, `test_update_filters_stray_kwargs`,
+  `test_list_reads_snapshot_under_lock`, `test_atomic_write_no_tmp_leak_and_import_rejects_nonimage`).
 - **Paths:** managed media + assets serialize **relative to `assets_dir`**; external
   references (seeded `../Fighter/out/*.gif`/`.mp4` takes) stay **absolute**. Untitled
   projects keep assets in `data/_scratch/<id>/` until the first **Save As**, which
@@ -263,10 +283,15 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
   the write raises (e.g. `_atomic_write_json` exhausts its Windows AV/indexer retries) it
   rolls everything back — identity restored, remap reversed, the moved scratch moved back
   (so untitled work is never lost), the copy/partial `.animproj` dropped. A Save-As **over
-  an occupied target** moves that neighbour's existing `.assets` sidecar *aside* (not
-  `rmtree`) and restores it on failure, so a failed overwrite leaves both this project and
-  the neighbour exactly as they were. Smoke-tested in
-  `smoke_phase5.test_save_as_rollback_on_write_failure`.
+  an occupied target** moves that neighbour's existing `.assets` sidecar **and its
+  `.animproj`** *aside* (each to a `.bak`, not `rmtree`) and restores both on failure, so a
+  failed overwrite leaves both this project and the neighbour exactly as they were. Displacing
+  the doc too is what closes the M1 window: `save()` writes the `.animproj` first, then
+  `takes.json`, so a `takes.json` failure after the doc write used to roll back identity +
+  sidecar but leave OUR document at the target — the neighbour ended up with this project's
+  shots document paired with its own restored sidecar. Smoke-tested in
+  `smoke_phase5.test_save_as_rollback_on_write_failure` +
+  `test_save_as_over_neighbour_preserves_doc`.
 - **Generate** saves the project first (untitled → Save As prompt) so a take never
   references an unsaved shot.
 

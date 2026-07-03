@@ -57,19 +57,26 @@ def _set_windows_app_id() -> None:
 
 
 def _resolve_project() -> Project:
-    """Reopen the last project, else the seeded starter, else a fresh untitled one."""
+    """Reopen the last project, else the seeded starter, else a fresh untitled one.
+
+    A load failure at any step is LOGGED (L2) before falling through - silently swallowing it
+    (the old `except: pass`) hid a genuinely corrupt project behind a different one opening,
+    with no trace despite applog being armed. (A corrupt takes.json no longer reaches here:
+    Project.load degrades it in place; only a corrupt .animproj / read error lands in these
+    handlers.)"""
     if paths.APP_STATE.exists():
         try:
             last = json.loads(paths.APP_STATE.read_text(encoding="utf-8")).get("last_project")
             if last and Path(last).exists():
                 return Project.load(last)
         except Exception:  # noqa: BLE001 - fall through to the next option
-            pass
+            applog.logger.warning("could not open the last project; falling back", exc_info=True)
     if paths.DEFAULT_PROJECT.exists():
         try:
             return Project.load(paths.DEFAULT_PROJECT)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:  # noqa: BLE001 - fall through to a fresh untitled project
+            applog.logger.warning("could not open the seeded starter project; opening untitled",
+                                  exc_info=True)
     return Project.new()
 
 
