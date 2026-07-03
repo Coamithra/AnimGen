@@ -652,6 +652,17 @@ class TakesView(QWidget):
             menu.addAction(label).triggered.connect(
                 lambda: self.restart_requested.emit(restartable))
             menu.addSeparator()
+        # Stop an in-flight render in place (halts spend/GPU on both backends). Only offered
+        # when a JobManager is wired in (plain viewers / headless tests have none) and the
+        # selection holds a GENERATING take; request_stop records it CANCELLED as it unwinds.
+        if self.jobs is not None:
+            generating = [tid for tid in ids
+                          if (t := self.project.get_take(tid)) and t.status == "generating"]
+            if generating:
+                label = ("Stop rendering" if len(generating) == 1
+                         else f"Stop rendering {len(generating)} takes")
+                menu.addAction(label).triggered.connect(lambda: self.stop_rendering(generating))
+                menu.addSeparator()
         menu.addAction("Toggle star").triggered.connect(lambda: self.toggle_star(ids))
         menu.addAction("Delete (to bin)").triggered.connect(lambda: self.delete(ids))
         menu.addAction("Export selected").triggered.connect(
@@ -673,6 +684,18 @@ class TakesView(QWidget):
         """Flip one take's star (from the clickable badge). Write-through via toggle_star, so
         it persists instantly - same as the right-click 'Toggle star'."""
         self.toggle_star([take_id])
+
+    def stop_rendering(self, ids: list) -> None:
+        """Stop each in-flight (GENERATING) render in place - halts spend/GPU on both backends
+        (comfy interrupt / replicate cancel) via JobManager.request_stop, which also flags the
+        take so the worker records it CANCELLED, not FAILED, as it unwinds. Best-effort and a
+        no-op for a take that isn't GENERATING. The tile refreshes when the resulting
+        status_changed reaches update_take; no full reload here (the worker unwinds async)."""
+        if self.jobs is None:
+            return
+        for tid in ids:
+            self.jobs.request_stop(tid)
+        self.changed.emit()
 
     def delete(self, ids: list) -> None:
         for tid in ids:

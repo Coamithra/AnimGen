@@ -493,9 +493,10 @@ class QueueView(QWidget):
         return out
 
     def _build_context_menu(self, take_ids: list) -> QMenu:
-        """The queued-take right-click menu, built without exec() so it's headless-testable
-        (the takes_view / shot_card pattern). Only still-PENDING takes can be cancelled here;
-        running takes are stopped from the ComfyUI tab and finished ones have nothing to cancel."""
+        """The queue-row right-click menu, built without exec() so it's headless-testable
+        (the takes_view / shot_card pattern). A still-PENDING take can be cancelled; a
+        still-GENERATING take can be stopped in place (JobManager.request_stop halts spend/GPU
+        on both backends and records the take CANCELLED). A finished take has nothing to act on."""
         menu = QMenu(self)
         pending = [tid for tid in take_ids
                    if (t := self.project.get_take(tid)) and t.status == STATUS_PENDING]
@@ -503,11 +504,25 @@ class QueueView(QWidget):
             label = ("Cancel queued generation" if len(pending) == 1
                      else f"Cancel {len(pending)} queued generations")
             menu.addAction(label).triggered.connect(lambda: self._cancel(pending))
+        generating = [tid for tid in take_ids
+                      if (t := self.project.get_take(tid)) and t.status == STATUS_GENERATING]
+        if generating:
+            label = ("Stop rendering" if len(generating) == 1
+                     else f"Stop rendering {len(generating)} takes")
+            menu.addAction(label).triggered.connect(lambda: self._stop(generating))
         return menu
 
     def _cancel(self, take_ids: list) -> None:
         for tid in take_ids:
             self.jobs.cancel_take(tid)
+        self.refresh()
+
+    def _stop(self, take_ids: list) -> None:
+        """Stop each in-flight render (best-effort, both backends) so spend/GPU halts. The
+        worker unwinds to CANCELLED asynchronously - status_changed then rebuilds the row;
+        the immediate refresh() just keeps the view current, matching _cancel."""
+        for tid in take_ids:
+            self.jobs.request_stop(tid)
         self.refresh()
 
     def _clear_finished(self) -> None:
