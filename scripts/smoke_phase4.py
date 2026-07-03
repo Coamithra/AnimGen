@@ -312,6 +312,81 @@ def test_take_progress_label() -> None:
     print("TakesView progress OK: generating tile shows live %, done tile ignores late tail")
 
 
+def test_take_tile_tooltip() -> None:
+    """A take tile's rich hover tooltip surfaces the per-take metadata the tile can't (status,
+    when queued, seed, render duration, cost, model/backend) and the full error text for a
+    FAILED take, so a failed tile reveals *why* without opening the viewer (card UX7). The
+    helper is pure (Take in -> string out): no disk/PyAV/library access, so it stays cheap to
+    build per tile on the GUI thread."""
+    from PySide6.QtWidgets import QApplication
+
+    from store.models import Take
+    from ui.takes_view import TakesView, take_tile_tooltip, _render_duration
+
+    # Pure duration helper (headless): started -> completed, "" on missing / unparseable / skew.
+    assert _render_duration("2026-06-18T10:00:00", "2026-06-18T10:00:12") == "12s"
+    assert _render_duration("2026-06-18T10:00:00", "2026-06-18T10:03:15") == "3m15s"
+    assert _render_duration("2026-06-18T10:00:00", "2026-06-18T11:02:03") == "1h2m3s"
+    assert _render_duration("", "2026-06-18T10:00:12") == ""          # missing start
+    assert _render_duration("2026-06-18T10:00:12", "2026-06-18T10:00:00") == ""  # negative -> ""
+    assert _render_duration("garbage", "2026-06-18T10:00:12") == ""   # unparseable -> ""
+
+    assert take_tile_tooltip(None) == ""
+
+    # A done take: status, model+backend, created, render time, seed, and (actual) cost.
+    done = Take(
+        id="d1", shot_id="s", status=STATUS_DONE,
+        settings_snapshot={"model_id": "seedance-2.0-std", "backend": "replicate",
+                           "settings": {"seed": 777}},
+        seed=1234, cost_estimate=0.05, cost_actual=0.042,
+        created="2026-06-18T10:00:00", started="2026-06-18T10:00:03",
+        completed="2026-06-18T10:00:15",
+    )
+    tip = take_tile_tooltip(done)
+    assert "Status: done" in tip
+    assert "Model: seedance-2.0-std (replicate)" in tip
+    assert "Created: 2026-06-18T10:00:00" in tip
+    assert "Render time: 12s" in tip                     # started -> completed, not created
+    assert "Seed: 1234" in tip                            # take.seed wins over snapshot seed
+    assert "Cost: $0.042" in tip and "Est. cost" not in tip   # actual present -> actual shown
+
+    # A failed take: the FULL error text is in the tooltip so the tile reveals why.
+    failed = Take(
+        id="f1", shot_id="s", status=STATUS_FAILED,
+        error="CUDA out of memory: tried to allocate 2.5 GiB",
+    )
+    ftip = take_tile_tooltip(failed)
+    assert "Status: failed" in ftip
+    assert "Error:" in ftip
+    assert "CUDA out of memory: tried to allocate 2.5 GiB" in ftip
+
+    # A failed take with no recorded error still gets an explicit note (not a bare "Error:").
+    assert "(no error detail was recorded)" in take_tile_tooltip(
+        Take(id="f2", shot_id="s", status=STATUS_FAILED))
+
+    # Est. cost is labelled as an estimate when no actual is recorded; snapshot seed is a
+    # fallback when the take has no seed of its own.
+    pend = Take(id="p1", shot_id="s", status=STATUS_PENDING, cost_estimate=0.08,
+                settings_snapshot={"settings": {"seed": 999}})
+    ptip = take_tile_tooltip(pend)
+    assert "Est. cost: $0.080" in ptip
+    assert "Seed: 999" in ptip
+    assert "Render time" not in ptip                     # not finished -> no duration line
+
+    # Wired live: the tooltip is set on the item in load() and refreshed in update_take().
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    t = project.add_take(shot.id, status=STATUS_PENDING, cost_estimate=0.05)
+    tv = TakesView(project, shot.id)
+    assert "Status: pending" in tv._items[t.id].toolTip()
+    project.update_take(t.id, status=STATUS_FAILED, error="boom")
+    tv.update_take(t.id)
+    assert "Status: failed" in tv._items[t.id].toolTip()
+    assert "boom" in tv._items[t.id].toolTip()           # error refreshed on the transition
+    print("TakesView tooltip OK: rich per-take metadata, full error on failure, live on load/update")
+
+
 def test_bin_neutralizes_queued_take() -> None:
     """Deleting a non-terminal take to the bin must first neutralize it in the queue (H2):
     a PENDING take is cancelled (so its runnable never fires the backend), a GENERATING one
@@ -759,6 +834,7 @@ if __name__ == "__main__":
     test_take_star_badge()
     test_take_star_toggle_incremental()
     test_take_progress_label()
+    test_take_tile_tooltip()
     test_bin_neutralizes_queued_take()
     test_assets_view()
     test_asset_picker()

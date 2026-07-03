@@ -12,6 +12,7 @@ user drag an explicit height (double-click it to return to auto-fit).
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal
@@ -81,6 +82,80 @@ def take_tile_label(status: str, take_id: str, pct: str = "") -> str:
     else:
         tail = f"  {status}"
     return f"{badge}{tail}".strip() or take_id[:6]
+
+
+def _render_duration(started: str, completed: str) -> str:
+    """Human render duration between two second-precision ISO stamps (started -> completed),
+    e.g. "3m15s". Both come from store.project._now() / jobs.GenerationJob (no timezone), so a
+    plain fromisoformat diff is safe. Returns "" if either is missing/unparseable or the span is
+    negative (clock skew). Mirrors queue_view._elapsed; kept local so this module stays pure and
+    Qt-free without importing the queue view. Pure so it's unit-testable headlessly."""
+    if not started or not completed:
+        return ""
+    try:
+        secs = int((datetime.fromisoformat(completed)
+                    - datetime.fromisoformat(started)).total_seconds())
+    except ValueError:
+        return ""
+    if secs < 0:
+        return ""
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m}m{s}s"
+    if m:
+        return f"{m}m{s}s"
+    return f"{s}s"
+
+
+def take_tile_tooltip(take) -> str:
+    """Rich hover tooltip for a take's grid tile: the per-take metadata the tile itself can't
+    show (status, when queued, seed, render duration, cost, model/backend) plus the full error
+    text for a FAILED take - so a failed tile reveals *why* without opening the viewer (card UX7).
+
+    Reads only fields already in memory on the Take + its immutable settings_snapshot (rule #3) -
+    no disk/PyAV access, so it's cheap to build per tile on the GUI thread. Model shows the raw
+    snapshot `model_id` rather than the roster display name, so it stays a pure, Qt/library-free
+    helper and doesn't re-parse model_library.json per tile (review finding #3). Pure so it's
+    unit-testable headlessly."""
+    if take is None:
+        return ""
+    snap = take.settings_snapshot or {}
+    lines: list[str] = []
+
+    status = take.status or ""
+    lines.append(f"Status: {status}" if status else "Status: (unknown)")
+
+    model_id = snap.get("model_id")
+    if model_id:
+        backend = snap.get("backend")
+        lines.append(f"Model: {model_id}" + (f" ({backend})" if backend else ""))
+
+    if take.created:
+        lines.append(f"Created: {take.created}")
+
+    dur = _render_duration(take.started or "", take.completed or "")
+    if dur:
+        lines.append(f"Render time: {dur}")
+
+    seed = take.seed
+    if seed is None:
+        seed = (snap.get("settings") or {}).get("seed")
+    if seed is not None:
+        lines.append(f"Seed: {seed}")
+
+    cost = take.cost_actual if take.cost_actual is not None else take.cost_estimate
+    if cost is not None:
+        prefix = "Cost" if take.cost_actual is not None else "Est. cost"
+        lines.append(f"{prefix}: ${cost:.3f}")
+
+    if status == "failed":
+        err = (take.error or "").strip()
+        lines.append("")
+        lines.append("Error:")
+        lines.append(err or "(no error detail was recorded)")
+
+    return "\n".join(lines)
 
 
 def columns_for(viewport_width: int, icon_size: int) -> int:
@@ -311,6 +386,7 @@ class TakesView(QWidget):
             item = QStandardItem(self._icon_for(t), self._label(t))
             item.setData(t.id, _USER_ROLE)
             item.setData(bool(t.starred), _STAR_ROLE)
+            item.setToolTip(take_tile_tooltip(t))
             item.setEditable(False)
             self.model.appendRow(item)
             self._items[t.id] = item
@@ -342,6 +418,7 @@ class TakesView(QWidget):
             return
         item.setText(self._label(t))
         item.setData(bool(t.starred), _STAR_ROLE)
+        item.setToolTip(take_tile_tooltip(t))
         if take_id not in self._strips and take_id not in self._strip_pending:
             # Not animating yet: refresh the static thumbnail, and if the take just became
             # playable (e.g. it finished rendering) kick off a single-take strip decode so it
