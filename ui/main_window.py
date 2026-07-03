@@ -1407,7 +1407,8 @@ class MainWindow(QMainWindow):
             self._refresh_cancel_action()
             self._refresh_recovery_banner()   # recovery just produced interrupted takes
             return
-        self._execute_plans(recovery.plan_comfy_recovery(orphans, history, queue))
+        self._execute_plans(recovery.plan_comfy_recovery(
+            orphans, history, queue, recovery.ambiguous_seeds(proj)))
 
     def _execute_plans(self, plans) -> None:
         counts: Counter = Counter()
@@ -1505,7 +1506,7 @@ class MainWindow(QMainWindow):
         skipped = len(res.get("skipped", []))
         msg = f"Exported {n_folders} animation(s), {total_frames} frames total\n\n{parent}"
         if skipped:
-            msg += f"\n\n({skipped} skipped - no video file)"
+            msg += f"\n\n({skipped} skipped - no video file, or take/shot no longer exists)"
         self._log(f"exported {n_folders} animation(s) -> {parent}")
         box = QMessageBox(self)
         box.setWindowTitle("Export complete")

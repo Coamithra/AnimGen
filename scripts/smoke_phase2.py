@@ -570,7 +570,10 @@ def test_total_price() -> None:
     assert total_price_text([0.72, None, 0.0]) == "Full set: $0.72  (+1 unknown)"
     assert total_price_text([]) == "Full set: $0.00"
     assert total_price_text([None, None]) == "Full set: $0.00  (+2 unknown)"
-    print("cost_confirm total_price_text OK: sum, free, unknown tally, empty")
+    # L13 sibling surface: a sub-cent full set doesn't collapse to $0.00 either.
+    assert total_price_text([0.004]) == "Full set: $0.004"
+    assert total_price_text([0.0004]) == "Full set: <$0.01"
+    print("cost_confirm total_price_text OK: sum, free, unknown tally, empty, sub-cent")
 
 
 def test_cost_summary() -> None:
@@ -620,6 +623,30 @@ def test_launch_label() -> None:
     _, total_m, has_spend_m = build_summary(mixed_items)
     assert launch_button_label(total_m, has_spend_m) == "Launch (spend ~$0.72)"
     print("cost_confirm launch_button_label OK: unknown-not-free, free, known, mixed")
+
+
+def test_subcent_cost_display() -> None:
+    """L13: sub-cent totals must NOT collapse to '$0.00' next to a 'spend real money'
+    warning. _fmt_cost shows sub-cent precision (or '<$0.01'), and the launch label
+    inherits it so the gate can't read '$0.00 spend'."""
+    from ui.cost_confirm import _fmt_cost, launch_button_label, build_summary
+
+    assert _fmt_cost(None) == "?"
+    assert _fmt_cost(0) == "free"          # exactly free stays "free", not "<$0.01"
+    assert _fmt_cost(0.0004) == "<$0.01"   # below the 3-decimal floor
+    assert _fmt_cost(0.004) == "$0.004"    # sub-cent but representable to 3 decimals
+    assert _fmt_cost(0.009) == "$0.009"
+    assert _fmt_cost(0.01) == "$0.01"      # cent boundary keeps 2-decimal form
+    assert _fmt_cost(0.72) == "$0.72"
+    assert _fmt_cost(2.0) == "$2.00"
+
+    # A batch whose total is sub-cent no longer renders "$0.00" in header or launch label.
+    body, total, has_spend = build_summary(
+        [{"name": "tiny", "model_display": "Cheap v1", "est_cost": 0.004, "params": {}}])
+    assert "$0.00 " not in body and "$0.004" in body, body
+    label = launch_button_label(total, has_spend)
+    assert label == "Launch (spend ~$0.004)", label
+    print("cost_confirm sub-cent OK: <$0.01 / $0.00X, no $0.00 spend")
 
 
 def test_job_manager() -> None:
@@ -1050,6 +1077,15 @@ def test_comfy_views() -> None:
 def test_orphan_recovery() -> None:
     from backends import recovery
 
+    # Minimal stand-in for a Project's take population, so ambiguous_seeds() can be exercised
+    # with hand-built Take lists (it only calls .list_takes(include_deleted=...)).
+    class _FakeProj:
+        def __init__(self, takes):
+            self._takes = takes
+
+        def list_takes(self, shot_id=None, *, include_deleted=False):
+            return list(self._takes)
+
     # comfy_orphans selects only mid-flight comfyui takes (generating before pending),
     # ignoring done takes and hosted ones.
     project = Project.new()
@@ -1074,8 +1110,8 @@ def test_orphan_recovery() -> None:
     assert orphans[-1].id == pend.id, "generating-first, pending last"
 
     # plan_comfy_recovery: the four actions + prompt-id match + seed match + claim dedup.
-    def t(tid, status, seed=None, job=None):
-        return Take(id=tid, shot_id="s", status=status, seed=seed, backend_job_id=job)
+    def t(tid, status, seed=None, job=None, shot="s"):
+        return Take(id=tid, shot_id=shot, status=status, seed=seed, backend_job_id=job)
 
     history = [
         {"prompt_id": "Pdone", "seeds": {100}, "outputs": [Path("out/A_00006_.mp4")], "ok": True},
@@ -1103,6 +1139,47 @@ def test_orphan_recovery() -> None:
     assert plans["dup1"].action == recovery.RECLAIM and plans["dup2"].action == recovery.FAIL, \
         "a finished render must be claimed by exactly one take"
 
+    # M5 - fixed-seed shot: a shot with an AUTHORED seed produces N takes sharing one seed, so a
+    # bare seed match is ambiguous. A never-submitted PENDING orphan (no backend_job_id) must NOT
+    # misclaim a SIBLING's finished /history entry as its own; it's left CANCEL (interrupted,
+    # restartable). Same guard blocks REATTACHing to a sibling's live /queue entry.
+    fs_hist = [{"prompt_id": "Pfs", "seeds": {77}, "outputs": [Path("out/sib.mp4")], "ok": True}]
+    fs_queue = [{"prompt_id": "Qfs", "seeds": {77}, "state": "running"}]
+    # shot "fixed" has two takes on seed 77 (fixed-seed); one is a mid-flight orphan, but the
+    # OTHER sibling is a non-orphan DONE take whose render "Pfs" that history belongs to.
+    ambig = recovery.ambiguous_seeds(_FakeProj([
+        t("fs_orphan", STATUS_PENDING, seed=77, shot="fixed"),
+        t("fs_done",   STATUS_DONE,    seed=77, shot="fixed"),   # sibling, owns Pfs
+    ]))
+    assert ("fixed", 77) in ambig, "shared seed within a shot is flagged ambiguous"
+    fs_orphans = [t("fs_orphan", STATUS_PENDING, seed=77, shot="fixed")]
+    fs_plans = {p.take_id: p for p in
+                recovery.plan_comfy_recovery(fs_orphans, fs_hist, fs_queue, ambig)}
+    assert fs_plans["fs_orphan"].action == recovery.CANCEL, \
+        "fixed-seed PENDING orphan must NOT RECLAIM/REATTACH a sibling's render"
+    assert fs_plans["fs_orphan"].output_path is None, "no wrong video is claimed"
+    assert "fixed-seed" in fs_plans["fs_orphan"].reason, "reason explains the ambiguous-seed skip"
+
+    # A GENERATING fixed-seed orphan is likewise not misattributed -> FAIL (interrupted).
+    fs_gen = [t("fs_gen", STATUS_GENERATING, seed=77, shot="fixed")]
+    fs_gen_plan = recovery.plan_comfy_recovery(fs_gen, fs_hist, fs_queue, ambig)[0]
+    assert fs_gen_plan.action == recovery.FAIL and fs_gen_plan.prompt_id is None
+
+    # But a fixed-seed orphan that DID record its own backend_job_id still matches by prompt-id
+    # (that's unambiguous) - the guard only refuses the SEED fallback, not prompt-id matching.
+    fs_byid = [t("fs_byid", STATUS_GENERATING, seed=77, job="Pfs", shot="fixed")]
+    assert recovery.plan_comfy_recovery(fs_byid, fs_hist, fs_queue, ambig)[0].action == recovery.RECLAIM, \
+        "prompt-id match is authoritative even for a fixed-seed shot"
+
+    # Regression guard: a UNIQUE seed (random-seed shot, one take per seed) still matches - the
+    # guard must not over-fire and refuse legitimate single-take seed matching.
+    uniq = recovery.ambiguous_seeds(_FakeProj([t("solo", STATUS_PENDING, seed=100, shot="s")]))
+    assert ("s", 100) not in uniq, "a seed carried by exactly one take is not ambiguous"
+    solo_plan = recovery.plan_comfy_recovery(
+        [t("solo", STATUS_GENERATING, seed=100)], history, queue, uniq)[0]
+    assert solo_plan.action == recovery.RECLAIM and solo_plan.prompt_id == "Pdone", \
+        "unique-seed matching still works with the ambiguity guard in place"
+
     # plan_offline_recovery: ComfyUI unreachable (no history/queue). Nothing can be verified
     # and no worker is live, so every orphan is cleared rather than left a permanent "running"
     # zombie: any generating take (submitted or not) -> FAIL; a pending take -> CANCEL.
@@ -1116,7 +1193,7 @@ def test_orphan_recovery() -> None:
     assert off["zombie"].action == recovery.FAIL, "generating-without-prompt-id must not be left"
     assert off["queued"].action == recovery.CANCEL
     print("orphan recovery OK: select + reclaim/reattach/fail/cancel + prompt-id + seed dedup "
-          "+ offline fail/cancel")
+          "+ fixed-seed ambiguity guard (M5) + offline fail/cancel")
 
 
 def test_crash_recovery() -> None:
@@ -2430,6 +2507,7 @@ if __name__ == "__main__":
     test_total_price()
     test_cost_summary()
     test_launch_label()
+    test_subcent_cost_display()
     test_cancel_pending()
     test_cancel_shot_takes()
     test_inflight_stop_maps_to_cancelled()
