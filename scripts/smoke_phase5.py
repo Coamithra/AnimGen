@@ -88,7 +88,28 @@ def test_export() -> None:
     r3 = project.add_take(shot.id, status=STATUS_PENDING)
     res3 = export.export_takes(project, [r3.id], dest_root=dest)
     assert res3["parent"] is None and r3.id in res3["skipped"]
-    print("export OK: single(flat)/multi(subfolders)/skipped, settings.txt snapshot")
+
+    # L14: an id that resolves to NO take is reported in skipped, not silently dropped.
+    res4 = export.export_takes(project, ["nope-does-not-exist"], dest_root=dest)
+    assert res4["parent"] is None and "nope-does-not-exist" in res4["skipped"]
+
+    # L14: a take whose SHOT was deleted out from under it is skipped (None-guarded),
+    # not an AttributeError on shot.name. Drop just the shot so the take still resolves.
+    vid5 = tmp / "r5.mp4"; _make_mp4(vid5, n=2)
+    r5 = project.add_take(shot.id, status=STATUS_DONE, video_path=str(vid5),
+                          settings_snapshot=snap)
+    project._shots.pop(shot.id, None)          # simulate the shot deleted mid-export
+    res5 = export.export_takes(project, [r5.id], dest_root=dest)
+    assert res5["parent"] is None and r5.id in res5["skipped"], res5
+    # And in the multi-take path: the orphaned take is skipped, a good take still exports.
+    good = project.add_shot("still_here", model_id="seedance-2.0-std")
+    vid6 = tmp / "r6.mp4"; _make_mp4(vid6, n=2)
+    r6 = project.add_take(good.id, status=STATUS_DONE, video_path=str(vid6),
+                          settings_snapshot=snap)
+    res6 = export.export_takes(project, [r5.id, r6.id], dest_root=dest)
+    assert r5.id in res6["skipped"] and len(res6["exported"]) == 1, res6
+
+    print("export OK: single(flat)/multi(subfolders)/skipped(no-video/unresolved/deleted-shot)")
 
 
 def test_extract_frames_wide_padding() -> None:

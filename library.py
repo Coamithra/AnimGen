@@ -106,7 +106,11 @@ def estimate_cost(model_id: str, settings: dict) -> Optional[float]:
         rate = _keyed_rate(rate, settings, m)
     if rate is None:
         return None
-    duration = settings.get("duration") or (m.get("default_params") or {}).get("duration") or 0
+    duration = settings.get("duration")              # explicit None check: honour an explicit 0
+    if duration is None:
+        duration = (m.get("default_params") or {}).get("duration")
+    if duration is None:
+        duration = 0
     try:
         return round(float(rate) * float(duration), 4)
     except (TypeError, ValueError):

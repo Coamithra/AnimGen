@@ -22,6 +22,8 @@ def _fmt_cost(c: Optional[float]) -> str:
         return "?"
     if c == 0:
         return "free"
+    if c < 0.01:                     # sub-cent: don't collapse to "$0.00" in the gate
+        return "<$0.01" if c < 0.001 else f"${c:.3f}"
     return f"${c:.2f}"
 
 
