@@ -796,15 +796,37 @@ def test_recovery_banner() -> None:
     assert win2.recovery_banner._label.text() == recovery_banner_text(2)
     assert "2 takes were interrupted" in win2.recovery_banner._label.text()
 
-    # (c) the Dismiss (x) hides the banner (find the close button by objectName).
+    # (c) binning an interrupted take from the card's grid keeps the banner honest: the
+    #     count drops (a binned take leaves _interrupted_take_count), and binning the LAST
+    #     one retires the banner entirely (reviewer finding: TakesView.delete doesn't route
+    #     through restart/purge/recovery, so without the changed->sync hook it went stale).
+    interrupted_ids = [t.id for t in proj.list_takes(shot.id) if t.interrupted]
+    card = win2.cards[shot.id]
+    card.expand_btn.setChecked(True)          # creates the card's TakesView (changed is wired)
+    card.takes_view.delete([interrupted_ids[0]])
+    assert not win2.recovery_banner.isHidden(), "one interrupted take left -> banner stays"
+    assert win2.recovery_banner._label.text() == recovery_banner_text(1)  # count re-synced
+    card.takes_view.delete([interrupted_ids[1]])
+    assert win2.recovery_banner.isHidden(), "binned the last interrupted take -> banner retires"
+
+    # (d) the Dismiss (x) hides the banner, and a later take-churn sync must NOT re-arm it.
     from PySide6.QtWidgets import QPushButton
+    win2._refresh_recovery_banner()           # re-arm is a no-op now (count 0) - banner stays down
+    assert win2.recovery_banner.isHidden()
+    proj.add_take(shot.id, status=STATUS_CANCELLED, interrupted=True,
+                  error="cancelled: ComfyUI/the app was closed mid-render")
+    win2._refresh_recovery_banner()           # simulate a recovery completion arming it again
+    assert not win2.recovery_banner.isHidden()
     close_btn = next(b for b in win2.recovery_banner.findChildren(QPushButton)
                      if b.objectName() == "infoBannerClose")
     close_btn.click()
     assert win2.recovery_banner.isHidden(), "Dismiss -> banner hidden"
+    win2._sync_recovery_banner()              # take-churn sync respects the dismissal
+    assert win2.recovery_banner.isHidden(), "sync must never re-arm a dismissed banner"
 
     print("recovery banner OK: hidden clean, shown with N-take text on interrupted load, "
-          "Dismiss hides, deliberate cancel excluded")
+          "bin re-counts/retires it, Dismiss hides + sync never re-arms, "
+          "deliberate cancel excluded")
 
 
 if __name__ == "__main__":

@@ -517,6 +517,8 @@ class MainWindow(QMainWindow):
             card.export_takes_requested.connect(self.export_takes)
             card.open_take_requested.connect(self.open_take)
             card.restart_requested.connect(self._restart_takes_by_ids)
+            # binning a take from the card's grid must keep the recovery banner honest
+            card.changed.connect(self._sync_recovery_banner)
             if shot.id in expanded:
                 card.expand_btn.setChecked(True)
             self.cards_layout.addWidget(card)
@@ -690,6 +692,8 @@ class MainWindow(QMainWindow):
         tab.export_requested.connect(self.export_takes)
         tab.open_take_requested.connect(self.open_take)
         tab.restart_requested.connect(self._restart_takes_by_ids)
+        # binning a take from the tab's grid must keep the recovery banner honest
+        tab.takes_changed.connect(self._sync_recovery_banner)
 
     def _on_shot_saved(self, shot_id: str, tab: ShotTab) -> None:
         # A blank tab just became a real shot (or an existing shot was re-saved): register
@@ -996,8 +1000,7 @@ class MainWindow(QMainWindow):
         removed = self.project.purge_takes(ids)
         self._log(f"removed {removed} cancelled take(s)")
         self.reload()             # rebuilds cards + refreshes the purge/restart action states
-        if self._interrupted_take_count() == 0:
-            self.recovery_banner.hide()   # purged the interrupted takes the banner referred to
+        self._sync_recovery_banner()   # the purge may have taken the banner's takes with it
         self.queue_tab.refresh()  # drop the purged takes from the Queue tab
 
     # ---- one-time crash-recovery banner --------------------------------
@@ -1010,6 +1013,15 @@ class MainWindow(QMainWindow):
             self.recovery_banner.show_message(text)
         else:
             self.recovery_banner.hide()
+
+    def _sync_recovery_banner(self) -> None:
+        """Keep an already-shown banner honest after take mutations (bin / purge / restart):
+        retire it when no interrupted takes remain, refresh its count otherwise. A hidden
+        banner stays hidden - unlike _refresh_recovery_banner this never re-arms a dismissed
+        one, so it's safe to call from any take-churn path."""
+        if self.recovery_banner.isHidden():
+            return
+        self._refresh_recovery_banner()
 
     def _restart_from_banner(self) -> None:
         """The banner's action: run the normal restart (its own cost gate). The banner is not
@@ -1081,8 +1093,7 @@ class MainWindow(QMainWindow):
                 f"marked failed:\n\n{detail}")
         self.reload()
         self._refresh_cancel_action()
-        if self._interrupted_take_count() == 0:
-            self.recovery_banner.hide()   # nothing left to restart -> retire the notice
+        self._sync_recovery_banner()   # interrupted takes consumed -> retire/re-count the notice
         self.queue_tab.refresh()
 
     def _restart_in_place(self, take) -> None:
