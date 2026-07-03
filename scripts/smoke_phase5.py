@@ -674,6 +674,52 @@ def test_generate_picker_keyframe_survives_open_tab() -> None:
     print("MainWindow OK: picker keyframe survives an open tab — snapshot gets it (H3 follow-on)")
 
 
+def test_generate_gate_cancel_refreshes_after_import() -> None:
+    """L11: generating a shot with NO start frame pops a keyframe picker, imports + saves the
+    picked keyframe, THEN shows the cost gate. Cancelling the gate must still leave the UI
+    reflecting the imported keyframe (the project already changed on disk) — not the stale
+    pre-import state. generate_shot reload()s after the import, before the gate, so the shot
+    card is rebuilt with the new start frame regardless of the gate outcome. No take queued."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui import main_window
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p",
+                            crop={"aspect": "16:9", "start": {"scale": 1.0, "cx": 0.5, "cy": 0.5}})
+    project.save_as(Path(tempfile.mkdtemp()) / "l11.animproj")
+    win = MainWindow(project)
+    card_before = win.cards[shot.id]
+    assert card_before.shot.start_frame in (None, ""), "shot starts with no start frame"
+
+    class _Picker:
+        @staticmethod
+        def getOpenFileName(*a, **k):
+            return ("picked.png", "")
+
+    orig_qfd, orig_import = main_window.QFileDialog, project.import_asset
+    orig_confirm, orig_enqueue = main_window.confirm_launch, win.jobs.enqueue
+    main_window.QFileDialog = _Picker
+    project.import_asset = lambda src: Path("picked.png")   # no real file needed
+    main_window.confirm_launch = lambda *a, **k: False        # user CANCELS the cost gate
+    win.jobs.enqueue = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no take may queue"))
+    try:
+        win.generate_shot(shot.id)
+    finally:
+        main_window.QFileDialog, project.import_asset = orig_qfd, orig_import
+        main_window.confirm_launch, win.jobs.enqueue = orig_confirm, orig_enqueue
+
+    assert not project.list_takes(shot.id), "cancelling the gate queues no take"
+    assert project.get_shot(shot.id).start_frame == "picked.png", "the picked keyframe persisted"
+    # The card was rebuilt (reload ran) and now shows the imported start frame, not the stale state.
+    card_after = win.cards[shot.id]
+    assert card_after is not card_before, "generate_shot reload()ed after the import (L11)"
+    assert card_after.shot.start_frame == "picked.png", "the refreshed card reflects the import"
+    print("MainWindow OK: gate-cancel after no-start-frame import still refreshes the card (L11)")
+
+
 def test_batch_gate_matches_snapshot_with_uncommitted_tab() -> None:
     """Card H3 (batch side): start_batch has the identical pre-save/post-gate hazard. It must
     save (flushing open tabs) BEFORE plan_batch + the single cost gate, so the plan/cost the
@@ -1803,6 +1849,120 @@ def test_guarded_emit_and_daemon_workers() -> None:
     print("qt_guard OK: guarded_emit drops dead-source signals; daemon workers survive teardown")
 
 
+def test_delete_shot_closes_take_tab() -> None:
+    """M10: deleting a shot with an open take-viewer tab must close that tab (drop it from
+    take_tabs) so it can't dangle on a removed take, and so the next save doesn't capture a
+    dead 'take' descriptor into ui_state. Mirrors remove_cancelled_takes, which already does
+    this before purge_takes."""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from ui import main_window
+    from ui.main_window import MainWindow
+    from ui.take_player import TakePlayerTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "del.animproj"
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_DONE)   # no video -> no decode thread
+    project.save_as(path)
+
+    win = MainWindow(project)
+    win.open_take(take.id)
+    assert take.id in win.take_tabs and isinstance(win.take_tabs[take.id], TakePlayerTab)
+    # Capture the layout WITH the take tab open, proving a stale descriptor would land in ui_state.
+    assert win.save_project()
+    kinds = {(d.get("kind"), d.get("id")) for d in (project.ui_state.get("tabs") or [])}
+    assert ("take", take.id) in kinds, "the open take tab is captured into ui_state pre-delete"
+
+    orig_question = main_window.QMessageBox.question
+    main_window.QMessageBox.question = lambda *_a, **_k: QMessageBox.StandardButton.Yes
+    try:
+        win.delete_shot(shot.id)
+    finally:
+        main_window.QMessageBox.question = orig_question
+
+    assert take.id not in win.take_tabs, "delete_shot closed the dangling take-viewer tab"
+    assert not any(isinstance(win.tabs.widget(i), TakePlayerTab) for i in range(win.tabs.count())), \
+        "no TakePlayerTab widget survives the shot delete"
+    # The next save must not record the removed take's descriptor.
+    assert win.save_project()
+    kinds = {(d.get("kind"), d.get("id")) for d in (project.ui_state.get("tabs") or [])}
+    assert ("take", take.id) not in kinds, "ui_state carries no dead take descriptor after delete"
+    print("MainWindow OK: delete_shot closes open take tab, no dead ui_state descriptor (M10)")
+
+
+def test_take_viewer_refreshes_on_status(tmp_mp4: Path) -> None:
+    """L6: a take viewer opened while its take is still generating must catch up when the take
+    finishes. _refresh_shot_for_take (the status_changed / finished fan-out) now reaches open
+    take_tabs, and the player's cheap refresh_status() decodes the video once it appears."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.take_player import TakePlayerTab
+    from store.models import STATUS_GENERATING
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_GENERATING)   # no video yet -> no decode
+    project.save_as(Path(tempfile.mkdtemp()) / "viewer.animproj")
+
+    win = MainWindow(project)
+    win.open_take(take.id)
+    viewer = win.take_tabs[take.id]
+    assert isinstance(viewer, TakePlayerTab)
+    assert not viewer._frames and viewer._loader is None, "a still-generating take decodes nothing"
+
+    # The fan-out reaches the open viewer: record that refresh_status was invoked for this take.
+    called = {"n": 0}
+    orig = TakePlayerTab.refresh_status
+    TakePlayerTab.refresh_status = lambda self: (called.__setitem__("n", called["n"] + 1),
+                                                 orig(self))[1]  # type: ignore[assignment]
+    try:
+        # The take finishes: a real video lands and the status flips.
+        project.update_take(take.id, status=STATUS_DONE, video_path=str(tmp_mp4))
+        win._refresh_shot_for_take(take.id)
+    finally:
+        TakePlayerTab.refresh_status = orig  # type: ignore[assignment]
+    assert called["n"] == 1, "_refresh_shot_for_take fans out to the open take viewer (L6)"
+    # refresh_status kicked off a decode of the now-present video (loader created, not None).
+    assert viewer._loader is not None, "refresh_status started decoding the finished take's video"
+
+    # Idempotent: a second status signal on an already-decoding viewer must not restart the load.
+    loader = viewer._loader
+    viewer.refresh_status()
+    assert viewer._loader is loader, "refresh_status no-ops once a decode is under way"
+    print("MainWindow OK: take viewer refreshes when its take finishes (L6)")
+
+
+def test_purge_cancelled_action_live_on_cancel() -> None:
+    """L12: the Edit-menu 'Remove cancelled takes' action enables on a queue status change,
+    not only on reload(). Cancelling a pending take (which fires status_changed CANCELLED)
+    must flip the action live, without any intervening reload()."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from store.models import STATUS_CANCELLED
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_PENDING)   # a queued-but-unstarted take
+    project.save_as(Path(tempfile.mkdtemp()) / "cancel.animproj")
+
+    win = MainWindow(project)
+    assert not win.purge_cancelled_act.isEnabled(), "no cancelled takes yet -> action disabled"
+
+    # cancel_pending marks the pending take CANCELLED and emits status_changed inline, which
+    # _on_status_changed handles -> the purge action must be live WITHOUT a reload.
+    win.cancel_pending()
+    assert project.get_take(take.id).status == STATUS_CANCELLED, "take was cancelled"
+    assert win.purge_cancelled_act.isEnabled(), \
+        "'Remove cancelled takes' enabled live on the cancel, no reload needed (L12)"
+    print("MainWindow OK: purge-cancelled action enables on queue status change (L12)")
+
+
 if __name__ == "__main__":
     test_save_as_over_neighbour_preserves_doc()
     test_load_corrupt_takes_json_degrades()
@@ -1824,6 +1984,7 @@ if __name__ == "__main__":
     test_snapshot_includes_framing()
     test_generate_gate_matches_snapshot_with_uncommitted_tab()
     test_generate_picker_keyframe_survives_open_tab()
+    test_generate_gate_cancel_refreshes_after_import()
     test_batch_gate_matches_snapshot_with_uncommitted_tab()
     test_generate_shot_missing_shot()
     test_take_player_settings_panel()
@@ -1836,6 +1997,9 @@ if __name__ == "__main__":
     test_guarded_emit_and_daemon_workers()
     test_save_as_rollback_on_write_failure()
     test_delete_shot_discard_preserves_takes()
+    test_delete_shot_closes_take_tab()
+    test_take_viewer_refreshes_on_status(_make_mp4(Path(tempfile.mkdtemp()) / "l6.mp4"))
+    test_purge_cancelled_action_live_on_cancel()
     test_export_starred_takes()
     test_shot_tab_missing_model_commit_and_generate()
     print("PHASE 5 SMOKE: PASS")
