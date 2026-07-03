@@ -624,6 +624,26 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     substring — so a "cannot restart: …" unrestartable mark is not misread) so a pre-existing
     crashed batch is recognised on load. Smoke-tested in `smoke_phase2` (`test_restart_plan`,
     `test_restart_take`, `test_restart_from_snapshot`, `test_interrupted_flag`).
+    **Orphan-recovery seed matching refuses ambiguous fixed-seed matches (M5, 2026-07-03):**
+    `backends/recovery.py` matches an orphaned local take to a `/history`/`/queue` entry by
+    `backend_job_id` (authoritative) then by concrete `seed`. But a seed only *identifies* a
+    take when it's unique within its shot — a **fixed-seed shot** (an authored, non-random seed;
+    the random path rerolls per take in `_queue_take`) gives all N takes the SAME seed, so a bare
+    seed match let a never-submitted PENDING orphan (no `backend_job_id`) RECLAIM a **sibling's**
+    finished render (or REATTACH a sibling's live prompt) — the `claimed` set only dedupes among
+    orphans, not against a non-orphan (already-DONE) sibling whose render that history belongs to.
+    Fix: `recovery.ambiguous_seeds(project)` computes the `(shot_id, seed)` keys shared by ≥2 takes
+    across the **whole** project (every status, `include_deleted` — the colliding sibling is often
+    a non-orphan not in the orphan set), and `plan_comfy_recovery(orphans, history, queue,
+    ambiguous_seeds)` (new 4th arg; `None` = no shared seed anywhere) has `_match_history`/
+    `_match_queue` **skip the seed fallback** for an ambiguous take. `backend_job_id` matching is
+    unaffected — a fixed-seed take that recorded its own prompt-id still matches. An ambiguous take
+    with no prompt-id gets no match → FAIL (generating) / CANCEL (pending), both `interrupted=True`
+    (via `main_window._execute_plans`), so it's restartable via this rule rather than misclaiming
+    another take's output; the reason text notes the fixed-seed skip. `main_window._apply_recovery`
+    passes `recovery.ambiguous_seeds(proj)`. Smoke-tested in `smoke_phase2.test_orphan_recovery`
+    (fixed-seed sibling: PENDING→CANCEL / GENERATING→FAIL with no misattribution, prompt-id still
+    RECLAIMs, unique seed still matches).
 18. **The 2026-06-18 native stack-overflow crash is ROOT-CAUSED: a runaway
     `QWidgetPrivate::paintSiblingsRecursive`. Card #72 has since REMOVED the prime suspect's
     mechanism (the Queue's per-row widgets) - see "FIX LANDED" at the end of this rule.** The genuine

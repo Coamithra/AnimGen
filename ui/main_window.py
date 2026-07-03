@@ -1407,7 +1407,8 @@ class MainWindow(QMainWindow):
             self._refresh_cancel_action()
             self._refresh_recovery_banner()   # recovery just produced interrupted takes
             return
-        self._execute_plans(recovery.plan_comfy_recovery(orphans, history, queue))
+        self._execute_plans(recovery.plan_comfy_recovery(
+            orphans, history, queue, recovery.ambiguous_seeds(proj)))
 
     def _execute_plans(self, plans) -> None:
         counts: Counter = Counter()
