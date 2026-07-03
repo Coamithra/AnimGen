@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import QMimeData, QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QAction, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QDockWidget, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenu,
     QMessageBox, QPushButton, QSlider, QTextEdit, QVBoxLayout, QWidget,
@@ -250,9 +250,18 @@ class TakePlayerTab(QWidget):
         self.star_btn = QPushButton()
         self.star_btn.setCheckable(True)
         self.star_btn.setToolTip("Star this take (keep it) — shortcut: S")
-        self.star_btn.setShortcut("S")
         self.star_btn.toggled.connect(self._on_star_toggled)
         self._refresh_star_btn()
+        # Scope the "S" shortcut to THIS tab's focus (WidgetWithChildren), not the whole window
+        # (a QPushButton.setShortcut / WindowShortcut default would fire for the whole MainWindow):
+        # otherwise a bare "s" typed anywhere in the window - e.g. a prompt box in a shot tab -
+        # would trigger it, and two open player tabs would both claim "S" (ambiguous). A QAction on
+        # this widget with WidgetWithChildrenShortcut context fires only when focus is inside the tab.
+        star_sc = QAction(self)
+        star_sc.setShortcut(QKeySequence("S"))
+        star_sc.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        star_sc.triggered.connect(self.star_btn.toggle)
+        self.addAction(star_sc)
 
         # The settings toggle sits to the right of the frame timer; it's always live
         # (the snapshot is available even before frames finish decoding).

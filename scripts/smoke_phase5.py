@@ -836,6 +836,18 @@ def test_take_player_star() -> None:
     tab._refresh_star_btn()
     assert tab.star_btn.isChecked() is True and len(changed) == 2
 
+    # The "S" shortcut is scoped to THIS tab's focus (WidgetWithChildren), so a bare "s" typed
+    # elsewhere in the window / a second open player can't steal it; triggering it toggles the star.
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QKeySequence
+    star_actions = [a for a in tab.actions()
+                    if a.shortcut() == QKeySequence("S")
+                    and a.shortcutContext() == Qt.ShortcutContext.WidgetWithChildrenShortcut]
+    assert len(star_actions) == 1, [a.shortcut().toString() for a in tab.actions()]
+    star_actions[0].trigger()                           # simulate the S keypress
+    assert project.get_take(take.id).starred is False   # was True -> toggled off
+    assert len(changed) == 3
+
     tab.close_player()
     print("TakePlayerTab OK: star button write-through, label sync, star_changed, no dirty")
 
