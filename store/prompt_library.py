@@ -7,18 +7,21 @@ once and applied anywhere. Persisted to data/prompt_templates.json.
 File shape: {"format": "animgen-prompt-templates", "version": 1,
              "templates": [{"name": <str>, "positive": <str>, "negative": <str>}, ...]}
 
-Reads tolerate a missing/corrupt file (returns the seed templates). Writes go through the
-project's atomic-write helper under a lock, mirroring store.schema_cache's discipline.
+Read-only accessors tolerate a missing/unreadable/corrupt file (returns the seed
+templates); mutating ops (save/delete) tolerate only ABSENCE - a present-but-unreadable
+file makes them raise `store._doc_io.UnreadableStoreError` instead of clobbering the user's
+templates with the seed set (M11; see `_load_list`). Writes go through the project's
+atomic-write helper under a lock, mirroring store.schema_cache's discipline.
 Paths are read from `paths` at call time so tests can override `paths.PROMPT_TEMPLATES`.
 """
 from __future__ import annotations
 
-import json
 import threading
 from typing import Optional
 
 import paths
 import library
+from store._doc_io import UnreadableStoreError, read_doc
 from store.project import _atomic_write_json
 
 _FORMAT = "animgen-prompt-templates"
@@ -326,13 +329,25 @@ def _normalize(t: dict) -> dict:
             "negative": str(t.get("negative", ""))}
 
 
-def _load_list() -> list[dict]:
+def _load_list(*, strict: bool = False) -> list[dict]:
+    """The templates on disk, or the seed set when the file is absent/empty.
+
+    `strict=True` (used by the mutating ops) lets an `UnreadableStoreError` propagate: a
+    present-but-unreadable file (a transient Windows AV/indexer PermissionError, or corrupt
+    JSON) must NOT be treated as the seed set, or save()/delete() would persist
+    'seeds +/- one entry' and silently discard every user template (M11). `strict=False`
+    (the read-only accessors) tolerates it and falls back to seeds - a degraded read is
+    harmless since it writes nothing.
+    """
     try:
-        with open(paths.PROMPT_TEMPLATES, encoding="utf-8") as f:
-            doc = json.load(f)
-    except (FileNotFoundError, OSError, ValueError):
+        doc = read_doc(paths.PROMPT_TEMPLATES)
+    except UnreadableStoreError:
+        if strict:
+            raise
         return [dict(t) for t in _SEEDS]
-    items = doc.get("templates") if isinstance(doc, dict) else None
+    if doc is None:                       # file absent -> seeds are correct
+        return [dict(t) for t in _SEEDS]
+    items = doc.get("templates")
     if not isinstance(items, list):
         return [dict(t) for t in _SEEDS]
     return [_normalize(t) for t in items if isinstance(t, dict) and str(t.get("name", "")).strip()]
@@ -364,7 +379,7 @@ def save(name: str, positive: str, negative: str) -> dict:
     if not rec["name"]:
         raise ValueError("Template name is required")
     with _lock:
-        items = [t for t in _load_list() if t["name"] != rec["name"]]
+        items = [t for t in _load_list(strict=True) if t["name"] != rec["name"]]
         items.append(rec)
         _write(items)
     return rec
@@ -373,7 +388,7 @@ def save(name: str, positive: str, negative: str) -> dict:
 def delete(name: str) -> bool:
     """Remove a template by name. Returns True if one was removed."""
     with _lock:
-        items = _load_list()
+        items = _load_list(strict=True)
         kept = [t for t in items if t["name"] != name]
         if len(kept) == len(items):
             return False

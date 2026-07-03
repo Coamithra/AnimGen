@@ -150,6 +150,145 @@ def test_app_settings() -> None:
     print("app_settings OK: default, set->get round-trip, persistence, explicit fallback")
 
 
+def test_store_absent_vs_unreadable() -> None:
+    """M11: the three app-global store loaders must distinguish an ABSENT file (seeds/
+    defaults are correct) from a PRESENT-BUT-UNREADABLE one (a transient Windows AV/indexer
+    PermissionError, or corrupt JSON). A mutating op reading a degraded set and writing it
+    back would silently discard every user entry - so save()/delete()/set_bool()/put() must
+    REFUSE (raise), while read-only accessors stay tolerant.
+    """
+    import builtins
+    import contextlib
+
+    from store import _doc_io, app_settings, prompt_library, schema_cache
+
+    real_open = builtins.open
+
+    @contextlib.contextmanager
+    def deny(path: Path):
+        """Make exactly `path` raise PermissionError on open (the AV/indexer lock)."""
+        def guard(file, *a, **k):
+            if isinstance(file, (str, Path)) and Path(file) == Path(path):
+                raise PermissionError(13, "locked by another process")
+            return real_open(file, *a, **k)
+        builtins.open = guard
+        try:
+            yield
+        finally:
+            builtins.open = real_open
+
+    # --- read_doc's three-way contract, directly ---
+    tmp = Path(tempfile.mkdtemp())
+    absent = tmp / "nope.json"
+    assert _doc_io.read_doc(absent) is None                      # absent -> None
+    good = tmp / "good.json"
+    good.write_text('{"k": 1}', encoding="utf-8")
+    assert _doc_io.read_doc(good) == {"k": 1}                    # readable -> parsed dict
+    bad = tmp / "bad.json"
+    bad.write_text("{ not json", encoding="utf-8")
+    try:
+        _doc_io.read_doc(bad); assert False, "corrupt file must raise"
+    except _doc_io.UnreadableStoreError:
+        pass
+    empty = tmp / "empty.json"
+    empty.write_text("", encoding="utf-8")   # 0-byte = interrupted write: unreadable, NOT absent
+    try:
+        _doc_io.read_doc(empty); assert False, "empty (0-byte) file must raise, not reseed"
+    except _doc_io.UnreadableStoreError:
+        pass
+    with deny(good):                                             # present but locked -> raise
+        try:
+            _doc_io.read_doc(good); assert False, "locked file must raise"
+        except _doc_io.UnreadableStoreError:
+            pass
+
+    # --- prompt_library: absence -> seeds; save/delete refuse to clobber a locked file ---
+    saved_pt = paths.PROMPT_TEMPLATES
+    paths.PROMPT_TEMPLATES = tmp / "prompt_templates.json"
+    try:
+        # ABSENT: seeds present, and a save persists seeds + the new entry (no loss).
+        assert not paths.PROMPT_TEMPLATES.exists()
+        seed_names = {t["name"] for t in prompt_library.all_templates()}
+        assert seed_names, "seeds must be non-empty when the file is absent"
+        prompt_library.save("UserProbe", "POS", "NEG")
+        after = {t["name"] for t in prompt_library.all_templates()}
+        assert "UserProbe" in after and seed_names <= after, "save dropped the seeds/user entry"
+        n_on_disk = len(prompt_library.all_templates())
+
+        # PRESENT-BUT-UNREADABLE: save() and delete() must raise, NOT clobber.
+        with deny(paths.PROMPT_TEMPLATES):
+            try:
+                prompt_library.save("Would-Clobber", "X", "Y")
+                assert False, "save() clobbered an unreadable file"
+            except _doc_io.UnreadableStoreError:
+                pass
+            try:
+                prompt_library.delete("UserProbe")
+                assert False, "delete() clobbered an unreadable file"
+            except _doc_io.UnreadableStoreError:
+                pass
+        # The file is intact - the failed mutation wrote nothing.
+        assert len(prompt_library.all_templates()) == n_on_disk
+        assert "UserProbe" in {t["name"] for t in prompt_library.all_templates()}
+    finally:
+        paths.PROMPT_TEMPLATES = saved_pt
+
+    # --- app_settings: set_bool refuses a locked file, get_bool tolerates it ---
+    saved_as = paths.APP_SETTINGS
+    paths.APP_SETTINGS = tmp / "app_settings.json"
+    try:
+        app_settings.set_bool("alpha", True)
+        app_settings.set_bool("beta", True)
+        with deny(paths.APP_SETTINGS):
+            # get_bool tolerates (falls back to registered/explicit default), writes nothing.
+            assert app_settings.get_bool("alpha", False) is False
+            try:
+                app_settings.set_bool("gamma", True)
+                assert False, "set_bool() clobbered an unreadable file"
+            except _doc_io.UnreadableStoreError:
+                pass
+        # Both original keys survive; the refused write left "gamma" off disk.
+        assert app_settings.get_bool("alpha") is True
+        assert app_settings.get_bool("beta") is True
+        assert app_settings.get_bool("gamma", False) is False
+    finally:
+        paths.APP_SETTINGS = saved_as
+
+    # --- schema_cache: put refuses a locked file, readers tolerate it ---
+    saved_sc = paths.SCHEMA_CACHE
+    paths.SCHEMA_CACHE = tmp / "schema_cache.json"
+    try:
+        schema_cache.put("model/a", {"p": {}})
+        schema_cache.put("model/b", {"q": {}})
+        with deny(paths.SCHEMA_CACHE):
+            assert schema_cache.all_entries() == {}          # tolerant read, no write
+            try:
+                schema_cache.put("model/c", {"r": {}})
+                assert False, "put() clobbered an unreadable file"
+            except _doc_io.UnreadableStoreError:
+                pass
+        assert set(schema_cache.all_entries()) == {"model/a", "model/b"}  # c never landed
+    finally:
+        paths.SCHEMA_CACHE = saved_sc
+
+    # --- 0-byte store file (interrupted write): a mutating op refuses, it does NOT reseed ---
+    saved_pt = paths.PROMPT_TEMPLATES
+    paths.PROMPT_TEMPLATES = tmp / "truncated_templates.json"
+    try:
+        paths.PROMPT_TEMPLATES.write_text("", encoding="utf-8")
+        try:
+            prompt_library.save("OnEmpty", "X", "Y")
+            assert False, "save() reseeded over a 0-byte file"
+        except _doc_io.UnreadableStoreError:
+            pass
+        assert paths.PROMPT_TEMPLATES.read_text(encoding="utf-8") == ""  # untouched
+    finally:
+        paths.PROMPT_TEMPLATES = saved_pt
+
+    print("store absent-vs-unreadable OK: absent->seeds/defaults; locked/corrupt/empty->"
+          "mutations refuse (raise), readers tolerate; no clobber")
+
+
 def test_roster_integrity() -> None:
     # Every roster entry is well-formed for its backend (offline: no schema fetch).
     for m in library.models():
@@ -2345,6 +2484,7 @@ if __name__ == "__main__":
     test_capability_sync()
     test_resolve_enums()
     test_app_settings()
+    test_store_absent_vs_unreadable()
     test_roster_integrity()
     test_comfy_prepare()
     test_dynamic_vram_gate()
