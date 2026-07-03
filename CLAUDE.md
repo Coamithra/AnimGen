@@ -306,7 +306,15 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
    snapshot records. The worker-thread closures (`framing.render_keyposes` + both backends'
    `generate`) must keep reading off that synth Shot — never re-close over the live `shot`.
    `_shot_from_snapshot` deep-copies the snapshot's `crop`/`settings` into the synth so a
-   reader can't mutate the frozen snapshot through a shared dict.
+   reader can't mutate the frozen snapshot through a shared dict. **The pre-gate SAVE is what
+   makes the snapshot coherent (card H3):** `generate_shot` and `start_batch` call
+   `save_project()` (which `_commit_open_shot_tabs()` flushes every open shot-tab editor into
+   the buffer, mutating the live Shot in place) BEFORE they read model/settings/est, show the
+   cost gate, and freeze the snapshot -- so the gate confirms exactly what renders (rule #1) and
+   the snapshot can't mix pre-commit backend/replicate-id/settings with post-commit
+   prompt/crop/frames. Keep the save FIRST; don't reintroduce a compute-then-save order. The
+   ShotTab-Generate path already `commit()`s its own tab first (`shot_tab._generate`), but the
+   card-Generate / batch paths must save to also flush OTHER open tabs.
 4. **Smoke tests run headless** with `QT_QPA_PLATFORM=offscreen`; never call a modal's
    `.exec()` in a test (it blocks). Tests override `paths.SCRATCH_DIR` to a tempdir so
    untitled-project scratch stays out of `data/`. `build_summary` / pure functions are

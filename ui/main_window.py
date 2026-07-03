@@ -655,6 +655,20 @@ class MainWindow(QMainWindow):
             # silently-dropped Generate is the confusing case (the siblings stay silent).
             self._log("generate ignored: shot no longer exists")
             return
+        # Persist the project (flushing every open shot-tab editor via
+        # _commit_open_shot_tabs) BEFORE validating, computing the cost estimate, showing the
+        # gate, and freezing the snapshot — otherwise an uncommitted open tab would mutate this
+        # Shot in place between the gate and _queue_take, so the gate could confirm one
+        # model/cost while the take snapshot records another (rule #1 + rule #3, card H3). Also
+        # handles untitled -> Save As prompt; aborting the save aborts the generation. Every
+        # validation below then reads committed state, so the confirmed content is what renders.
+        if not self.save_project():
+            self._log("generation cancelled (project not saved)")
+            return
+        shot = self.project.get_shot(shot_id)
+        if not shot:
+            self._log("generate ignored: shot deleted during save")
+            return
         model = library.get_model(shot.model_id)
         if not model:
             QMessageBox.warning(self, "Generate", f"Unknown model: {shot.model_id}")
@@ -673,6 +687,10 @@ class MainWindow(QMainWindow):
             if not start:
                 return
             self.project.update_shot(shot.id, start_frame=str(self.project.import_asset(start)))
+            # Re-persist so the picked keyframe is committed before the take snapshots it.
+            if not self.save_project():
+                self._log("generation cancelled (project not saved)")
+                return
             shot = self.project.get_shot(shot_id)
             if not shot:
                 self._log("generate ignored: shot deleted while picking a keyframe")
@@ -684,12 +702,6 @@ class MainWindow(QMainWindow):
                 "backend": model["backend"], "est_cost": est, "params": settings}
         if not confirm_launch(self, [item]):
             self._log("launch cancelled")
-            return
-
-        # Persist the project so the take never references an unsaved shot (untitled ->
-        # Save As prompt). Aborting the save aborts the generation.
-        if not self.save_project():
-            self._log("generation cancelled (project not saved)")
             return
 
         self._queue_take(shot, model, settings, est)
@@ -753,9 +765,19 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         scope, n, power = dlg.scope(), dlg.takes_per_shot(), dlg.power_action()
+        view_ids = list(self.cards)   # snapshot the view before save() rebuilds self.cards
+
+        # Persist the project (flushing every open shot-tab editor via _commit_open_shot_tabs)
+        # BEFORE planning, showing the gate, and freezing snapshots — otherwise an uncommitted
+        # open tab would mutate a Shot in place between the gate and _queue_take, so the gate
+        # could confirm one plan/cost while the take snapshots record another (rule #1 + rule
+        # #3, card H3). Also handles untitled -> Save As; aborting the save aborts the batch.
+        if not self.save_project():
+            self._log("batch cancelled (project not saved)")
+            return
 
         if scope == SCOPE_VIEW:
-            shots = [s for s in (self.project.get_shot(sid) for sid in self.cards) if s]
+            shots = [s for s in (self.project.get_shot(sid) for sid in view_ids) if s]
         else:
             shots = self.project.list_shots()
         plan = batch.plan_batch(
@@ -782,9 +804,6 @@ class MainWindow(QMainWindow):
 
         if not confirm_launch(self, plan.items):
             self._log("batch cancelled")
-            return
-        if not self.save_project():
-            self._log("batch cancelled (project not saved)")
             return
 
         take_ids: set[str] = set()
