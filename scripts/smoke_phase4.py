@@ -794,6 +794,47 @@ def test_param_enum_preserves_out_of_schema_value() -> None:
     print("shot-tab enum param OK: out-of-schema value preserved + flagged, valid re-pick clears flag")
 
 
+def test_shot_tab_missing_model_flag() -> None:
+    """A shot whose model_id left the roster must show a disabled placeholder combo entry
+    carrying the stored id and flag it red (mirroring the invalid-aspect state), NOT snap the
+    combo to a real model at index 0. Picking a real model clears the flag and drops the
+    placeholder. Card M9."""
+    import library
+    from PySide6.QtWidgets import QApplication
+
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("c", model_id="ghost-model-9000")   # not in the roster
+    tab = ShotTab(project, shot)
+
+    assert tab._current_model() is None, "unknown model resolves to None"
+    assert not tab.model_valid(), "an off-roster model must be flagged invalid"
+    assert "d9534f" in tab.model_combo.styleSheet(), "combo flagged red like an invalid aspect"
+    assert tab.model_combo.currentData() == "ghost-model-9000", "combo holds the stored id, not index 0"
+    idx = tab.model_combo.findData("ghost-model-9000")
+    assert idx >= 0, "the missing model is a real combo entry"
+    item = tab.model_combo.model().item(idx)
+    assert item is not None and not item.isEnabled(), "placeholder entry is disabled (not user-pickable)"
+
+    # Pick a real roster model -> flag clears, placeholder is dropped, combo lands on it.
+    real = library.models()[0]["id"]
+    tab.model_combo.setCurrentIndex(tab.model_combo.findData(real))
+    assert tab.model_valid(), "picking a real model clears the invalid flag"
+    assert "d9534f" not in tab.model_combo.styleSheet()
+    assert tab.model_combo.findData("ghost-model-9000") < 0, "placeholder dropped after a real pick"
+
+    # A BLANK model_id (a bare new shot) is NOT the missing-model case: it defaults to
+    # index 0, stays valid, and gets no placeholder.
+    blank = project.add_shot("blank")
+    tab2 = ShotTab(project, blank)
+    assert tab2.model_valid(), "a blank model_id defaults to the first roster model, not invalid"
+    assert tab2.model_combo.currentIndex() == 0
+    assert tab2._missing_model_idx is None, "no placeholder for a blank id"
+    print("shot-tab missing-model OK: placeholder held + flagged red, real pick clears + drops it")
+
+
 def test_takes_view_incremental_update() -> None:
     """A take's status signal updates just that take's tile in place (same QStandardItem, cached
     icon, no full model rebuild), and only falls back to a full load when the take's membership
@@ -1171,5 +1212,6 @@ if __name__ == "__main__":
     test_runner_uses_snapshot_not_live_shot()
     test_snapshot_detached_from_live_shot_at_creation()
     test_param_enum_preserves_out_of_schema_value()
+    test_shot_tab_missing_model_flag()
     test_queue_view()
     print("PHASE 4 SMOKE: PASS")

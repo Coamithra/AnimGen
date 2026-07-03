@@ -1450,6 +1450,52 @@ def test_export_starred_takes() -> None:
     print("export starred takes OK: gathers view's starred takes, excludes deleted, empty->message")
 
 
+def test_shot_tab_missing_model_commit_and_generate() -> None:
+    """Card M9: loading a shot whose model_id left the roster must NOT silently rewrite it.
+    commit() round-trips the stored id unchanged (was: snapped to the first roster model), the
+    Generate path is blocked with a warning (never emits generate_requested / saves), and
+    actively picking a real model unblocks Generate and commit() then writes the new id."""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    import library
+    from ui.shot_tab import ShotTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="ghost-model-9000", prompt="p")
+    assert library.get_model("ghost-model-9000") is None, "precondition: model off-roster"
+    tab = ShotTab(project, shot)
+
+    # (1) commit() preserves the stored id verbatim - no snap to a real model.
+    tab.commit()
+    assert project.get_shot(shot.id).model_id == "ghost-model-9000", \
+        "commit() must round-trip an off-roster model id, not rewrite it"
+
+    # (2) Generate is blocked: _generate warns and returns before emitting / saving.
+    emitted: list = []
+    tab.generate_requested.connect(lambda sid: emitted.append(sid))
+    warned: list = []
+    _orig_warn = QMessageBox.warning
+    QMessageBox.warning = staticmethod(lambda *a, **k: warned.append(a) or QMessageBox.StandardButton.Ok)  # type: ignore[assignment]
+    try:
+        tab._generate()
+    finally:
+        QMessageBox.warning = _orig_warn  # type: ignore[assignment]
+    assert warned, "an off-roster model must warn on Generate"
+    assert not emitted, "Generate must not fire while the model is off-roster"
+    assert project.get_shot(shot.id).model_id == "ghost-model-9000", \
+        "a blocked Generate must not have saved a rewritten model id"
+
+    # (3) Actively picking a real model unblocks Generate and commit() writes the NEW id.
+    real = library.models()[0]["id"]
+    tab.model_combo.setCurrentIndex(tab.model_combo.findData(real))
+    assert tab.model_valid(), "a real pick clears the flag"
+    tab._generate()
+    assert emitted == [shot.id], "Generate fires once a real model is chosen"
+    assert project.get_shot(shot.id).model_id == real, "commit() writes the newly-picked model id"
+    print("shot-tab missing-model OK: commit round-trips off-roster id, Generate blocked, real pick unblocks")
+
+
 if __name__ == "__main__":
     test_export()
     test_take_media_probe()
@@ -1477,4 +1523,5 @@ if __name__ == "__main__":
     test_save_as_rollback_on_write_failure()
     test_delete_shot_discard_preserves_takes()
     test_export_starred_takes()
+    test_shot_tab_missing_model_commit_and_generate()
     print("PHASE 5 SMOKE: PASS")
