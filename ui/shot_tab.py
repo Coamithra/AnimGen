@@ -66,6 +66,7 @@ class ShotTab(QWidget):
         self._schema: Optional[dict] = None
         self._param_getters: dict[str, Callable] = {}
         self._takes_view: Optional[TakesView] = None
+        self._missing_model_idx: Optional[int] = None  # combo row for a shot's since-removed model
         self._assets: dict[str, Optional[str]] = {"start": None, "end": None}
         self._frames: dict[str, dict] = {"start": dict(_DEFAULT_PLACEMENT),
                                           "end": dict(_DEFAULT_PLACEMENT)}
@@ -483,10 +484,50 @@ class ShotTab(QWidget):
             btn.setIcon(QIcon()); btn.setText("Choose…")
 
     # ---- model + params -------------------------------------------------
-    def _current_model(self) -> dict:
+    def _current_model(self) -> Optional[dict]:
         return library.get_model(self.model_combo.currentData())
 
+    def _select_model(self, model_id: str) -> None:
+        """Point the combo at model_id. If it's no longer in the roster, keep it visible as a
+        disabled placeholder carrying the stored id (mirrors _populate_aspects keeping an
+        out-of-list aspect) so commit() round-trips it and model_valid() can flag it red,
+        instead of silently snapping to index 0."""
+        self._drop_missing_model_item()
+        idx = self.model_combo.findData(model_id)
+        if idx < 0 and model_id:   # blank id (a new shot) -> default to index 0, no placeholder
+            self.model_combo.blockSignals(True)
+            self.model_combo.addItem(f"(missing) {model_id}", model_id)
+            self._missing_model_idx = self.model_combo.count() - 1
+            item = self.model_combo.model().item(self._missing_model_idx)
+            if item is not None:
+                item.setEnabled(False)   # not user-selectable; only reachable via the stored id
+            self.model_combo.blockSignals(False)
+            idx = self._missing_model_idx
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        self.model_valid()
+
+    def _drop_missing_model_item(self) -> None:
+        if self._missing_model_idx is not None:
+            self.model_combo.blockSignals(True)
+            self.model_combo.removeItem(self._missing_model_idx)
+            self.model_combo.blockSignals(False)
+            self._missing_model_idx = None
+
+    def model_valid(self) -> bool:
+        """The current selection is a real roster model (mirrors aspect_valid): returns the
+        flag and paints a red border when the shot's model has left the roster."""
+        ok = self._current_model() is not None
+        self.model_combo.setStyleSheet("" if ok else "QComboBox { border: 2px solid #d9534f; }")
+        return ok
+
     def _on_model_changed(self) -> None:
+        # A real user pick supersedes any missing-model placeholder - drop it so the stored
+        # id is no longer preserved and the combo can't re-land on it.
+        if (self._missing_model_idx is not None
+                and self.model_combo.currentIndex() != self._missing_model_idx):
+            self._drop_missing_model_item()
+        self.model_valid()
         self._rebuild_params()        # re-reads the schema -> re-masks the negative box
         self._populate_aspects()      # offer this model's aspects; flag if current is invalid
 
@@ -727,9 +768,7 @@ class ShotTab(QWidget):
     # ---- load / save ----------------------------------------------------
     def _load(self, shot) -> None:
         self.name.setText(shot.name)
-        idx = self.model_combo.findData(shot.model_id)
-        if idx >= 0:
-            self.model_combo.setCurrentIndex(idx)
+        self._select_model(shot.model_id)
         self.prompt.setPlainText(shot.prompt)
         self._set_negative(shot.negative_prompt)   # stash-aware (the model's box may be masked)
         self._rebuild_params(shot.settings)
@@ -767,14 +806,18 @@ class ShotTab(QWidget):
             self.name.setText(name)
         self._frames[self._active] = self.canvas.get_placement()   # capture the live one
         model = self._current_model()
+        # A shot whose model left the roster keeps its stored id verbatim (the disabled
+        # placeholder holds it) until the user actively picks a real one - never snap to
+        # index 0. get_model returned None, so read the id off the combo's stored data.
+        model_id = model["id"] if model else self.model_combo.currentData()
         settings = self._params()
         aspect = self.selected_aspect()
-        if "aspect_ratio" in (model.get("default_params") or {}):
+        if "aspect_ratio" in ((model or {}).get("default_params") or {}):
             settings["aspect_ratio"] = aspect    # hosted models that take the param
         crop = {"aspect": aspect, "start": self._frames["start"], "end": self._frames["end"]}
         w, h = framing.canvas_size(aspect, local=self._is_local())
 
-        fields = dict(model_id=model["id"], prompt=self.prompt.toPlainText().strip(),
+        fields = dict(model_id=model_id, prompt=self.prompt.toPlainText().strip(),
                       negative_prompt=self._negative_value().strip(), settings=settings,
                       start_frame=self._assets["start"], end_frame=self._assets["end"],
                       canvas_w=w, canvas_h=h, crop=crop)
@@ -798,6 +841,11 @@ class ShotTab(QWidget):
         return sid
 
     def _generate(self) -> None:
+        if not self.model_valid():
+            QMessageBox.warning(self, "Generate",
+                                f"'{self.model_combo.currentData()}' is no longer in the model "
+                                f"roster. Pick a current model before generating.")
+            return
         if not self.aspect_valid():
             QMessageBox.warning(self, "Generate",
                                 f"'{self.selected_aspect()}' isn't a valid aspect ratio for "

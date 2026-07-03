@@ -752,7 +752,14 @@ class TakesView(QWidget):
                 elif t.status == "generating":
                     self.jobs.request_stop(tid)
             # update_take mutates the Take in place, so `t` already reflects the cancel.
-            takes_io.move_to_bin(t, self.project)
+            # Resilience (M13): a transient AV/indexer lock can make one take's file move
+            # raise mid-sequence; don't let it abort binning the rest of a multi-delete.
+            # move_to_bin is now per-move atomic, so a take that partially binned is left
+            # consistent (deleted=True + whatever moved) and can still be restored.
+            try:
+                takes_io.move_to_bin(t, self.project)
+            except OSError:
+                pass
         self.load()
         self.changed.emit()
 

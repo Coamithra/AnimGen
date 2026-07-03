@@ -13,6 +13,7 @@ import copy
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -150,6 +151,145 @@ def test_app_settings() -> None:
     print("app_settings OK: default, set->get round-trip, persistence, explicit fallback")
 
 
+def test_store_absent_vs_unreadable() -> None:
+    """M11: the three app-global store loaders must distinguish an ABSENT file (seeds/
+    defaults are correct) from a PRESENT-BUT-UNREADABLE one (a transient Windows AV/indexer
+    PermissionError, or corrupt JSON). A mutating op reading a degraded set and writing it
+    back would silently discard every user entry - so save()/delete()/set_bool()/put() must
+    REFUSE (raise), while read-only accessors stay tolerant.
+    """
+    import builtins
+    import contextlib
+
+    from store import _doc_io, app_settings, prompt_library, schema_cache
+
+    real_open = builtins.open
+
+    @contextlib.contextmanager
+    def deny(path: Path):
+        """Make exactly `path` raise PermissionError on open (the AV/indexer lock)."""
+        def guard(file, *a, **k):
+            if isinstance(file, (str, Path)) and Path(file) == Path(path):
+                raise PermissionError(13, "locked by another process")
+            return real_open(file, *a, **k)
+        builtins.open = guard
+        try:
+            yield
+        finally:
+            builtins.open = real_open
+
+    # --- read_doc's three-way contract, directly ---
+    tmp = Path(tempfile.mkdtemp())
+    absent = tmp / "nope.json"
+    assert _doc_io.read_doc(absent) is None                      # absent -> None
+    good = tmp / "good.json"
+    good.write_text('{"k": 1}', encoding="utf-8")
+    assert _doc_io.read_doc(good) == {"k": 1}                    # readable -> parsed dict
+    bad = tmp / "bad.json"
+    bad.write_text("{ not json", encoding="utf-8")
+    try:
+        _doc_io.read_doc(bad); assert False, "corrupt file must raise"
+    except _doc_io.UnreadableStoreError:
+        pass
+    empty = tmp / "empty.json"
+    empty.write_text("", encoding="utf-8")   # 0-byte = interrupted write: unreadable, NOT absent
+    try:
+        _doc_io.read_doc(empty); assert False, "empty (0-byte) file must raise, not reseed"
+    except _doc_io.UnreadableStoreError:
+        pass
+    with deny(good):                                             # present but locked -> raise
+        try:
+            _doc_io.read_doc(good); assert False, "locked file must raise"
+        except _doc_io.UnreadableStoreError:
+            pass
+
+    # --- prompt_library: absence -> seeds; save/delete refuse to clobber a locked file ---
+    saved_pt = paths.PROMPT_TEMPLATES
+    paths.PROMPT_TEMPLATES = tmp / "prompt_templates.json"
+    try:
+        # ABSENT: seeds present, and a save persists seeds + the new entry (no loss).
+        assert not paths.PROMPT_TEMPLATES.exists()
+        seed_names = {t["name"] for t in prompt_library.all_templates()}
+        assert seed_names, "seeds must be non-empty when the file is absent"
+        prompt_library.save("UserProbe", "POS", "NEG")
+        after = {t["name"] for t in prompt_library.all_templates()}
+        assert "UserProbe" in after and seed_names <= after, "save dropped the seeds/user entry"
+        n_on_disk = len(prompt_library.all_templates())
+
+        # PRESENT-BUT-UNREADABLE: save() and delete() must raise, NOT clobber.
+        with deny(paths.PROMPT_TEMPLATES):
+            try:
+                prompt_library.save("Would-Clobber", "X", "Y")
+                assert False, "save() clobbered an unreadable file"
+            except _doc_io.UnreadableStoreError:
+                pass
+            try:
+                prompt_library.delete("UserProbe")
+                assert False, "delete() clobbered an unreadable file"
+            except _doc_io.UnreadableStoreError:
+                pass
+        # The file is intact - the failed mutation wrote nothing.
+        assert len(prompt_library.all_templates()) == n_on_disk
+        assert "UserProbe" in {t["name"] for t in prompt_library.all_templates()}
+    finally:
+        paths.PROMPT_TEMPLATES = saved_pt
+
+    # --- app_settings: set_bool refuses a locked file, get_bool tolerates it ---
+    saved_as = paths.APP_SETTINGS
+    paths.APP_SETTINGS = tmp / "app_settings.json"
+    try:
+        app_settings.set_bool("alpha", True)
+        app_settings.set_bool("beta", True)
+        with deny(paths.APP_SETTINGS):
+            # get_bool tolerates (falls back to registered/explicit default), writes nothing.
+            assert app_settings.get_bool("alpha", False) is False
+            try:
+                app_settings.set_bool("gamma", True)
+                assert False, "set_bool() clobbered an unreadable file"
+            except _doc_io.UnreadableStoreError:
+                pass
+        # Both original keys survive; the refused write left "gamma" off disk.
+        assert app_settings.get_bool("alpha") is True
+        assert app_settings.get_bool("beta") is True
+        assert app_settings.get_bool("gamma", False) is False
+    finally:
+        paths.APP_SETTINGS = saved_as
+
+    # --- schema_cache: put refuses a locked file, readers tolerate it ---
+    saved_sc = paths.SCHEMA_CACHE
+    paths.SCHEMA_CACHE = tmp / "schema_cache.json"
+    try:
+        schema_cache.put("model/a", {"p": {}})
+        schema_cache.put("model/b", {"q": {}})
+        with deny(paths.SCHEMA_CACHE):
+            assert schema_cache.all_entries() == {}          # tolerant read, no write
+            try:
+                schema_cache.put("model/c", {"r": {}})
+                assert False, "put() clobbered an unreadable file"
+            except _doc_io.UnreadableStoreError:
+                pass
+        assert set(schema_cache.all_entries()) == {"model/a", "model/b"}  # c never landed
+    finally:
+        paths.SCHEMA_CACHE = saved_sc
+
+    # --- 0-byte store file (interrupted write): a mutating op refuses, it does NOT reseed ---
+    saved_pt = paths.PROMPT_TEMPLATES
+    paths.PROMPT_TEMPLATES = tmp / "truncated_templates.json"
+    try:
+        paths.PROMPT_TEMPLATES.write_text("", encoding="utf-8")
+        try:
+            prompt_library.save("OnEmpty", "X", "Y")
+            assert False, "save() reseeded over a 0-byte file"
+        except _doc_io.UnreadableStoreError:
+            pass
+        assert paths.PROMPT_TEMPLATES.read_text(encoding="utf-8") == ""  # untouched
+    finally:
+        paths.PROMPT_TEMPLATES = saved_pt
+
+    print("store absent-vs-unreadable OK: absent->seeds/defaults; locked/corrupt/empty->"
+          "mutations refuse (raise), readers tolerate; no clobber")
+
+
 def test_roster_integrity() -> None:
     # Every roster entry is well-formed for its backend (offline: no schema fetch).
     for m in library.models():
@@ -194,11 +334,21 @@ def test_comfy_prepare() -> None:
     template = json.loads((WORKFLOWS_DIR / "FLF_stand_to_crouch.json").read_text(encoding="utf-8"))
     roles = library.get_model("local-flf-wan14b")["comfy_nodes"]
 
+    # M8: input images are now named by content hash (kp_<sha1>.ext), not source name, so
+    # distinct framings never contest the same ComfyUI/input slot. Two different images -> two
+    # different names; both copied into the input dir.
+    import hashlib as _hl
+    name_a = f"kp_{_hl.sha1(a.read_bytes()).hexdigest()}.png"
+    name_b = f"kp_{_hl.sha1(b.read_bytes()).hexdigest()}.png"
+    assert name_a != name_b
+
     wf = comfy_client.prepare_workflow(
         template, start_img=str(a), end_img=str(b), prompt="POS", negative="NEG",
         seed=42, node_roles=roles, sets={"12.steps": "30"})
-    assert wf["9"]["inputs"]["image"] == "a.png"
-    assert wf["10"]["inputs"]["image"] == "b.png"
+    assert wf["9"]["inputs"]["image"] == name_a
+    assert wf["10"]["inputs"]["image"] == name_b
+    assert (comfy_client.COMFY_INPUT_DIR / name_a).exists()
+    assert (comfy_client.COMFY_INPUT_DIR / name_b).exists()
     assert wf["7"]["inputs"]["text"] == "POS"
     assert wf["8"]["inputs"]["text"] == "NEG"
     assert wf["12"]["inputs"]["noise_seed"] == 42 and wf["13"]["inputs"]["noise_seed"] == 42
@@ -207,7 +357,7 @@ def test_comfy_prepare() -> None:
     # heuristic fallback (no roles): same result via ascending node-id ordering
     wf2 = comfy_client.prepare_workflow(
         template, start_img=str(a), end_img=str(b), prompt="P2", negative="N2", seed=9)
-    assert wf2["9"]["inputs"]["image"] == "a.png" and wf2["10"]["inputs"]["image"] == "b.png"
+    assert wf2["9"]["inputs"]["image"] == name_a and wf2["10"]["inputs"]["image"] == name_b
     assert wf2["7"]["inputs"]["text"] == "P2" and wf2["8"]["inputs"]["text"] == "N2"
     assert wf2["12"]["inputs"]["noise_seed"] == 9
 
@@ -216,7 +366,7 @@ def test_comfy_prepare() -> None:
     wf3 = comfy_client.prepare_workflow(
         template, start_img=str(a), end_img=None, prompt="P", negative="N",
         seed=1, node_roles=roles)
-    assert wf3["9"]["inputs"]["image"] == "a.png"            # start still applied
+    assert wf3["9"]["inputs"]["image"] == name_a            # start still applied
     assert not any(isinstance(v, list) and v and str(v[0]) == "10"
                    for n in wf3.values() for v in n.get("inputs", {}).values()), \
         "end-image node should have no consumers when no end frame is given"
@@ -423,6 +573,158 @@ def test_comfy_stop_helpers() -> None:
     print("comfy stop helpers OK: pid-by-port probe + stop_work error path")
 
 
+def test_comfy_api_errors() -> None:
+    # M3: _api must distinguish an HTTP error (a real 4xx/5xx response body, e.g. a /prompt
+    # validation failure with node_errors) from an unreachable server, surface a truncated/
+    # malformed body cleanly, and wrap a read timeout - none of which used to reach a ComfyError
+    # with useful text. Drive each via a fake urlopen so no server is touched.
+    import io
+    import urllib.error
+    import urllib.request
+
+    saved = urllib.request.urlopen
+
+    def make_http_error(body: bytes, code: int = 400):
+        def urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, code, "Bad Request", {},
+                                         io.BytesIO(body))
+        return urlopen
+
+    try:
+        # a 400 carrying node_errors -> the node-level detail is surfaced, not "unreachable"
+        body = json.dumps({"error": {"message": "invalid prompt"},
+                           "node_errors": {"12": {"errors": ["missing model"]}}}).encode()
+        urllib.request.urlopen = make_http_error(body)
+        try:
+            comfy_client._api("/prompt", {"prompt": {}})
+            assert False, "expected ComfyError on HTTP 400"
+        except comfy_client.ComfyError as e:
+            msg = str(e)
+            assert "HTTP 400" in msg and "invalid prompt" in msg and "node_errors" in msg, msg
+            assert "unreachable" not in msg, "HTTP error must NOT be reported as unreachable"
+
+        # a non-JSON error body -> falls back to the raw text, still a ComfyError (not a crash)
+        urllib.request.urlopen = make_http_error(b"<html>500 boom</html>", code=500)
+        try:
+            comfy_client._api("/history/x")
+            assert False, "expected ComfyError on HTTP 500"
+        except comfy_client.ComfyError as e:
+            assert "HTTP 500" in str(e) and "boom" in str(e)
+
+        # a truncated/malformed 200 body -> JSONDecodeError wrapped as ComfyError (used to escape)
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b"{not json"
+        urllib.request.urlopen = lambda req, timeout=None: FakeResp()
+        try:
+            comfy_client._api("/history/x")
+            assert False, "expected ComfyError on malformed body"
+        except comfy_client.ComfyError as e:
+            assert "malformed" in str(e)
+
+        # a read timeout mid-body -> wrapped as ComfyError (socket.timeout is not a URLError)
+        import socket
+        def urlopen_timeout(req, timeout=None):
+            raise socket.timeout("timed out")
+        urllib.request.urlopen = urlopen_timeout
+        try:
+            comfy_client._api("/history/x", timeout=3)
+            assert False, "expected ComfyError on read timeout"
+        except comfy_client.ComfyError as e:
+            assert "timed out" in str(e)
+    finally:
+        urllib.request.urlopen = saved
+    print("comfy _api errors OK: HTTP body surfaced, malformed/timeout wrapped, not 'unreachable'")
+
+
+def test_poll_retry() -> None:
+    # M4: a transient /history poll failure is retried with backoff, not fatal. Stub _api to
+    # fail a few times then succeed; the render must still complete. A sustained outage past
+    # the streak limit is still fatal. Patch time.sleep so the test doesn't actually wait.
+    saved_api, saved_sleep = comfy_client._api, comfy_client.time.sleep
+    out = Path(tempfile.mkdtemp()) / "take.mp4"
+    src_dir = Path(tempfile.mkdtemp())
+    (src_dir / "src.mp4").write_bytes(b"video-bytes")
+    hist_ok = {"P": {"status": {"status_str": "success", "completed": True},
+                     "outputs": {"9": {"gifs": [{"filename": "src.mp4",
+                                                 "subfolder": ""}]}}}}
+    # point COMFY_OUTPUT_DIR at our temp dir so the claimed file resolves to our src
+    saved_out_dir = comfy_client.COMFY_OUTPUT_DIR
+    comfy_client.COMFY_OUTPUT_DIR = src_dir
+    try:
+        comfy_client.time.sleep = lambda *a, **k: None
+        calls = {"n": 0}
+
+        def flaky(path, data=None, timeout=30):
+            calls["n"] += 1
+            if calls["n"] <= 3:                       # first 3 polls stall
+                raise comfy_client.ComfyError("stalled")
+            return hist_ok
+
+        comfy_client._api = flaky
+        res = comfy_client._poll_until_done("P", out, None, timeout_s=3600, poll_s=0)
+        assert calls["n"] == 4, f"should have retried 3 stalls then succeeded: {calls['n']}"
+        assert Path(res["video_path"]).exists()
+
+        # a sustained outage (always fails) trips the streak limit and raises
+        calls["n"] = 0
+        comfy_client._api = lambda *a, **k: (_ for _ in ()).throw(comfy_client.ComfyError("down"))
+        try:
+            comfy_client._poll_until_done("P", out, None, timeout_s=3600, poll_s=0)
+            assert False, "a sustained poll outage must eventually raise"
+        except comfy_client.ComfyError as e:
+            assert "lost contact" in str(e)
+
+        # the failure branch still honors the overall timeout (accounting for the upcoming
+        # backoff sleep): with the budget exhausted, a stalling poll raises "timed out"
+        # instead of retrying - the streak limit must not be the only bound.
+        try:
+            comfy_client._poll_until_done("P", out, None, timeout_s=0, poll_s=0)
+            assert False, "an exhausted timeout on the failure branch must raise"
+        except comfy_client.ComfyError as e:
+            assert "timed out" in str(e)
+    finally:
+        comfy_client._api, comfy_client.time.sleep = saved_api, saved_sleep
+        comfy_client.COMFY_OUTPUT_DIR = saved_out_dir
+    print("comfy poll retry OK: transient stalls retried, sustained outage fatal")
+
+
+def test_claim_output_empty() -> None:
+    # L10: a /history entry whose outputs carry only unrecognized keys yields an empty produced
+    # list; claiming it used to return a DONE take pointing at a never-written file. Now it raises.
+    out = Path(tempfile.mkdtemp()) / "take.mp4"
+    entry = {"outputs": {"9": {"latents": [{"filename": "x.latent", "subfolder": ""}]}}}
+    assert comfy_client._entry_outputs(entry) == [], "unrecognized keys produce nothing"
+    try:
+        comfy_client._claim_output([], out)
+        assert False, "empty produced list must raise, not claim a nonexistent file"
+    except comfy_client.ComfyError as e:
+        assert "recognized media" in str(e)
+    assert not out.exists(), "no file should have been claimed"
+    print("comfy claim empty OK: no-media output raises instead of a phantom DONE take")
+
+
+def test_stop_work_targets_prompt() -> None:
+    # L8: stop_work targets our own prompt id (delete: [id]) instead of clearing the whole
+    # server queue; only falls back to clear:true when no id is known. Capture the POST bodies.
+    saved_post = comfy_client._post
+    posts = []
+    comfy_client._post = lambda path, data=None, timeout=5: posts.append((path, data))
+    try:
+        comfy_client.stop_work(prompt_id="P7")
+        assert ("/queue", {"delete": ["P7"]}) in posts, posts
+        assert ("/interrupt", {}) in posts
+        assert not any(d == {"clear": True} for _, d in posts), "must NOT clear the whole queue"
+
+        posts.clear()
+        comfy_client.stop_work()   # no id -> blanket clear fallback preserved
+        assert ("/queue", {"clear": True}) in posts, posts
+    finally:
+        comfy_client._post = saved_post
+    print("comfy stop_work OK: targets our prompt id, falls back to clear when unknown")
+
+
 def test_total_price() -> None:
     from ui.cost_confirm import total_price_text
 
@@ -431,7 +733,10 @@ def test_total_price() -> None:
     assert total_price_text([0.72, None, 0.0]) == "Full set: $0.72  (+1 unknown)"
     assert total_price_text([]) == "Full set: $0.00"
     assert total_price_text([None, None]) == "Full set: $0.00  (+2 unknown)"
-    print("cost_confirm total_price_text OK: sum, free, unknown tally, empty")
+    # L13 sibling surface: a sub-cent full set doesn't collapse to $0.00 either.
+    assert total_price_text([0.004]) == "Full set: $0.004"
+    assert total_price_text([0.0004]) == "Full set: <$0.01"
+    print("cost_confirm total_price_text OK: sum, free, unknown tally, empty, sub-cent")
 
 
 def test_cost_summary() -> None:
@@ -481,6 +786,30 @@ def test_launch_label() -> None:
     _, total_m, has_spend_m = build_summary(mixed_items)
     assert launch_button_label(total_m, has_spend_m) == "Launch (spend ~$0.72)"
     print("cost_confirm launch_button_label OK: unknown-not-free, free, known, mixed")
+
+
+def test_subcent_cost_display() -> None:
+    """L13: sub-cent totals must NOT collapse to '$0.00' next to a 'spend real money'
+    warning. _fmt_cost shows sub-cent precision (or '<$0.01'), and the launch label
+    inherits it so the gate can't read '$0.00 spend'."""
+    from ui.cost_confirm import _fmt_cost, launch_button_label, build_summary
+
+    assert _fmt_cost(None) == "?"
+    assert _fmt_cost(0) == "free"          # exactly free stays "free", not "<$0.01"
+    assert _fmt_cost(0.0004) == "<$0.01"   # below the 3-decimal floor
+    assert _fmt_cost(0.004) == "$0.004"    # sub-cent but representable to 3 decimals
+    assert _fmt_cost(0.009) == "$0.009"
+    assert _fmt_cost(0.01) == "$0.01"      # cent boundary keeps 2-decimal form
+    assert _fmt_cost(0.72) == "$0.72"
+    assert _fmt_cost(2.0) == "$2.00"
+
+    # A batch whose total is sub-cent no longer renders "$0.00" in header or launch label.
+    body, total, has_spend = build_summary(
+        [{"name": "tiny", "model_display": "Cheap v1", "est_cost": 0.004, "params": {}}])
+    assert "$0.00 " not in body and "$0.004" in body, body
+    label = launch_button_label(total, has_spend)
+    assert label == "Launch (spend ~$0.004)", label
+    print("cost_confirm sub-cent OK: <$0.01 / $0.00X, no $0.00 spend")
 
 
 def test_job_manager() -> None:
@@ -725,7 +1054,8 @@ def test_request_stop_calls_backend() -> None:
         lt = project.add_take(shot.id, status=STATUS_GENERATING,
                               settings_snapshot={"backend": "comfyui"})
         assert jm.request_stop(lt.id) is True
-        assert lt.id in jm._stopping and ("comfy", (), {}) in calls
+        # L8: request_stop targets the take's own prompt id (None here - not yet recorded)
+        assert lt.id in jm._stopping and ("comfy", (), {"prompt_id": None}) in calls
 
         # hosted in-flight take with a recorded prediction id -> replicate cancel (raises,
         # request_stop swallows it)
@@ -911,6 +1241,15 @@ def test_comfy_views() -> None:
 def test_orphan_recovery() -> None:
     from backends import recovery
 
+    # Minimal stand-in for a Project's take population, so ambiguous_seeds() can be exercised
+    # with hand-built Take lists (it only calls .list_takes(include_deleted=...)).
+    class _FakeProj:
+        def __init__(self, takes):
+            self._takes = takes
+
+        def list_takes(self, shot_id=None, *, include_deleted=False):
+            return list(self._takes)
+
     # comfy_orphans selects only mid-flight comfyui takes (generating before pending),
     # ignoring done takes and hosted ones.
     project = Project.new()
@@ -935,8 +1274,8 @@ def test_orphan_recovery() -> None:
     assert orphans[-1].id == pend.id, "generating-first, pending last"
 
     # plan_comfy_recovery: the four actions + prompt-id match + seed match + claim dedup.
-    def t(tid, status, seed=None, job=None):
-        return Take(id=tid, shot_id="s", status=status, seed=seed, backend_job_id=job)
+    def t(tid, status, seed=None, job=None, shot="s"):
+        return Take(id=tid, shot_id=shot, status=status, seed=seed, backend_job_id=job)
 
     history = [
         {"prompt_id": "Pdone", "seeds": {100}, "outputs": [Path("out/A_00006_.mp4")], "ok": True},
@@ -964,6 +1303,47 @@ def test_orphan_recovery() -> None:
     assert plans["dup1"].action == recovery.RECLAIM and plans["dup2"].action == recovery.FAIL, \
         "a finished render must be claimed by exactly one take"
 
+    # M5 - fixed-seed shot: a shot with an AUTHORED seed produces N takes sharing one seed, so a
+    # bare seed match is ambiguous. A never-submitted PENDING orphan (no backend_job_id) must NOT
+    # misclaim a SIBLING's finished /history entry as its own; it's left CANCEL (interrupted,
+    # restartable). Same guard blocks REATTACHing to a sibling's live /queue entry.
+    fs_hist = [{"prompt_id": "Pfs", "seeds": {77}, "outputs": [Path("out/sib.mp4")], "ok": True}]
+    fs_queue = [{"prompt_id": "Qfs", "seeds": {77}, "state": "running"}]
+    # shot "fixed" has two takes on seed 77 (fixed-seed); one is a mid-flight orphan, but the
+    # OTHER sibling is a non-orphan DONE take whose render "Pfs" that history belongs to.
+    ambig = recovery.ambiguous_seeds(_FakeProj([
+        t("fs_orphan", STATUS_PENDING, seed=77, shot="fixed"),
+        t("fs_done",   STATUS_DONE,    seed=77, shot="fixed"),   # sibling, owns Pfs
+    ]))
+    assert ("fixed", 77) in ambig, "shared seed within a shot is flagged ambiguous"
+    fs_orphans = [t("fs_orphan", STATUS_PENDING, seed=77, shot="fixed")]
+    fs_plans = {p.take_id: p for p in
+                recovery.plan_comfy_recovery(fs_orphans, fs_hist, fs_queue, ambig)}
+    assert fs_plans["fs_orphan"].action == recovery.CANCEL, \
+        "fixed-seed PENDING orphan must NOT RECLAIM/REATTACH a sibling's render"
+    assert fs_plans["fs_orphan"].output_path is None, "no wrong video is claimed"
+    assert "fixed-seed" in fs_plans["fs_orphan"].reason, "reason explains the ambiguous-seed skip"
+
+    # A GENERATING fixed-seed orphan is likewise not misattributed -> FAIL (interrupted).
+    fs_gen = [t("fs_gen", STATUS_GENERATING, seed=77, shot="fixed")]
+    fs_gen_plan = recovery.plan_comfy_recovery(fs_gen, fs_hist, fs_queue, ambig)[0]
+    assert fs_gen_plan.action == recovery.FAIL and fs_gen_plan.prompt_id is None
+
+    # But a fixed-seed orphan that DID record its own backend_job_id still matches by prompt-id
+    # (that's unambiguous) - the guard only refuses the SEED fallback, not prompt-id matching.
+    fs_byid = [t("fs_byid", STATUS_GENERATING, seed=77, job="Pfs", shot="fixed")]
+    assert recovery.plan_comfy_recovery(fs_byid, fs_hist, fs_queue, ambig)[0].action == recovery.RECLAIM, \
+        "prompt-id match is authoritative even for a fixed-seed shot"
+
+    # Regression guard: a UNIQUE seed (random-seed shot, one take per seed) still matches - the
+    # guard must not over-fire and refuse legitimate single-take seed matching.
+    uniq = recovery.ambiguous_seeds(_FakeProj([t("solo", STATUS_PENDING, seed=100, shot="s")]))
+    assert ("s", 100) not in uniq, "a seed carried by exactly one take is not ambiguous"
+    solo_plan = recovery.plan_comfy_recovery(
+        [t("solo", STATUS_GENERATING, seed=100)], history, queue, uniq)[0]
+    assert solo_plan.action == recovery.RECLAIM and solo_plan.prompt_id == "Pdone", \
+        "unique-seed matching still works with the ambiguity guard in place"
+
     # plan_offline_recovery: ComfyUI unreachable (no history/queue). Nothing can be verified
     # and no worker is live, so every orphan is cleared rather than left a permanent "running"
     # zombie: any generating take (submitted or not) -> FAIL; a pending take -> CANCEL.
@@ -977,7 +1357,7 @@ def test_orphan_recovery() -> None:
     assert off["zombie"].action == recovery.FAIL, "generating-without-prompt-id must not be left"
     assert off["queued"].action == recovery.CANCEL
     print("orphan recovery OK: select + reclaim/reattach/fail/cancel + prompt-id + seed dedup "
-          "+ offline fail/cancel")
+          "+ fixed-seed ambiguity guard (M5) + offline fail/cancel")
 
 
 def test_crash_recovery() -> None:
@@ -1247,6 +1627,18 @@ def test_restart_server() -> None:
         comfy_client.restart_server(settle_s=0)
         assert order == ["stop", "launch"], order
 
+        # L9: a transient taskkill stall in stop_server surfaces as subprocess.TimeoutExpired
+        # (NOT a ComfyError), which used to escape restart_server and abandon the whole local
+        # queue. It must now be swallowed and the relaunch must still happen.
+        order.clear()
+        def stop_stall():
+            order.append("stop")
+            raise subprocess.TimeoutExpired(cmd="taskkill", timeout=10)
+        comfy_client.stop_server = stop_stall
+        comfy_client.restart_server(settle_s=0)
+        assert order == ["stop", "launch"], f"TimeoutExpired must not abort restart: {order}"
+        comfy_client.stop_server = stop   # restore the ComfyError-raising stub for the rest
+
         # server never answers but the process is still alive -> "did not come back up".
         comfy_client.wait_until_responsive = lambda *a, **k: False
         try:
@@ -1467,7 +1859,7 @@ def test_pause_requeue_current() -> None:
     # make the interrupt actually unblock the runner (mimicking ComfyUI aborting the prompt).
     interrupted = threading.Event()
     orig_stop_work = comfy_client.stop_work
-    comfy_client.stop_work = lambda: interrupted.set()  # type: ignore[assignment]
+    comfy_client.stop_work = lambda *a, **k: interrupted.set()  # type: ignore[assignment]
     try:
         local_snap = {"backend": "comfyui"}
         active = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
@@ -2268,6 +2660,7 @@ if __name__ == "__main__":
     test_capability_sync()
     test_resolve_enums()
     test_app_settings()
+    test_store_absent_vs_unreadable()
     test_roster_integrity()
     test_comfy_prepare()
     test_dynamic_vram_gate()
@@ -2275,6 +2668,10 @@ if __name__ == "__main__":
     test_comfy_launch_helpers()
     test_comfy_gpu_cache()
     test_comfy_stop_helpers()
+    test_comfy_api_errors()
+    test_poll_retry()
+    test_claim_output_empty()
+    test_stop_work_targets_prompt()
     test_comfy_views()
     test_orphan_recovery()
     test_crash_recovery()
@@ -2290,6 +2687,7 @@ if __name__ == "__main__":
     test_total_price()
     test_cost_summary()
     test_launch_label()
+    test_subcent_cost_display()
     test_cancel_pending()
     test_cancel_shot_takes()
     test_inflight_stop_maps_to_cancelled()

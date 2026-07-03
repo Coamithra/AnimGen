@@ -43,6 +43,13 @@ def test_library() -> None:
     kpro = library.estimate_cost("kling-3.0", {"duration": 5, "mode": "pro"})
     assert kstd is not None and kpro is not None and kstd < kpro, (kstd, kpro)
     assert library.estimate_cost("local-flf-wan14b", {}) == 0.0
+    # L18: an explicit duration=0 is honoured (yields $0.00), not treated as "unset" and
+    # replaced by the model default via or-chaining.
+    d0 = library.estimate_cost("seedance-2.0-std", {"duration": 0})
+    assert d0 == 0.0, d0
+    # A missing duration still falls back to the model default (unchanged behaviour).
+    ddef = library.estimate_cost("seedance-2.0-std", {})
+    assert ddef is not None and ddef > 0, ddef
     assert library.default_negative_prompt().startswith("camera pan")
     print(f"library OK: {len(lib['models'])} models; seedance 4s est ${cost:.2f}")
 
