@@ -1294,7 +1294,14 @@ class MainWindow(QMainWindow):
         for p in plans:
             if p.action == recovery.RECLAIM:
                 try:
-                    dst = self.project.takes_dir / f"{p.take_id}.mp4"
+                    # A binned orphan (deleted mid-flight, H2) is still reclaimed - the render
+                    # is already paid for - but its media belongs in the bin with the rest of a
+                    # deleted take's files, not the live takes/ dir. It stays deleted throughout
+                    # (recovery never clears `deleted`), so restore-from-bin finds it in place.
+                    take = self.project.get_take(p.take_id)
+                    dest_dir = (self.project.bin_dir / p.take_id if take and take.deleted
+                                else self.project.takes_dir)
+                    dst = dest_dir / f"{p.take_id}.mp4"
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(p.output_path, dst)
                     # Stamp fps/frame_count off the reclaimed video too - this path sets
