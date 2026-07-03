@@ -54,6 +54,9 @@ class ShotTab(QWidget):
     open_take_requested = Signal(str)  # take id -> open in the frame-by-frame viewer tab
     restart_requested = Signal(list)   # cancelled / crash-interrupted-failed take ids -> re-run them
     dirty_changed = Signal()          # this tab's unsaved-edits state flipped
+    takes_changed = Signal()          # the tab's takes grid mutated takes (bin/star/...) - a
+                                      # re-emit of TakesView.changed so MainWindow can sync
+                                      # global state (e.g. the crash-recovery banner)
 
     def __init__(self, project: Project, shot=None, parent=None, jobs=None):
         super().__init__(parent)
@@ -313,6 +316,7 @@ class ShotTab(QWidget):
             self._takes_view.export_requested.connect(self.export_requested)
             self._takes_view.open_take_requested.connect(self.open_take_requested)
             self._takes_view.restart_requested.connect(self.restart_requested)
+            self._takes_view.changed.connect(self.takes_changed)
             self._takes_layout.insertWidget(1, self._takes_view, 1)
 
     def refresh_takes(self) -> None:
