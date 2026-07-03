@@ -302,7 +302,16 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
    COPIES it into `.assets/` (deliberate; the original is left untouched). Delete-to-bin
    only moves files under the project's `.assets/`; a take pointing at an external file
    (e.g. a seeded `../Fighter/out/` gif) is flagged deleted but left in place. Never
-   relocate/delete anything outside the project.
+   relocate/delete anything outside the project. **Binning a non-terminal take neutralizes
+   it in the queue first (H2, PR #92):** `TakesView.delete` cancels a PENDING take
+   (`jobs.cancel_take`) / stops a GENERATING one (`jobs.request_stop`) before `move_to_bin`,
+   so a binned take can't keep spending or stick PENDING. Belt-and-braces: the queue-wide
+   sweeps (`cancel_pending`/`pause_local`/`abandon_local`) and orphan recovery
+   (`recovery.comfy_orphans`) scan with `include_deleted=True`, and a binned orphan's
+   RECLAIMed media lands in `.bin/<take_id>/`, not the live `takes/` dir (the take stays
+   deleted throughout). `pending_count` deliberately stays `include_deleted=False` - a
+   binned take shouldn't inflate the user-visible pending count now that bin-time
+   neutralize exists.
 3. **Each take stores an immutable `settings_snapshot`** — frozen at launch
    (`main_window.generate_shot`). This is the whole point (the source project had no
    per-take metadata). Don't mutate it. It captures model/backend/replicate id/workflow,
@@ -328,7 +337,15 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
    snapshot records. The worker-thread closures (`framing.render_keyposes` + both backends'
    `generate`) must keep reading off that synth Shot — never re-close over the live `shot`.
    `_shot_from_snapshot` deep-copies the snapshot's `crop`/`settings` into the synth so a
-   reader can't mutate the frozen snapshot through a shared dict.
+   reader can't mutate the frozen snapshot through a shared dict. **The pre-gate SAVE is what
+   makes the snapshot coherent (card H3):** `generate_shot` and `start_batch` call
+   `save_project()` (which `_commit_open_shot_tabs()` flushes every open shot-tab editor into
+   the buffer, mutating the live Shot in place) BEFORE they read model/settings/est, show the
+   cost gate, and freeze the snapshot — so the gate confirms exactly what renders (rule #1) and
+   the snapshot can't mix pre-commit backend/replicate-id/settings with post-commit
+   prompt/crop/frames. Keep the save FIRST; don't reintroduce a compute-then-save order. The
+   ShotTab-Generate path already `commit()`s its own tab first (`shot_tab._generate`), but the
+   card-Generate / batch paths must save to also flush OTHER open tabs.
 4. **Smoke tests run headless** with `QT_QPA_PLATFORM=offscreen`; never call a modal's
    `.exec()` in a test (it blocks). Tests override `paths.SCRATCH_DIR` to a tempdir so
    untitled-project scratch stays out of `data/`. `build_summary` / pure functions are

@@ -49,8 +49,13 @@ def comfy_orphans(project) -> list:
 
     Only comfyui-backed takes (per the immutable settings_snapshot) - a hosted/replicate
     take orphans differently and isn't reconciled here. Generating-before-pending, then
-    oldest-first, so seed claiming is deterministic."""
-    orphans = [t for t in project.list_takes(include_deleted=False)
+    oldest-first, so seed claiming is deterministic.
+
+    include_deleted=True: a take binned while still mid-flight is otherwise never reconciled
+    (H2) - it sits `generating` forever and its ComfyUI render keeps running unclaimed. Its
+    plan still runs (reclaim/fail a generating one, cancel a pending one); the take stays
+    binned throughout (recovery never clears `deleted`)."""
+    orphans = [t for t in project.list_takes(include_deleted=True)
                if t.status in (STATUS_GENERATING, "pending")
                and (t.settings_snapshot or {}).get("backend") == "comfyui"]
     orphans.sort(key=lambda t: (t.status != STATUS_GENERATING, t.created or ""))

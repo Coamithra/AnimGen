@@ -545,6 +545,172 @@ def test_snapshot_includes_framing() -> None:
     print("MainWindow OK: snapshot carries canvas + crop framing")
 
 
+def test_generate_gate_matches_snapshot_with_uncommitted_tab() -> None:
+    """Card H3: generate_shot / start_batch must commit every open shot-tab editor and save
+    BEFORE computing the cost estimate, showing the gate, and freezing the snapshot — so the
+    gate confirms exactly what renders (rule #1) and the snapshot is internally coherent (rule
+    #3). Regression: an open tab switched hosted Seedance -> local Wan (uncommitted) would let
+    the gate show Seedance + Seedance's cost while the take enqueued on comfyui with a mixed,
+    self-contradictory snapshot. Here the gate item, the frozen snapshot, and the committed
+    shot must all agree on the NEW (local) model/backend/prompt."""
+    from PySide6.QtWidgets import QApplication
+
+    import library
+    from ui import main_window
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="old prompt",
+                            start_frame="x.png", settings={"seed": 5},
+                            crop={"aspect": "16:9", "start": {"scale": 1.0, "cx": 0.5, "cy": 0.5}})
+    project.save_as(Path(tempfile.mkdtemp()) / "p.animproj")
+    win = MainWindow(project)
+
+    # Open the shot's tab and make UNCOMMITTED edits: switch hosted Seedance -> local Wan and
+    # change the prompt. commit() is never called, so project.get_shot still returns the old
+    # hosted spec until generate_shot's save flushes the tab.
+    win.open_shot(shot.id)
+    tab = win.shot_tabs[shot.id]
+    tab.model_combo.setCurrentIndex(tab.model_combo.findData("local-flf-wan14b"))
+    tab.aspect_combo.setCurrentText("16:9")           # valid for both models
+    tab.prompt.setPlainText("new prompt")
+    assert tab.is_dirty(), "the tab has uncommitted edits"
+    assert project.get_shot(shot.id).model_id == "seedance-2.0-std", "buffer still pre-commit"
+
+    gate_items: list = []
+    orig_confirm = main_window.confirm_launch
+    orig_enqueue = win.jobs.enqueue
+    main_window.confirm_launch = lambda parent, items: (gate_items.extend(items), True)[1]
+    win.jobs.enqueue = lambda *a, **k: None            # don't actually render
+    try:
+        win.generate_shot(shot.id)
+    finally:
+        main_window.confirm_launch = orig_confirm
+        win.jobs.enqueue = orig_enqueue
+
+    assert len(gate_items) == 1, "the gate is shown exactly once"
+    item = gate_items[0]
+    wan = library.get_model("local-flf-wan14b")
+    # (1) the gate confirmed the NEW model + its backend + its cost, not stale Seedance.
+    assert item["model_display"] == wan["display_name"], item.get("model_display")
+    assert item["backend"] == "comfyui", item.get("backend")
+    expected_est = library.estimate_cost("local-flf-wan14b",
+                                         {**wan.get("default_params", {}), "seed": 5})
+    assert item["est_cost"] == expected_est, (item.get("est_cost"), expected_est)
+    # (2) the frozen snapshot agrees with the gate AND with the committed shot — no mix.
+    snap = project.list_takes(shot.id)[-1].settings_snapshot
+    assert snap["model_id"] == "local-flf-wan14b", snap.get("model_id")
+    assert snap["backend"] == "comfyui", snap.get("backend")
+    assert snap["prompt"] == "new prompt", snap.get("prompt")
+    assert project.get_shot(shot.id).model_id == "local-flf-wan14b", "tab was committed"
+    assert not win._has_unsaved_changes(), "project is clean after the pre-gate save"
+    print("MainWindow OK: generate_shot commits open tabs before the gate — gate == snapshot (H3)")
+
+
+def test_generate_picker_keyframe_survives_open_tab() -> None:
+    """Card H3 follow-on: when a shot with NO start frame is generated from its card while
+    its own tab is OPEN, the picker-set keyframe must survive to the gate + snapshot. The
+    picker edit is persisted via project.save() directly — save_project() would re-run
+    _commit_open_shot_tabs(), and this shot's open tab (whose editor still has no start
+    frame) would commit over the buffer and revert the just-picked keyframe."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui import main_window
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p",
+                            settings={"seed": 5},
+                            crop={"aspect": "16:9", "start": {"scale": 1.0, "cx": 0.5, "cy": 0.5}})
+    project.save_as(Path(tempfile.mkdtemp()) / "p.animproj")
+    win = MainWindow(project)
+    win.open_shot(shot.id)   # the shot's own tab is open, editor has no start frame
+
+    class _Picker:
+        @staticmethod
+        def getOpenFileName(*a, **k):
+            return ("picked.png", "")
+
+    orig_qfd, orig_import = main_window.QFileDialog, project.import_asset
+    orig_confirm, orig_enqueue = main_window.confirm_launch, win.jobs.enqueue
+    main_window.QFileDialog = _Picker
+    project.import_asset = lambda src: Path("picked.png")   # no real file needed
+    main_window.confirm_launch = lambda *a, **k: True
+    win.jobs.enqueue = lambda *a, **k: None
+    try:
+        win.generate_shot(shot.id)
+    finally:
+        main_window.QFileDialog, project.import_asset = orig_qfd, orig_import
+        main_window.confirm_launch, win.jobs.enqueue = orig_confirm, orig_enqueue
+
+    takes = project.list_takes(shot.id)
+    assert takes, "the take was queued"
+    snap = takes[-1].settings_snapshot
+    assert snap["start_frame"] == "picked.png", snap.get("start_frame")
+    assert project.get_shot(shot.id).start_frame == "picked.png", "picked keyframe persisted"
+    print("MainWindow OK: picker keyframe survives an open tab — snapshot gets it (H3 follow-on)")
+
+
+def test_batch_gate_matches_snapshot_with_uncommitted_tab() -> None:
+    """Card H3 (batch side): start_batch has the identical pre-save/post-gate hazard. It must
+    save (flushing open tabs) BEFORE plan_batch + the single cost gate, so the plan/cost the
+    user confirms is what each take snapshots. Same uncommitted Seedance -> Wan switch; the
+    plan item and the take snapshot must both be the committed local model."""
+    from PySide6.QtWidgets import QApplication, QDialog
+
+    from backends import batch
+    from ui import main_window
+    from ui.batch_dialog import SCOPE_ALL
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="old prompt",
+                            start_frame="x.png", settings={"seed": 5},
+                            crop={"aspect": "16:9", "start": {"scale": 1.0, "cx": 0.5, "cy": 0.5}})
+    project.save_as(Path(tempfile.mkdtemp()) / "p.animproj")
+    win = MainWindow(project)
+
+    win.open_shot(shot.id)
+    tab = win.shot_tabs[shot.id]
+    tab.model_combo.setCurrentIndex(tab.model_combo.findData("local-flf-wan14b"))
+    tab.aspect_combo.setCurrentText("16:9")
+    tab.prompt.setPlainText("new prompt")
+    assert tab.is_dirty()
+
+    # Drive the batch dialog headlessly (never .exec() a modal): 1 take, all shots, no power.
+    class _Dlg:
+        def __init__(self, *a, **k): pass
+        def exec(self): return QDialog.DialogCode.Accepted
+        def scope(self): return SCOPE_ALL
+        def takes_per_shot(self): return 1
+        def power_action(self): return batch.POWER_NONE
+
+    gate_items: list = []
+    orig_dlg = main_window.BatchDialog
+    orig_confirm = main_window.confirm_launch
+    orig_enqueue = win.jobs.enqueue
+    main_window.BatchDialog = _Dlg
+    main_window.confirm_launch = lambda parent, items: (gate_items.extend(items), True)[1]
+    win.jobs.enqueue = lambda *a, **k: None
+    try:
+        win.start_batch()
+    finally:
+        main_window.BatchDialog = orig_dlg
+        main_window.confirm_launch = orig_confirm
+        win.jobs.enqueue = orig_enqueue
+
+    assert len(gate_items) == 1, "one eligible shot -> one plan item"
+    assert gate_items[0]["backend"] == "comfyui", gate_items[0].get("backend")
+    snap = project.list_takes(shot.id)[-1].settings_snapshot
+    assert snap["model_id"] == "local-flf-wan14b", snap.get("model_id")
+    assert snap["prompt"] == "new prompt", snap.get("prompt")
+    win._batch = None   # don't leave a live BatchRun for later tests
+    print("MainWindow OK: start_batch commits open tabs before the plan/gate — plan == snapshot (H3)")
+
+
 def test_generate_shot_missing_shot() -> None:
     """generate_shot is fed a deleted/unknown shot_id (generate_requested is a queued
     signal; the shot can vanish between emit and slot). Both guards - the top-level one
@@ -1168,6 +1334,9 @@ if __name__ == "__main__":
     test_format_generation_settings()
     test_take_player_failure_message()
     test_snapshot_includes_framing()
+    test_generate_gate_matches_snapshot_with_uncommitted_tab()
+    test_generate_picker_keyframe_survives_open_tab()
+    test_batch_gate_matches_snapshot_with_uncommitted_tab()
     test_generate_shot_missing_shot()
     test_take_player_settings_panel()
     test_gif_export()

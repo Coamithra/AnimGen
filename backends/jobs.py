@@ -345,7 +345,10 @@ class JobManager(QObject):
         self._local_paused = False   # cancelling the whole queue clears any user pause
         self._hosted_pool.clear()
         self._local_pool.clear()
-        pending = [t for t in self.project.list_takes(include_deleted=False)
+        # include_deleted=True: a take binned while still PENDING is otherwise excluded from
+        # every queue scan, so its runnable would fire the backend into a binned take (H2). The
+        # bin path now cancels it up front; sweeping it here too is belt-and-braces.
+        pending = [t for t in self.project.list_takes(include_deleted=True)
                    if t.status == STATUS_PENDING]
         for t in pending:
             self._cancelled.add(t.id)
@@ -404,11 +407,13 @@ class JobManager(QObject):
         Hosted takes are untouched (separate pool, no crash/restart issue)."""
         self._local_paused = True
         self._local_pool.clear()
-        held = [t.id for t in self.project.list_takes(include_deleted=False)
+        # include_deleted=True: a take binned while PENDING must still be held (not dropped),
+        # or its runnable is lost and it sticks PENDING forever after a resume (H2).
+        held = [t.id for t in self.project.list_takes(include_deleted=True)
                 if t.status == STATUS_PENDING
                 and (t.settings_snapshot or {}).get("backend") == "comfyui"]
         if requeue_current:
-            gen = next((t for t in self.project.list_takes(include_deleted=False)
+            gen = next((t for t in self.project.list_takes(include_deleted=True)
                         if t.status == STATUS_GENERATING
                         and (t.settings_snapshot or {}).get("backend") == "comfyui"), None)
             if gen and self.stop_and_requeue(gen.id):
@@ -450,7 +455,9 @@ class JobManager(QObject):
         dequeued when we cleared.
         """
         self._local_pool.clear()
-        pending = [t for t in self.project.list_takes(include_deleted=False)
+        # include_deleted=True: sweep a take binned while PENDING too, or its runnable is left
+        # queued and it sticks PENDING forever (H2).
+        pending = [t for t in self.project.list_takes(include_deleted=True)
                    if t.status == STATUS_PENDING
                    and (t.settings_snapshot or {}).get("backend") == "comfyui"]
         for t in pending:

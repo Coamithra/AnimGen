@@ -647,13 +647,27 @@ class MainWindow(QMainWindow):
         self.reload()
 
     def generate_shot(self, shot_id: str) -> None:
-        shot = self.project.get_shot(shot_id)
-        if not shot:
+        if not self.project.get_shot(shot_id):
+            # Existence probe only (the real fetch happens after the save below).
             # generate_requested is a queued signal; the shot can be deleted between the
             # emit and this slot running (benign double-click / stale-tab race). Guard the
             # deref like open_shot/toggle_shot_star/delete_shot do, plus a log line since a
             # silently-dropped Generate is the confusing case (the siblings stay silent).
             self._log("generate ignored: shot no longer exists")
+            return
+        # Persist the project (flushing every open shot-tab editor via
+        # _commit_open_shot_tabs) BEFORE validating, computing the cost estimate, showing the
+        # gate, and freezing the snapshot — otherwise an uncommitted open tab would mutate this
+        # Shot in place between the gate and _queue_take, so the gate could confirm one
+        # model/cost while the take snapshot records another (rule #1 + rule #3, card H3). Also
+        # handles untitled -> Save As prompt; aborting the save aborts the generation. Every
+        # validation below then reads committed state, so the confirmed content is what renders.
+        if not self.save_project():
+            self._log("generation cancelled (project not saved)")
+            return
+        shot = self.project.get_shot(shot_id)
+        if not shot:
+            self._log("generate ignored: shot deleted during save")
             return
         model = library.get_model(shot.model_id)
         if not model:
@@ -673,6 +687,12 @@ class MainWindow(QMainWindow):
             if not start:
                 return
             self.project.update_shot(shot.id, start_frame=str(self.project.import_asset(start)))
+            # Persist the picked keyframe DIRECTLY (project.save(), not save_project()): the
+            # project is titled by now (the save above succeeded), and save_project()'s
+            # _commit_open_shot_tabs() would re-commit this shot's open tab — whose editor
+            # still has no start frame — reverting the keyframe we just picked before the
+            # snapshot freezes it.
+            self.project.save()
             shot = self.project.get_shot(shot_id)
             if not shot:
                 self._log("generate ignored: shot deleted while picking a keyframe")
@@ -684,12 +704,6 @@ class MainWindow(QMainWindow):
                 "backend": model["backend"], "est_cost": est, "params": settings}
         if not confirm_launch(self, [item]):
             self._log("launch cancelled")
-            return
-
-        # Persist the project so the take never references an unsaved shot (untitled ->
-        # Save As prompt). Aborting the save aborts the generation.
-        if not self.save_project():
-            self._log("generation cancelled (project not saved)")
             return
 
         self._queue_take(shot, model, settings, est)
@@ -753,9 +767,19 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         scope, n, power = dlg.scope(), dlg.takes_per_shot(), dlg.power_action()
+        view_ids = list(self.cards)   # snapshot the view before save() rebuilds self.cards
+
+        # Persist the project (flushing every open shot-tab editor via _commit_open_shot_tabs)
+        # BEFORE planning, showing the gate, and freezing snapshots — otherwise an uncommitted
+        # open tab would mutate a Shot in place between the gate and _queue_take, so the gate
+        # could confirm one plan/cost while the take snapshots record another (rule #1 + rule
+        # #3, card H3). Also handles untitled -> Save As; aborting the save aborts the batch.
+        if not self.save_project():
+            self._log("batch cancelled (project not saved)")
+            return
 
         if scope == SCOPE_VIEW:
-            shots = [s for s in (self.project.get_shot(sid) for sid in self.cards) if s]
+            shots = [s for s in (self.project.get_shot(sid) for sid in view_ids) if s]
         else:
             shots = self.project.list_shots()
         plan = batch.plan_batch(
@@ -782,9 +806,6 @@ class MainWindow(QMainWindow):
 
         if not confirm_launch(self, plan.items):
             self._log("batch cancelled")
-            return
-        if not self.save_project():
-            self._log("batch cancelled (project not saved)")
             return
 
         take_ids: set[str] = set()
@@ -1294,7 +1315,14 @@ class MainWindow(QMainWindow):
         for p in plans:
             if p.action == recovery.RECLAIM:
                 try:
-                    dst = self.project.takes_dir / f"{p.take_id}.mp4"
+                    # A binned orphan (deleted mid-flight, H2) is still reclaimed - the render
+                    # is already paid for - but its media belongs in the bin with the rest of a
+                    # deleted take's files, not the live takes/ dir. It stays deleted throughout
+                    # (recovery never clears `deleted`), so restore-from-bin finds it in place.
+                    take = self.project.get_take(p.take_id)
+                    dest_dir = (self.project.bin_dir / p.take_id if take and take.deleted
+                                else self.project.takes_dir)
+                    dst = dest_dir / f"{p.take_id}.mp4"
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(p.output_path, dst)
                     # Stamp fps/frame_count off the reclaimed video too - this path sets
