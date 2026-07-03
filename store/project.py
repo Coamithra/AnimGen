@@ -258,10 +258,20 @@ class Project:
         if self.path is None:
             raise ValueError("save() needs a path; call save_as() on an untitled project")
         self._write_project_file()
+        # Commit any buffered shot deletion: drop the held takes, then write takes.json
+        # without them - in ONE lock scope, so no worker write-through can interleave
+        # between the clear and the write. If the write fails the buffer is RESTORED;
+        # otherwise the purge would be committed in memory while disk (rolled back /
+        # unwritten) still holds the takes, and retrying the save later - or a Discard -
+        # would land in exactly the half-state this buffer exists to prevent.
         with self._lock:
-            self._pending_take_purge.clear()   # committing the deletion: drop the held takes for good
-        self._write_takes_file()
-        with self._lock:
+            held = dict(self._pending_take_purge)
+            self._pending_take_purge.clear()
+            try:
+                self._write_takes_file()
+            except BaseException:
+                self._pending_take_purge.update(held)
+                raise
             self.dirty = False
 
     def save_as(self, path: Path | str) -> None:
@@ -361,6 +371,8 @@ class Project:
             # Include _pending_take_purge: takes of a deleted-but-unsaved shot must stay on disk
             # so a Discard can bring them back (card H1). They live outside the view/queue; save()
             # empties the buffer before this runs, so a committed deletion drops them for good.
+            # Invariant: the two dicts are DISJOINT - delete_shot pops a take out of _takes into
+            # the buffer, ids are uuid4, and nothing moves a take back - so merge order is moot.
             merged = {**self._pending_take_purge, **self._takes}
             doc = {"version": VERSION,
                    "takes": [self._take_to_dict(t) for t in self._ordered(merged)]}
@@ -553,7 +565,10 @@ class Project:
 
     def update_take(self, take_id: str, **fields) -> None:
         with self._lock:
-            take = self._takes.get(take_id)
+            # Also reach takes held in _pending_take_purge: a worker unwinding a stopped
+            # render after its shot was deleted-but-not-saved must still record its terminal
+            # status (CANCELLED, not a stale GENERATING) so a Discard restores it truthfully.
+            take = self._takes.get(take_id) or self._pending_take_purge.get(take_id)
             if not take:
                 return
             for k, v in fields.items():

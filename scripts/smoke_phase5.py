@@ -1081,12 +1081,14 @@ def test_take_media_probe() -> None:
 
 
 def test_delete_shot_discard_preserves_takes() -> None:
-    """Card H1: delete_shot is a BUFFERED (discardable) authoring edit, so it must not
-    destructively purge the shot's takes from takes.json until the deletion is committed by
-    save(). Three properties:
+    """Review finding H1: delete_shot is a BUFFERED (discardable) authoring edit, so it must
+    not destructively purge the shot's takes from takes.json until the deletion is committed
+    by save(). Five properties:
       (1) delete_shot -> reload (== Discard) brings BOTH the shot and its takes back;
       (2) a take write-through for a SURVIVING shot after a delete keeps the deleted shot's
           takes on disk (the concurrent-write-through leak);
+      (2b) update_take reaches a HELD take, so a stopped worker's terminal status persists;
+      (2c) a failed save RESTORES the purge buffer instead of committing the purge in memory;
       (3) delete_shot -> save -> reload drops the deleted shot's takes for good."""
     tmp = Path(tempfile.mkdtemp())
     path = tmp / "proj.animproj"
@@ -1115,6 +1117,33 @@ def test_delete_shot_discard_preserves_takes() -> None:
     mid = Project.load(path)
     assert {t.id for t in mid.list_takes(doomed.id)} == {t1.id, t2.id}, \
         "held takes survive a concurrent write-through until save"
+    mid_t2 = next(t for t in mid.list_takes(doomed.id) if t.id == t2.id)
+    assert mid_t2.seed == 12 and not mid_t2.starred, "held take metadata not mangled by the merge"
+
+    # --- (2b) update_take reaches a HELD take: a worker unwinding a stopped render after
+    # the delete must still record its terminal status, not leave a stale one behind ---
+    p.update_take(t2.id, status=STATUS_FAILED, error="stopped after delete")
+    held_reload = Project.load(path)
+    got2 = next(t for t in held_reload.list_takes(doomed.id) if t.id == t2.id)
+    assert got2.status == STATUS_FAILED and got2.error == "stopped after delete", \
+        "a held take's terminal update routes into the buffer and persists"
+
+    # --- (2c) a FAILED save must restore the purge buffer, not commit the purge in memory ---
+    real_write = p._write_takes_file
+    def boom():
+        raise PermissionError("simulated AV lock on takes.json")
+    p._write_takes_file = boom
+    try:
+        p.save()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save must propagate the takes.json write failure")
+    finally:
+        p._write_takes_file = real_write
+    assert set(p._pending_take_purge) == {t1.id, t2.id}, \
+        "failed save restores the held takes (purge not silently committed in memory)"
+    assert p.dirty, "failed save leaves the project dirty for a retry"
 
     # --- (3) save commits the deletion: the takes are dropped for good ---
     p.save()
