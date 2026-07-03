@@ -76,7 +76,10 @@ def ambiguous_seeds(project) -> set:
     seed match against /history or /queue is ambiguous - a never-submitted PENDING orphan
     would misclaim a SIBLING's finished render (M5). We compute ambiguity over the full take
     population (every status, `include_deleted`), NOT just the orphan set, because the sibling
-    an orphan would collide with is often a non-orphan (already-DONE) take not in that set."""
+    an orphan would collide with is often a non-orphan (already-DONE) take not in that set.
+    Assumes colliding siblings are still in the take list: a sibling hard-removed via
+    `purge_takes` no longer counts, so its stale /history render could still be misclaimed
+    (narrow window; requires a purge between the sibling finishing and the app restart)."""
     counts: dict = {}
     for t in project.list_takes(include_deleted=True):
         if t.seed is not None:
@@ -125,19 +128,19 @@ def _match_queue(orphan, queue: list[dict], claimed: set, ambiguous: set) -> Opt
 
 
 def plan_comfy_recovery(orphans: list, history: list[dict], queue: list[dict],
-                        ambiguous_seeds: Optional[set] = None) -> list[RecoveryPlan]:
+                        ambiguous: Optional[set] = None) -> list[RecoveryPlan]:
     """Decide what to do with each orphaned take. Pure: no I/O, no mutation.
 
-    `orphans`         - Take-like objects (.id/.shot_id/.status/.seed/.backend_job_id).
-    `history`         - comfy_client.history_view() output.
-    `queue`           - comfy_client.queue_view() output.
-    `ambiguous_seeds` - `(shot_id, seed)` keys shared by >=2 takes (from `ambiguous_seeds()`).
-                        Seed-only matching is refused for these fixed-seed shots so an orphan
-                        never misclaims a sibling's render (M5); the take is left FAIL/CANCEL
-                        (interrupted, restartable via rule #17) instead. `None` -> no shot has
-                        a shared seed, so seed matching is safe for every orphan.
+    `orphans`   - Take-like objects (.id/.shot_id/.status/.seed/.backend_job_id).
+    `history`   - comfy_client.history_view() output.
+    `queue`     - comfy_client.queue_view() output.
+    `ambiguous` - `(shot_id, seed)` keys shared by >=2 takes (from `ambiguous_seeds()`).
+                  Seed-only matching is refused for these fixed-seed shots so an orphan
+                  never misclaims a sibling's render (M5); the take is left FAIL/CANCEL
+                  (interrupted, restartable via rule #17) instead. `None` -> no shot has
+                  a shared seed, so seed matching is safe for every orphan.
     """
-    ambiguous = ambiguous_seeds or set()
+    ambiguous = ambiguous or set()
     plans: list[RecoveryPlan] = []
     claimed: set = set()
     for o in orphans:
@@ -158,7 +161,7 @@ def plan_comfy_recovery(orphans: list, history: list[dict], queue: list[dict],
         # No prompt-id match, and any seed match was refused as ambiguous (fixed-seed shot):
         # note that so the user knows the take was left restartable rather than misclaimed.
         ambiguous_note = (" (fixed-seed shot: seed match too ambiguous to auto-reclaim)"
-                          if o.backend_job_id is None and _seed_is_ambiguous(o, ambiguous)
+                          if not o.backend_job_id and _seed_is_ambiguous(o, ambiguous)
                           else "")
         if o.status == STATUS_GENERATING:
             plans.append(RecoveryPlan(

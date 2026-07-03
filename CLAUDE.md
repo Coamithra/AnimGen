@@ -635,7 +635,7 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     Fix: `recovery.ambiguous_seeds(project)` computes the `(shot_id, seed)` keys shared by ≥2 takes
     across the **whole** project (every status, `include_deleted` — the colliding sibling is often
     a non-orphan not in the orphan set), and `plan_comfy_recovery(orphans, history, queue,
-    ambiguous_seeds)` (new 4th arg; `None` = no shared seed anywhere) has `_match_history`/
+    ambiguous)` (new optional 4th arg; `None` = no shared seed anywhere) has `_match_history`/
     `_match_queue` **skip the seed fallback** for an ambiguous take. `backend_job_id` matching is
     unaffected — a fixed-seed take that recorded its own prompt-id still matches. An ambiguous take
     with no prompt-id gets no match → FAIL (generating) / CANCEL (pending), both `interrupted=True`

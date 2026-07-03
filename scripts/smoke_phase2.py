@@ -917,7 +917,7 @@ def test_orphan_recovery() -> None:
         def __init__(self, takes):
             self._takes = takes
 
-        def list_takes(self, include_deleted=False):
+        def list_takes(self, shot_id=None, *, include_deleted=False):
             return list(self._takes)
 
     # comfy_orphans selects only mid-flight comfyui takes (generating before pending),
