@@ -44,7 +44,10 @@ def move_to_bin(take, project) -> None:
 
 
 def restore_from_bin(take, project) -> None:
-    updates: dict = {"deleted": False}
+    # Mirrors move_to_bin's per-move write-through (M13): a failed later move-back can't
+    # strand an already-restored file's record on its vanished .bin path. A partial restore
+    # is retryable - already-restored fields point outside .bin and are simply skipped.
+    project.update_take(take.id, deleted=False)
     for field in _FILE_FIELDS:
         val = getattr(take, field)
         if not val:
@@ -54,5 +57,4 @@ def restore_from_bin(take, project) -> None:
             dest_dir = project.thumbs_dir if field == "thumbnail" else project.takes_dir
             dest = dest_dir / p.name
             shutil.move(str(p), str(dest))
-            updates[field] = str(dest)
-    project.update_take(take.id, **updates)
+            project.update_take(take.id, **{field: str(dest)})
