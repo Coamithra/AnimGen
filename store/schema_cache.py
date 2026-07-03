@@ -18,12 +18,12 @@ atomic JSON discipline). Paths are read from `paths` at call time so tests can o
 """
 from __future__ import annotations
 
-import json
 import threading
 import time
 from typing import Optional
 
 import paths
+from store._doc_io import UnreadableStoreError, read_doc
 from store.project import _atomic_write_json
 
 _FORMAT = "animgen-schema-cache"
@@ -31,13 +31,24 @@ _VERSION = 1
 _lock = threading.RLock()
 
 
-def _load_doc() -> dict:
+def _load_doc(*, strict: bool = False) -> dict:
+    """The schemas dict on disk, or `{}` when the file is absent/empty.
+
+    `strict=True` (used by put) lets an `UnreadableStoreError` propagate: a
+    present-but-unreadable file (a transient Windows AV/indexer PermissionError, or corrupt
+    JSON) must NOT be read as empty, or put would persist just this one schema and silently
+    discard every other cached entry (M11 - same pattern, lower stakes since schemas re-fetch).
+    `strict=False` (the read-only accessors) tolerates it and falls back to `{}`.
+    """
     try:
-        with open(paths.SCHEMA_CACHE, encoding="utf-8") as f:
-            doc = json.load(f)
-    except (FileNotFoundError, OSError, ValueError):
+        doc = read_doc(paths.SCHEMA_CACHE)
+    except UnreadableStoreError:
+        if strict:
+            raise
         return {}
-    return doc.get("schemas", {}) if isinstance(doc, dict) else {}
+    if doc is None:
+        return {}
+    return doc.get("schemas", {}) if isinstance(doc.get("schemas"), dict) else {}
 
 
 def all_entries() -> dict:
@@ -61,11 +72,15 @@ def get(replicate_model_id: Optional[str]) -> Optional[dict]:
 
 
 def put(replicate_model_id: str, props: dict, *, fetched: Optional[float] = None) -> dict:
-    """Store/overwrite a model's fetched schema and persist immediately. Returns the entry."""
+    """Store/overwrite a model's fetched schema and persist immediately. Returns the entry.
+
+    Refuses to clobber a present-but-unreadable cache file (raises `UnreadableStoreError` via
+    the strict load) rather than drop every other cached schema.
+    """
     rec = {"props": props, "fields": len(props),
            "fetched": fetched if fetched is not None else time.time()}
     with _lock:
-        schemas = _load_doc()
+        schemas = _load_doc(strict=True)
         schemas[replicate_model_id] = rec
         _atomic_write_json(paths.SCHEMA_CACHE,
                            {"format": _FORMAT, "version": _VERSION, "schemas": schemas})

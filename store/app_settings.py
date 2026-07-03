@@ -11,10 +11,10 @@ read from `paths` at call time so tests can override `paths.APP_SETTINGS`.
 """
 from __future__ import annotations
 
-import json
 import threading
 
 import paths
+from store._doc_io import UnreadableStoreError, read_doc
 from store.project import _atomic_write_json
 
 _FORMAT = "animgen-app-settings"
@@ -26,13 +26,24 @@ UPDATE_SCHEMAS_ON_STARTUP = "update_schemas_on_startup"
 _DEFAULTS = {UPDATE_SCHEMAS_ON_STARTUP: False}
 
 
-def _load_doc() -> dict:
+def _load_doc(*, strict: bool = False) -> dict:
+    """The settings dict on disk, or `{}` when the file is absent/empty.
+
+    `strict=True` (used by set_bool) lets an `UnreadableStoreError` propagate: a
+    present-but-unreadable file (a transient Windows AV/indexer PermissionError, or corrupt
+    JSON) must NOT be read as empty, or set_bool would persist 'defaults + this one key' and
+    silently discard every other stored preference (M11). `strict=False` (get_bool)
+    tolerates it and falls back to `{}` - a degraded read is harmless since it writes nothing.
+    """
     try:
-        with open(paths.APP_SETTINGS, encoding="utf-8") as f:
-            doc = json.load(f)
-    except (FileNotFoundError, OSError, ValueError):
+        doc = read_doc(paths.APP_SETTINGS)
+    except UnreadableStoreError:
+        if strict:
+            raise
         return {}
-    return doc.get("settings", {}) if isinstance(doc, dict) else {}
+    if doc is None:
+        return {}
+    return doc.get("settings", {}) if isinstance(doc.get("settings"), dict) else {}
 
 
 def get_bool(key: str, default: bool | None = None) -> bool:
@@ -44,9 +55,13 @@ def get_bool(key: str, default: bool | None = None) -> bool:
 
 
 def set_bool(key: str, value: bool) -> None:
-    """Store a boolean preference and persist immediately."""
+    """Store a boolean preference and persist immediately.
+
+    Refuses to clobber a present-but-unreadable file (raises `UnreadableStoreError` via the
+    strict load) rather than overwrite stored preferences with just this key.
+    """
     with _lock:
-        settings = _load_doc()
+        settings = _load_doc(strict=True)
         settings[key] = bool(value)
         _atomic_write_json(paths.APP_SETTINGS,
                            {"format": _FORMAT, "version": _VERSION, "settings": settings})
