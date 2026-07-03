@@ -2671,6 +2671,151 @@ def test_queue_actions_in_queue_tab() -> None:
     print("queue_actions_in_queue_tab OK: pause/cancel/restart moved to Queue header")
 
 
+def test_quiesce_on_switch() -> None:
+    """JobManager.quiesce (project switch): cancels the outgoing project's PENDING takes
+    (interrupted=True -> restartable), clears the stale _cancelled/_stopping/_requeue id sets,
+    but LEAVES the currently-GENERATING take running and keeps its _runners entry so
+    live_take_ids still names it after the switch."""
+    import threading
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+    from store.models import STATUS_CANCELLED, STATUS_DONE, STATUS_GENERATING, STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    jm = JobManager(project)
+
+    local_snap, hosted_snap = {"backend": "comfyui"}, {"backend": "replicate"}
+    release = threading.Event()
+    active = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+    lq = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=local_snap)
+    hq = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=hosted_snap)
+
+    def blocker(progress):
+        release.wait(timeout=10)
+        return {"video_path": "x.mp4"}
+
+    jm.enqueue(active.id, "comfyui", blocker)
+    jm.enqueue(lq.id, "comfyui", blocker)   # queues behind `active` (serialized local pool)
+    # hq is left PENDING but NOT dispatched (the hosted pool would run it immediately) - it
+    # stands for a queued hosted take that quiesce should also cancel.
+
+    for _ in range(200):
+        if project.get_take(active.id).status == STATUS_GENERATING:
+            break
+        time.sleep(0.02)
+    assert project.get_take(active.id).status == STATUS_GENERATING, "blocker never started"
+
+    # Seed stale id-set membership that quiesce must prune, plus a live-worker stop flag it
+    # must PRESERVE (a request_stop just before the switch still records CANCELLED).
+    jm._cancelled.add("stale-c")
+    jm._stopping.add("stale-s")
+    jm._stopping.add(active.id)
+    jm._requeue.add("stale-r")
+    assert jm.has_in_flight_work() is True
+
+    n = jm.quiesce()
+    assert n == 2, n                                     # both PENDING takes (local + hosted)
+    assert project.get_take(lq.id).status == STATUS_CANCELLED
+    assert project.get_take(hq.id).status == STATUS_CANCELLED
+    assert project.get_take(lq.id).interrupted is True, "switch-cancel must be restartable"
+    assert project.get_take(active.id).status == STATUS_GENERATING, "running take must survive"
+    # Stale ids are pruned; the just-cancelled ids stay in _cancelled (the same dequeue-race
+    # safety net as cancel_pending), the live worker keeps its _stopping flag, and the
+    # GENERATING take's runner entry is KEPT for live_take_ids.
+    assert jm._cancelled == {lq.id, hq.id}, jm._cancelled
+    assert jm._stopping == {active.id}, jm._stopping
+    assert jm._requeue == set(), jm._requeue
+    assert active.id in jm.live_take_ids(), "generating take dropped from live set"
+    assert lq.id not in jm.live_take_ids() and hq.id not in jm.live_take_ids()
+    jm._stopping.discard(active.id)   # let the blocker finish DONE below, not CANCELLED
+
+    # The still-running worker finishes and records DONE via its own project reference.
+    release.set()
+    assert jm.wait_for_done(10000), "jobs did not finish"
+    app.processEvents()
+    assert project.get_take(active.id).status == STATUS_DONE, "left-running take must complete"
+    assert active.id not in jm.live_take_ids(), "_on_job_done should drop the finished take"
+    print("quiesce OK: pending cancelled (interrupted), stale ids pruned, running take survives")
+
+
+def test_switch_skips_live_orphans() -> None:
+    """recovery.comfy_orphans excludes ids a live worker is still rendering (A->B->A): the take
+    the original worker owns is NOT reconciled as an orphan, so no second monitor races it."""
+    from backends import recovery
+    from store.models import STATUS_GENERATING, STATUS_PENDING
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="local-flf-wan14b")
+    snap = {"backend": "comfyui"}
+    live = project.add_take(shot.id, status=STATUS_GENERATING, seed=1, settings_snapshot=snap)
+    dead = project.add_take(shot.id, status=STATUS_GENERATING, seed=2, settings_snapshot=snap)
+    pend = project.add_take(shot.id, status=STATUS_PENDING, seed=3, settings_snapshot=snap)
+
+    # No skip set: all three mid-flight takes are orphan candidates.
+    assert {o.id for o in recovery.comfy_orphans(project)} == {live.id, dead.id, pend.id}
+    # With the live worker's take in the skip set, it is excluded; the rest still reconcile.
+    got = {o.id for o in recovery.comfy_orphans(project, {live.id})}
+    assert got == {dead.id, pend.id}, got
+    print("comfy_orphans skip OK: live-worker take excluded, real orphans still reconciled")
+
+
+def test_switch_resets_batch_and_pause() -> None:
+    """MainWindow._switch_project drops a batch tracked against the OLD project and lifts a
+    transient local pause, so a stale batch can't finalize (empty report + power action) after
+    the switch. The drain prompt is driven headlessly (no exec()); an abort returns False and
+    leaves the current project untouched."""
+    from PySide6.QtWidgets import QApplication
+
+    from backends import batch
+    from ui.main_window import MainWindow
+    from store.models import STATUS_PENDING
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new("A")
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    win = MainWindow(project)
+    # The batch below uses POWER_SLEEP so a regression is observable - but the power action
+    # must NEVER actually run in a test (it stops ComfyUI and puts the PC to sleep). Capture
+    # instead of executing; the assertion below proves the switch never reaches it.
+    power_calls = []
+    win._perform_power_action = power_calls.append
+
+    # --- abort path: in-flight work + user says No -> switch is refused, project unchanged.
+    take = project.add_take(shot.id, status=STATUS_PENDING,
+                            settings_snapshot={"backend": "replicate"})
+    win._batch = batch.BatchRun(take_ids={take.id}, power_action=batch.POWER_SLEEP, started="t")
+    win._confirm_switch_with_queued_work = lambda: False
+    other = Project.new("B")
+    assert win._switch_project(other) is False
+    assert win.project is project, "aborted switch must not swap the project"
+    assert win._batch is not None, "aborted switch must not drop the batch"
+
+    # --- proceed path: user says Yes -> queued take cancelled, batch + pause reset.
+    win._confirm_switch_with_queued_work = lambda: True
+    win._stop_paused_local = True
+    assert win._switch_project(other) is True
+    assert win.project is other, "confirmed switch should swap the project"
+    assert win._batch is None, "batch must be dropped on switch (no stale power action)"
+    # The batch must be dropped BEFORE quiesce's CANCELLED emits: otherwise cancelling the
+    # last pending take drains the batch to complete mid-switch and _finalize_batch fires
+    # the sleep/stop-ComfyUI power action while the user is switching projects.
+    assert power_calls == [], f"power action fired during switch: {power_calls}"
+    assert win._stop_paused_local is False, "transient local pause must be lifted on switch"
+    assert win.jobs.is_local_paused() is False
+    # The old project's queued take was cancelled by quiesce and flagged restartable.
+    from store.models import STATUS_CANCELLED
+    assert project.get_take(take.id).status == STATUS_CANCELLED
+    assert project.get_take(take.id).interrupted is True
+
+    win.close()
+    print("switch reset OK: abort intact; proceed drops batch first (no power action) + lifts pause")
+
+
 if __name__ == "__main__":
     test_build_input()
     test_capability_sync()
@@ -2726,4 +2871,7 @@ if __name__ == "__main__":
     test_restart_from_snapshot()
     test_interrupted_flag()
     test_ws_progress_diagnostics()
+    test_quiesce_on_switch()
+    test_switch_skips_live_orphans()
+    test_switch_resets_batch_and_pause()
     print("PHASE 2 SMOKE: PASS")

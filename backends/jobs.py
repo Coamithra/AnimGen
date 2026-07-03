@@ -251,8 +251,79 @@ class JobManager(QObject):
         self._local_paused = False             # user paused the local queue (read by crash recovery)
 
     def set_project(self, project: Project) -> None:
-        """Point the queue at a newly opened/created project."""
+        """Point the queue at a newly opened/created project.
+
+        Callers switching projects mid-work should `quiesce()` the OUTGOING project FIRST
+        (while `self.project` still points at it) so its queued takes are cancelled and the
+        stale id sets don't bleed into the new project - see `quiesce`."""
         self.project = project
+
+    def live_take_ids(self) -> set[str]:
+        """Take ids a live worker is still rendering (has NOT reached _on_job_done).
+
+        `_runners` holds every take from `enqueue` until `_on_job_done` drops it at a terminal
+        status. `quiesce` removes the entries it cancels but KEEPS the still-GENERATING take's
+        entry, so after an A->B->A switch this still names the take whose original worker (holding
+        the OLD Project instance) is mid-render. Read by orphan recovery to SKIP these: a take
+        still being rendered by a live worker must NOT be reconciled as an orphan (it isn't one),
+        or two monitors would poll one prompt and two Project instances would race
+        last-writer-wins on takes.json (M7). GIL-atomic snapshot of the dict keys."""
+        return set(self._runners)
+
+    def has_in_flight_work(self) -> bool:
+        """Whether any take of the current project is still queued PENDING or GENERATING.
+
+        Pure predicate driving the project-switch prompt (drain vs cancel) without touching Qt,
+        so the switch decision path stays headless-testable. Scans the live project's takes
+        (both backends) rather than pool thread counts, since a queued-but-unstarted local take
+        has no active thread yet but still needs quiescing. include_deleted=True deliberately:
+        a take binned while PENDING/GENERATING (H2) is still queue/spend until neutralized, so
+        it still warrants the prompt (unlike pending_count, which is a user-facing tally)."""
+        return any(t.status in (STATUS_PENDING, STATUS_GENERATING)
+                   for t in self.project.list_takes(include_deleted=True))
+
+    def quiesce(self) -> int:
+        """Cancel the CURRENT project's queued takes and clear stale queue state before a switch.
+
+        Called on `_switch_project` while `self.project` still points at the OUTGOING project.
+        Drops the not-yet-started runnables from both pools and marks every still-PENDING take
+        CANCELLED (interrupted=True: an app-driven switch cut it short, so it's restartable via
+        rule #17, not a deliberate user cancel), then prunes the stale queued-take id sets so
+        they can't accumulate across switches. Pruning is an INTERSECTION, not a wholesale
+        clear:
+        - each just-cancelled id is ADDED to `_cancelled` first (the same dequeue race as
+          cancel_pending: a runnable the pool handed to a worker between our scan and clear()
+          must still bail at its `tid in cancelled` check rather than fire the backend);
+        - an id still in `_runners` (a live GENERATING worker) KEEPS its `_stopping`/`_requeue`
+          membership, so a stop/halt requested just before the switch still records
+          CANCELLED/PENDING when that worker unwinds, not a bogus FAILED.
+
+        The currently-GENERATING take is deliberately LEFT running: its `GenerationJob` captured
+        the OLD `Project` instance at construction, so its write-through still lands in the OLD
+        project's takes.json - stopping it would waste the spend/GPU already committed. Its
+        `_runners` entry is KEPT (only the cancelled PENDING ids are dropped), so `live_take_ids`
+        still names it after an A->B->A switch and orphan recovery skips it (its worker will pop
+        the entry itself via `_on_job_done` when it finishes). Returns how many PENDING takes
+        were cancelled.
+
+        GIL-atomic set/dict ops (like cancel_pending), plus RLock-guarded update_take."""
+        self._local_paused = False
+        self._hosted_pool.clear()
+        self._local_pool.clear()
+        pending = [t for t in self.project.list_takes(include_deleted=True)
+                   if t.status == STATUS_PENDING]
+        for t in pending:
+            self._cancelled.add(t.id)
+            self._runners.pop(t.id, None)
+            self.project.update_take(t.id, status=STATUS_CANCELLED,
+                                     error="cancelled: switched to another project",
+                                     interrupted=True)   # app-driven switch, restartable
+            self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
+        live = set(self._runners)
+        self._cancelled &= live | {t.id for t in pending}
+        self._stopping &= live
+        self._requeue &= live
+        return len(pending)
 
     def enqueue(self, take_id: str, backend: str, runner: Runner) -> None:
         self._runners[take_id] = (backend, runner)
