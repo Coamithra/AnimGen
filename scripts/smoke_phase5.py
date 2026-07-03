@@ -1450,6 +1450,244 @@ def test_export_starred_takes() -> None:
     print("export starred takes OK: gathers view's starred takes, excludes deleted, empty->message")
 
 
+def test_save_as_over_neighbour_preserves_doc() -> None:
+    """M1: a Save-As over an OCCUPIED neighbour whose .animproj write SUCCEEDS but whose
+    takes.json write then FAILS must leave the neighbour's .animproj AND sidecar exactly as
+    they were - not paired with THIS project's shots document. Previously only the sidecar was
+    displaced, so the neighbour ended up carrying our doc after the partial-failure rollback."""
+    tmp = Path(tempfile.mkdtemp())
+
+    # A different project already lives at the target: a recognizable .animproj + sidecar.
+    target = tmp / "N.animproj"
+    target_assets = Project._assets_for(target)
+    target_assets.mkdir(parents=True)
+    (target_assets / "NEIGHBOUR.png").write_bytes(b"neighbour asset")
+    (target_assets / "takes.json").write_text('{"version": 1, "takes": []}', encoding="utf-8")
+    neighbour_doc = '{"format": "animgen-project", "version": 1, "name": "Neighbour", "shots": []}'
+    target.write_text(neighbour_doc, encoding="utf-8")
+
+    # Our (already-saved elsewhere) project Save-As'd OVER the neighbour; the doc write lands but
+    # takes.json fails - the exact M1 window.
+    p = Project.new()
+    p.add_shot("mine", model_id="seedance-2.0-std")
+    p.save_as(tmp / "mine.animproj")
+    mine_path = p.path
+
+    def boom_takes(*_a, **_k):
+        raise PermissionError("simulated lock on takes.json")
+    p._write_takes_file = boom_takes
+    try:
+        p.save_as(target)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate the takes.json failure over an occupied target")
+    finally:
+        del p._write_takes_file
+
+    assert p.path == mine_path, "identity rolled back to our original saved path"
+    assert target.read_text(encoding="utf-8") == neighbour_doc, \
+        "neighbour's .animproj restored verbatim (not clobbered with our shots document)"
+    assert (target_assets / "NEIGHBOUR.png").read_bytes() == b"neighbour asset", \
+        "neighbour's sidecar restored"
+    assert not list(tmp.glob("N.animproj.*.bak")), "the displaced-doc backup was cleaned up"
+    assert not list(tmp.glob("N.assets.*.bak")), "the displaced-sidecar backup was cleaned up"
+
+    # And a CLEAN Save-As over an occupied neighbour commits our doc and drops the .bak.
+    p.save_as(target)
+    assert p.path == target and "mine" in [s.name for s in Project.load(target).list_shots()]
+    assert not list(tmp.glob("N.animproj.*.bak")), "clean overwrite leaves no doc backup"
+    print("Project OK: save_as over a neighbour preserves its .animproj on a takes.json failure (M1)")
+
+
+def test_load_corrupt_takes_json_degrades() -> None:
+    """L2: a corrupt/unreadable takes.json must NOT make the whole project unopenable. Project
+    opens with its shots intact and ZERO takes, warns, and moves the bad file aside (so the
+    first write-through can't clobber whatever might be manually recoverable)."""
+    tmp = Path(tempfile.mkdtemp())
+    path = tmp / "corrupt.animproj"
+    p = Project.new()
+    s = p.add_shot("kick", model_id="seedance-2.0-std")
+    p.add_take(s.id, status=STATUS_DONE)
+    p.save_as(path)
+
+    takes_file = Project._assets_for(path) / "takes.json"
+    assert takes_file.exists()
+    takes_file.write_text("{ this is not json", encoding="utf-8")   # corrupt it
+
+    reopened = Project.load(path)                      # must NOT raise
+    assert reopened.get_shot(s.id) is not None, "shots still load despite corrupt takes.json"
+    assert reopened.list_takes() == [], "degrades to zero takes"
+    baks = list(Project._assets_for(path).glob("takes.json.corrupt.*.bak"))
+    assert len(baks) == 1, "the corrupt file was moved aside, not left in place"
+    assert not takes_file.exists(), "no live takes.json until the next write recreates it"
+    print("Project OK: corrupt takes.json degrades to zero takes + moved aside (L2)")
+
+
+def test_load_orphan_takes_preserved() -> None:
+    """L3: a take whose shot_id matches no shot is PRESERVED on disk (held out of the live
+    view/queue), not permanently dropped - so a write-through can't erase a take whose shot is
+    only transiently missing. Unlike the delete-purge buffer these survive a save() too."""
+    tmp = Path(tempfile.mkdtemp())
+    path = tmp / "orphan.animproj"
+    p = Project.new()
+    s = p.add_shot("kick", model_id="seedance-2.0-std")
+    live = p.add_take(s.id, status=STATUS_DONE, seed=1)
+    p.save_as(path)
+
+    # Hand-edit takes.json to add a take pointing at a shot that isn't in the .animproj.
+    takes_file = Project._assets_for(path) / "takes.json"
+    import json as _json
+    doc = _json.loads(takes_file.read_text(encoding="utf-8"))
+    doc["takes"].append({"id": "orphan1", "shot_id": "ghost-shot", "status": "done", "seed": 42})
+    takes_file.write_text(_json.dumps(doc), encoding="utf-8")
+
+    reopened = Project.load(path)
+    assert {t.id for t in reopened.list_takes()} == {live.id}, "orphan stays OUT of the live view"
+    assert reopened.get_take("orphan1") is None, "orphan not surfaced via get_take"
+
+    # A write-through (a live take update) must NOT erase the orphan from takes.json.
+    reopened.update_take(live.id, starred=True)
+    on_disk = _json.loads(takes_file.read_text(encoding="utf-8"))
+    assert {t["id"] for t in on_disk["takes"]} == {live.id, "orphan1"}, \
+        "orphan preserved on disk through a write-through"
+
+    # And a save() (which purges the delete-buffer) still keeps the orphan.
+    reopened.save()
+    after_save = _json.loads(takes_file.read_text(encoding="utf-8"))
+    assert "orphan1" in {t["id"] for t in after_save["takes"]}, "orphan survives a save() too"
+
+    # An orphan is an INERT record: update_take / purge_takes on it are no-ops (they touch only
+    # _takes / _pending_take_purge), so an orphan can't be resurrected into the live view nor
+    # accidentally dropped from the file by a purge that thinks it removed it.
+    reopened.update_take("orphan1", starred=True)          # no-op (id not in the live/purge dicts)
+    assert reopened.get_take("orphan1") is None, "update_take does not resurrect an orphan"
+    assert reopened.purge_takes(["orphan1"]) == 0, "purge_takes reports nothing removed for an orphan"
+    still = _json.loads(takes_file.read_text(encoding="utf-8"))
+    assert "orphan1" in {t["id"] for t in still["takes"]}, "orphan untouched by update/purge"
+
+    # An orphan whose id COLLIDES with a live take is discarded at load, not merged (a foreign
+    # takes.json id isn't guaranteed uuid4-unique; keeping both would drop one in the 3-way merge).
+    doc2 = _json.loads(takes_file.read_text(encoding="utf-8"))
+    doc2["takes"].append({"id": live.id, "shot_id": "ghost-shot", "status": "done", "seed": 999})
+    takes_file.write_text(_json.dumps(doc2), encoding="utf-8")
+    collided = Project.load(path)
+    live_take = collided.get_take(live.id)
+    assert live_take is not None and live_take.seed != 999, "the live take wins the id collision"
+    assert collided.list_takes()[0].id == live.id
+    print("Project OK: load-time orphan takes preserved (inert) + id-collision discarded (L3)")
+
+
+def test_update_filters_stray_kwargs() -> None:
+    """L4: update_shot / update_take drop any kwarg that isn't a declared dataclass field, so a
+    stray key can't be serialized and then TypeError Shot(**d)/Take(**d) on the next load."""
+    tmp = Path(tempfile.mkdtemp())
+    path = tmp / "kw.animproj"
+    p = Project.new()
+    s = p.add_shot("kick", model_id="seedance-2.0-std")
+    t = p.add_take(s.id, status=STATUS_DONE)
+
+    # A real field is applied; a stray key is dropped (no setattr, not serialized).
+    p.update_shot(s.id, prompt="real", bogus_shot_key="X")
+    p.update_take(t.id, seed=7, bogus_take_key="Y")
+    assert p.get_shot(s.id).prompt == "real"
+    assert p.get_take(t.id).seed == 7
+    assert not hasattr(p.get_shot(s.id), "bogus_shot_key"), "stray shot kwarg not set"
+    assert not hasattr(p.get_take(t.id), "bogus_take_key"), "stray take kwarg not set"
+
+    # The stray keys never reach disk, so a reload succeeds (would TypeError if they did).
+    p.save_as(path)
+    reopened = Project.load(path)                      # must NOT raise
+    assert reopened.get_shot(s.id).prompt == "real" and reopened.get_take(t.id).seed == 7
+    print("Project OK: update_shot/update_take filter stray kwargs against dataclass fields (L4)")
+
+
+def test_atomic_write_no_tmp_leak_and_import_rejects_nonimage() -> None:
+    """L19: _atomic_write_json finally-unlinks its tmp on a non-PermissionError failure (no
+    orphan *.tmp beside the target); import_asset rejects a non-image source."""
+    from store import project as proj_mod
+
+    tmp = Path(tempfile.mkdtemp())
+    target = tmp / "out.json"
+
+    # A json.dumps failure (unserializable value) must not leave a *.tmp behind.
+    class _Unserializable:
+        pass
+    try:
+        proj_mod._atomic_write_json(target, {"bad": _Unserializable()})
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("_atomic_write_json must propagate the serialization error")
+    assert not list(tmp.glob("out.json.*.tmp")), "no leaked tmp on a serialization failure"
+
+    # A normal write leaves no tmp either (success path consumes it).
+    proj_mod._atomic_write_json(target, {"ok": 1})
+    assert target.exists() and not list(tmp.glob("out.json.*.tmp")), "no tmp after a clean write"
+
+    # import_asset rejects a non-image source (would be invisible to list_assets otherwise).
+    p = Project.new()
+    txt = tmp / "notes.txt"
+    txt.write_text("not an image", encoding="utf-8")
+    try:
+        p.import_asset(txt)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("import_asset must reject a non-image file")
+    assert p.list_assets() == [], "no cruft left in .assets/ from the rejected import"
+
+    # An actual image imports fine and shows up.
+    png = tmp / "kf.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    imported = p.import_asset(png)
+    assert imported.suffix == ".png" and imported in p.list_assets()
+    print("Project OK: _atomic_write_json no tmp leak + import_asset rejects non-image (L19)")
+
+
+def test_list_reads_snapshot_under_lock() -> None:
+    """M12: list_takes / list_shots snapshot under the RLock, so a concurrent mutation resizing
+    the dict mid-iteration can't raise 'dictionary changed size during iteration'. Hammer the
+    read paths on one thread while another thread churns add/delete."""
+    import threading as _threading
+
+    p = Project.new()
+    s = p.add_shot("kick", model_id="seedance-2.0-std")
+    for _ in range(50):
+        p.add_take(s.id, status=STATUS_DONE)
+
+    errors: list = []
+    stop = _threading.Event()
+
+    def churn():
+        while not stop.is_set():
+            extra = p.add_shot("tmp", model_id="seedance-2.0-std")
+            t = p.add_take(extra.id, status=STATUS_DONE)
+            p.purge_takes([t.id])
+            p.delete_shot(extra.id)
+
+    def reader():
+        try:
+            for _ in range(2000):
+                p.list_takes()
+                p.list_shots()
+                p.used_model_ids()
+        except Exception as e:  # noqa: BLE001 - any RuntimeError here is the M12 bug
+            errors.append(e)
+
+    churner = _threading.Thread(target=churn)
+    readers = [_threading.Thread(target=reader) for _ in range(3)]
+    churner.start()
+    for r in readers:
+        r.start()
+    for r in readers:
+        r.join()
+    stop.set()
+    churner.join()
+    assert not errors, f"concurrent read raised: {errors[:3]}"
+    print("Project OK: list_takes/list_shots snapshot under the lock, no resize-race (M12)")
+
+
 def test_shot_tab_missing_model_commit_and_generate() -> None:
     """Card M9: loading a shot whose model_id left the roster must NOT silently rewrite it.
     commit() round-trips the stored id unchanged (was: snapped to the first roster model), the
@@ -1497,6 +1735,12 @@ def test_shot_tab_missing_model_commit_and_generate() -> None:
 
 
 if __name__ == "__main__":
+    test_save_as_over_neighbour_preserves_doc()
+    test_load_corrupt_takes_json_degrades()
+    test_load_orphan_takes_preserved()
+    test_update_filters_stray_kwargs()
+    test_atomic_write_no_tmp_leak_and_import_rejects_nonimage()
+    test_list_reads_snapshot_under_lock()
     test_export()
     test_take_media_probe()
     test_extract_frames_wide_padding()

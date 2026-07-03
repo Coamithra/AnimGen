@@ -360,7 +360,9 @@ class JobManager(QObject):
         try:
             if backend == "comfyui":
                 from backends import comfy_client
-                comfy_client.stop_work()
+                # Target our own prompt id (L8) so we drop only this take's pending prompt,
+                # not the whole server queue; None falls back to the blanket clear.
+                comfy_client.stop_work(prompt_id=t.backend_job_id)
             elif backend == "replicate" and t.backend_job_id:
                 from backends import replicate_client
                 replicate_client.cancel_prediction(t.backend_job_id)
@@ -426,7 +428,7 @@ class JobManager(QObject):
         self._requeue.add(take_id)
         try:
             from backends import comfy_client
-            comfy_client.stop_work()
+            comfy_client.stop_work(prompt_id=t.backend_job_id)  # target our prompt (L8)
         except Exception:  # noqa: BLE001 - best-effort; the worker still unwinds to PENDING
             pass
         return True

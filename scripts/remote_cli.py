@@ -12,7 +12,8 @@ Then drive it (defaults to http://127.0.0.1:8765; override with ANIMGEN_REMOTE_P
     python scripts/remote_cli.py click --text Generate     # click by visible text
     python scripts/remote_cli.py click --ref modelFilter   # click by ref/objectName
     python scripts/remote_cli.py set --ref mainTabs --value Assets   # switch tab
-    python scripts/remote_cli.py type --ref QLineEdit:0 --text hello
+    python scripts/remote_cli.py type --text hello                   # type into the focused field
+    python scripts/remote_cli.py type --ref QLineEdit:0 --keys hello # type into a selected widget
     python scripts/remote_cli.py key --ref QLineEdit:0 --key enter
 """
 from __future__ import annotations
@@ -75,6 +76,9 @@ def main(argv: list[str]) -> int:
         p.add_argument("--ref")
         p.add_argument("--object-name", dest="object_name")
         p.add_argument("--text")
+        if name == "type":
+            p.add_argument("--keys", help="text to type into the selected widget "
+                           "(--ref/--object-name/--text then select it)")
         if name == "key":
             p.add_argument("--key", required=True)
         if name == "set":
@@ -82,8 +86,8 @@ def main(argv: list[str]) -> int:
             p.add_argument("--checked", choices=("true", "false"))
 
     args = ap.parse_args(argv)
-    if args.cmd == "type" and not args.text:
-        ap.error("type requires --text")
+    if args.cmd == "type" and not args.keys and not args.text:
+        ap.error("type requires --keys (with a selector) or --text (types into focus)")
     base = _base(args.port)
 
     if args.cmd in ("health", "snapshot"):
@@ -105,7 +109,11 @@ def main(argv: list[str]) -> int:
 
     body = _selector_body(args)
     if args.cmd == "type":
-        body["text"] = args.text
+        # L1: --keys is the payload with ref/object_name/text as selectors. Without --keys,
+        # --text (already in body via _selector_body) IS the payload: the server treats a
+        # keys-less 'text' as the text-to-type (focused widget, or --ref/--object-name if given).
+        if args.keys is not None:
+            body["keys"] = args.keys
     if args.cmd == "key":
         body["key"] = args.key
     if args.cmd == "set":
