@@ -667,6 +667,12 @@ def test_cancel_remote_spend_on_terminal_failure() -> None:
         assert calls == ["pred_abc"], calls
         assert project.get_take(t.id).status == STATUS_FAILED
         assert done == [(t.id, STATUS_FAILED)], done
+        # The persisted job log must keep BOTH the error line and the cancel milestone: the
+        # cancel's progress() re-writes the log from log_lines, so err has to be IN the list
+        # (a `log_lines + [err]` copy-join would let the cancel line overwrite the error).
+        rec = next(j for j in project._jobs.values() if j.take_id == t.id)
+        assert "RuntimeError: boom" in (rec.log or ""), rec.log
+        assert "requested cancel of prediction pred_abc" in (rec.log or ""), rec.log
 
         # (b) replicate take with NO backend_job_id (never submitted / create POST never returned)
         #     -> no cancel attempted (nothing to cancel), still FAILED.

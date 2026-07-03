@@ -98,7 +98,7 @@ class GenerationJob(QRunnable):
         try:
             from backends import replicate_client
             replicate_client.cancel_prediction(pred_id)
-            progress(f"attempted cancel of prediction {pred_id} to stop remote spend")
+            progress(f"requested cancel of prediction {pred_id} to stop remote spend (best-effort)")
         except Exception:  # noqa: BLE001 - best-effort; a failed cancel must not abort the worker
             pass
 
@@ -197,10 +197,16 @@ class GenerationJob(QRunnable):
                 # action pick it up like its abandon_local'd siblings (rule #17, card #68).
                 interrupted = bool(getattr(e, CRASH_INTERRUPTED_ATTR, False))
                 self.project.update_take(tid, status=STATUS_FAILED, error=err, interrupted=interrupted)
-                self.project.update_job(job.id, state="failed", log="\n".join(log_lines + [err]))
-                self._cancel_remote_spend(tid, progress)
+                # Mutate log_lines (not a `log_lines + [err]` copy): _cancel_remote_spend's
+                # progress() milestone below re-writes the job log from log_lines, so err must
+                # be IN the list or that later write would drop the error from the persisted log.
+                log_lines.append(err)
+                self.project.update_job(job.id, state="failed", log="\n".join(log_lines))
                 self._emit("status_changed", tid, STATUS_FAILED)
                 self._emit("failed", tid, err)
+                # After the emits: the cancel POST can sit in the 5xx backoff loop for a while,
+                # and the UI should surface the failure immediately, not after the cancel returns.
+                self._cancel_remote_spend(tid, progress)
                 final = STATUS_FAILED
         finally:
             self.stopping.discard(tid)
