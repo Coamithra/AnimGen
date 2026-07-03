@@ -216,7 +216,7 @@ def do_set(
     checked: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Set a value directly (more reliable than synthesizing keystrokes): check state,
-    combo current text, tab by title, or line/plain-text edit text."""
+    combo current text, tab by title, spinbox numeric value, or line/plain-text edit text."""
     if checked is not None:
         if not hasattr(widget, "setChecked"):
             raise ValueError(f"{type(widget).__name__} cannot hold a checked state")

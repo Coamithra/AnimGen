@@ -109,13 +109,11 @@ def main(argv: list[str]) -> int:
 
     body = _selector_body(args)
     if args.cmd == "type":
-        # L1: --keys is the payload with ref/object_name/text as selectors; bare --text is the
-        # payload typed into focus (send it as 'text' with NO selector so it isn't self-matched).
+        # L1: --keys is the payload with ref/object_name/text as selectors. Without --keys,
+        # --text (already in body via _selector_body) IS the payload: the server treats a
+        # keys-less 'text' as the text-to-type (focused widget, or --ref/--object-name if given).
         if args.keys is not None:
             body["keys"] = args.keys
-        else:
-            body.pop("text", None)  # --text is the payload here, not a selector
-            body["text"] = args.text
     if args.cmd == "key":
         body["key"] = args.key
     if args.cmd == "set":

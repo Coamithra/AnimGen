@@ -146,6 +146,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ---- routes ----
     def do_GET(self) -> None:  # noqa: N802 - http.server override
+        self._response_started = False  # per-request, in case keep-alive ever reuses a handler
         route = urlparse(self.path)
         if route.path in ("/health", "/"):
             self._dispatch(lambda: self._send_json({"ok": True, "app": "AnimGen"}))
@@ -159,10 +160,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"error": f"unknown route {route.path}"}, 404)
 
     def do_POST(self) -> None:  # noqa: N802 - http.server override
+        self._response_started = False  # per-request, in case keep-alive ever reuses a handler
         route = urlparse(self.path)
         try:
             body = self._read_body()
         except ValueError as exc:
+            # This and the unknown-route 404 below are single-shot sends outside _dispatch —
+            # a write failure here just propagates to the base handler (no re-send to guard).
             self._send_json({"error": str(exc)}, 400)
             return
         routes = {

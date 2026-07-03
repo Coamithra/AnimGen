@@ -335,6 +335,36 @@ def test_bridge_cancel_once() -> None:
         app.processEvents()
         time.sleep(0.01)
     assert results2.get("val") == "hello", results2
+
+    # Case 3 (the timeout-boundary branch): the GUI thread CLAIMS and is still running a slow
+    # fn when the caller's timeout expires. The caller must see the claim, wait for the real
+    # result, and return it — not raise a spurious 504 while the action executes anyway.
+    results3: dict[str, Any] = {}
+    slow_ran: list[str] = []
+
+    def slow_fn() -> str:
+        slow_ran.append("ran")
+        time.sleep(0.6)  # far longer than the caller's timeout below
+        return "slow-result"
+
+    def worker_boundary() -> None:
+        try:
+            results3["val"] = bridge.call(slow_fn, timeout=0.15)
+        except TimeoutError:
+            results3["val"] = "TIMEOUT"
+        finally:
+            results3["done"] = True
+
+    threading.Thread(target=worker_boundary, daemon=True).start()
+    # Pump immediately: the GUI thread claims + enters slow_fn while the 0.05s timeout expires
+    # mid-run (processEvents blocks in slow_fn for 0.4s, so the interleave is deterministic).
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not results3.get("done"):
+        app.processEvents()
+        time.sleep(0.01)
+    assert slow_ran == ["ran"], slow_ran
+    assert results3.get("val") == "slow-result", (
+        f"caller must wait for the claimed call's real result, got {results3.get('val')!r}")
     print("bridge cancel once OK")
 
 
