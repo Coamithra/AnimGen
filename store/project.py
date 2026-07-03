@@ -113,6 +113,14 @@ class Project:
         self._lock = threading.RLock()
         self._shots: dict[str, Shot] = {}
         self._takes: dict[str, Take] = {}
+        # Takes whose shot was deleted but not yet saved. delete_shot is a BUFFERED authoring
+        # edit (discardable via the save-prompt), so its takes must not vanish from disk until
+        # the deletion is committed by save() - otherwise a Discard brings the shot back from
+        # the untouched .animproj while takes.json has already lost its take records (card H1).
+        # Held here (out of the live view/queue) yet still serialized by _write_takes_file, so
+        # any concurrent write-through keeps them on disk; save() clears the buffer, making the
+        # purge durable exactly when the authoring deletion lands.
+        self._pending_take_purge: dict[str, Take] = {}
         self._jobs: dict[str, Job] = {}          # in-memory only, never persisted
         self.dirty = False                       # unsaved *authoring* edits
         self.ui_state: dict = {}                 # per-project window layout (open tabs); UI-owned
@@ -250,8 +258,20 @@ class Project:
         if self.path is None:
             raise ValueError("save() needs a path; call save_as() on an untitled project")
         self._write_project_file()
-        self._write_takes_file()
+        # Commit any buffered shot deletion: drop the held takes, then write takes.json
+        # without them - in ONE lock scope, so no worker write-through can interleave
+        # between the clear and the write. If the write fails the buffer is RESTORED;
+        # otherwise the purge would be committed in memory while disk (rolled back /
+        # unwritten) still holds the takes, and retrying the save later - or a Discard -
+        # would land in exactly the half-state this buffer exists to prevent.
         with self._lock:
+            held = dict(self._pending_take_purge)
+            self._pending_take_purge.clear()
+            try:
+                self._write_takes_file()
+            except BaseException:
+                self._pending_take_purge.update(held)
+                raise
             self.dirty = False
 
     def save_as(self, path: Path | str) -> None:
@@ -322,7 +342,7 @@ class Project:
         for shot in self._shots.values():
             for f in _SHOT_PATHS:
                 setattr(shot, f, remap(getattr(shot, f)))
-        for take in self._takes.values():
+        for take in (*self._takes.values(), *self._pending_take_purge.values()):
             for f in _TAKE_PATHS:
                 setattr(take, f, remap(getattr(take, f)))
 
@@ -348,8 +368,14 @@ class Project:
 
     def _write_takes_file(self) -> None:
         with self._lock:
+            # Include _pending_take_purge: takes of a deleted-but-unsaved shot must stay on disk
+            # so a Discard can bring them back (card H1). They live outside the view/queue; save()
+            # empties the buffer before this runs, so a committed deletion drops them for good.
+            # Invariant: the two dicts are DISJOINT - delete_shot pops a take out of _takes into
+            # the buffer, ids are uuid4, and nothing moves a take back - so merge order is moot.
+            merged = {**self._pending_take_purge, **self._takes}
             doc = {"version": VERSION,
-                   "takes": [self._take_to_dict(t) for t in self._ordered(self._takes)]}
+                   "takes": [self._take_to_dict(t) for t in self._ordered(merged)]}
             _atomic_write_json(self._assets_dir / "takes.json", doc)
 
     @staticmethod
@@ -450,14 +476,17 @@ class Project:
         return dup
 
     def delete_shot(self, shot_id: str) -> None:
+        """Remove a shot and its takes. A BUFFERED authoring edit (dirty=True, discardable):
+        the shot leaves the .animproj only on save(), and its takes are held aside in
+        _pending_take_purge - out of the live view/queue but still serialized to takes.json -
+        so a concurrent take write-through can't strand them and a Discard restores both from
+        disk. save() clears the buffer, making the purge durable (card H1). Writes nothing here."""
         with self._lock:
             self._shots.pop(shot_id, None)
             gone = [tid for tid, t in self._takes.items() if t.shot_id == shot_id]
             for tid in gone:
-                self._takes.pop(tid, None)
+                self._pending_take_purge[tid] = self._takes.pop(tid)
             self.dirty = True
-        if gone:
-            self._write_takes_file()
 
     def set_shot_starred(self, shot_id: str, starred: bool) -> None:
         """Star/unstar a shot. WRITE-THROUGH to the shot_stars.json sidecar (like a take's
@@ -536,7 +565,10 @@ class Project:
 
     def update_take(self, take_id: str, **fields) -> None:
         with self._lock:
-            take = self._takes.get(take_id)
+            # Also reach takes held in _pending_take_purge: a worker unwinding a stopped
+            # render after its shot was deleted-but-not-saved must still record its terminal
+            # status (CANCELLED, not a stale GENERATING) so a Discard restores it truthfully.
+            take = self._takes.get(take_id) or self._pending_take_purge.get(take_id)
             if not take:
                 return
             for k, v in fields.items():
