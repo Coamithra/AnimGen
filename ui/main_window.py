@@ -1505,7 +1505,7 @@ class MainWindow(QMainWindow):
         skipped = len(res.get("skipped", []))
         msg = f"Exported {n_folders} animation(s), {total_frames} frames total\n\n{parent}"
         if skipped:
-            msg += f"\n\n({skipped} skipped - no video file)"
+            msg += f"\n\n({skipped} skipped - no video file, or take/shot no longer exists)"
         self._log(f"exported {n_folders} animation(s) -> {parent}")
         box = QMessageBox(self)
         box.setWindowTitle("Export complete")

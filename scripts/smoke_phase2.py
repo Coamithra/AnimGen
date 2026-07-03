@@ -431,7 +431,10 @@ def test_total_price() -> None:
     assert total_price_text([0.72, None, 0.0]) == "Full set: $0.72  (+1 unknown)"
     assert total_price_text([]) == "Full set: $0.00"
     assert total_price_text([None, None]) == "Full set: $0.00  (+2 unknown)"
-    print("cost_confirm total_price_text OK: sum, free, unknown tally, empty")
+    # L13 sibling surface: a sub-cent full set doesn't collapse to $0.00 either.
+    assert total_price_text([0.004]) == "Full set: $0.004"
+    assert total_price_text([0.0004]) == "Full set: <$0.01"
+    print("cost_confirm total_price_text OK: sum, free, unknown tally, empty, sub-cent")
 
 
 def test_cost_summary() -> None:
