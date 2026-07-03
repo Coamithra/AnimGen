@@ -65,6 +65,126 @@ def test_bin_restore() -> None:
     print("takes_io OK: project-owned binned/restored, external file untouched")
 
 
+def test_move_to_bin_partial_failure() -> None:
+    """M13: move_to_bin is per-move atomic. A transient AV/indexer lock on a later file move
+    (the thumbnail here) must NOT strand the record - the already-moved video keeps its .bin
+    path, the take is flagged deleted, and restore_from_bin still puts the moved file back
+    while leaving the never-moved one where it is. The caller loop is also resilient: one
+    failing take doesn't abort binning the rest of a multi-delete."""
+    import shutil as _shutil
+
+    from pipeline import takes_io
+
+    project = Project.new()
+    shot = project.add_shot("c", model_id="seedance-2.0-std")
+
+    video = project.takes_dir / "v.mp4"
+    video.write_bytes(b"video")
+    thumb = project.thumbs_dir / "v.png"
+    _png(thumb)
+    t = project.add_take(shot.id, status=STATUS_DONE,
+                         video_path=str(video), thumbnail=str(thumb))
+
+    # Fail the SECOND real move (the thumbnail) mid-sequence - the documented Windows AV-lock
+    # failure mode. The video (moved first) must already be recorded + the take flagged deleted.
+    real_move = _shutil.move
+    orig_thumb = str(thumb)
+
+    def flaky_move(src, dst):
+        if str(src) == orig_thumb:
+            raise OSError("simulated AV lock on thumbnail move")
+        return real_move(src, dst)
+
+    _shutil.move = flaky_move
+    try:
+        try:
+            takes_io.move_to_bin(project.get_take(t.id), project)
+        except OSError:
+            pass  # move_to_bin lets the failing move propagate; caller (below) swallows it
+    finally:
+        _shutil.move = real_move
+
+    g = project.get_take(t.id)
+    # Record consistent with disk: video binned + recorded, deleted set; thumbnail untouched.
+    assert g.deleted, "take must be flagged deleted even though a later move failed"
+    assert not video.exists(), "video should have moved to .bin"
+    assert (project.bin_dir / t.id / "v.mp4").exists()
+    assert Path(g.video_path).exists() and g.video_path == str(project.bin_dir / t.id / "v.mp4")
+    assert g.thumbnail == orig_thumb and thumb.exists(), "failed thumbnail move stays in place"
+
+    # Restore a PARTIALLY-binned take: the video (under .bin) moves back, the thumbnail (never
+    # under .bin) is skipped and left exactly where it is. Both symmetric with the good path.
+    takes_io.restore_from_bin(project.get_take(t.id), project)
+    g = project.get_take(t.id)
+    assert not g.deleted
+    assert (project.takes_dir / "v.mp4").exists() and Path(g.video_path).exists()
+    assert g.thumbnail == orig_thumb and thumb.exists()
+
+    # Restore is per-move atomic in mirror (M13): bin a take fully, then fail the thumbnail
+    # move-BACK mid-restore. The video (restored first) keeps its recorded takes/ path and
+    # deleted flips False; the thumbnail stays in .bin with its record intact, so a retried
+    # restore (no failure) completes it.
+    v2 = project.takes_dir / "w.mp4"
+    v2.write_bytes(b"video2")
+    th2 = project.thumbs_dir / "w.png"
+    _png(th2)
+    t2 = project.add_take(shot.id, status=STATUS_DONE,
+                          video_path=str(v2), thumbnail=str(th2))
+    takes_io.move_to_bin(project.get_take(t2.id), project)         # full bin, no failure
+    binned_thumb = project.get_take(t2.id).thumbnail
+
+    def flaky_restore(src, dst):
+        if str(src) == binned_thumb:
+            raise OSError("simulated AV lock on thumbnail move-back")
+        return real_move(src, dst)
+
+    _shutil.move = flaky_restore
+    try:
+        try:
+            takes_io.restore_from_bin(project.get_take(t2.id), project)
+        except OSError:
+            pass
+    finally:
+        _shutil.move = real_move
+    g2 = project.get_take(t2.id)
+    assert not g2.deleted
+    assert g2.video_path == str(project.takes_dir / "w.mp4") and Path(g2.video_path).exists()
+    assert g2.thumbnail == binned_thumb and Path(binned_thumb).exists()
+    takes_io.restore_from_bin(project.get_take(t2.id), project)    # retry completes it
+    g2 = project.get_take(t2.id)
+    assert g2.thumbnail == str(project.thumbs_dir / "w.png") and Path(g2.thumbnail).exists()
+
+    # Caller resilience: TakesView.delete over multiple ids - one take fails its file move but
+    # the loop still bins the rest.
+    from PySide6.QtWidgets import QApplication
+
+    from ui.takes_view import TakesView
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    va = project.takes_dir / "a.mp4"; va.write_bytes(b"a")
+    vb = project.takes_dir / "b.mp4"; vb.write_bytes(b"b")
+    ta = project.add_take(shot.id, status=STATUS_DONE, video_path=str(va))
+    tb = project.add_take(shot.id, status=STATUS_DONE, video_path=str(vb))
+    bad = str(va)
+
+    def flaky_move2(src, dst):
+        if str(src) == bad:
+            raise OSError("simulated AV lock")
+        return real_move(src, dst)
+
+    _shutil.move = flaky_move2
+    try:
+        TakesView(project, shot.id).delete([ta.id, tb.id])
+    finally:
+        _shutil.move = real_move
+    # ta failed its move but is still flagged deleted (per-move: deleted set before the move);
+    # tb bins fully despite ta's failure - the loop wasn't aborted.
+    assert project.get_take(ta.id).deleted
+    gb = project.get_take(tb.id)
+    assert gb.deleted and not vb.exists() and (project.bin_dir / tb.id / "b.mp4").exists()
+    print("takes_io OK: per-move atomic on failure; restore of partial bin; caller loop resilient")
+
+
 def test_takes_view() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -1034,6 +1154,7 @@ if __name__ == "__main__":
     test_recovery_banner_predicate()
     test_recovery_banner()
     test_bin_restore()
+    test_move_to_bin_partial_failure()
     test_takes_view()
     test_takes_view_incremental_update()
     test_take_star_badge()
