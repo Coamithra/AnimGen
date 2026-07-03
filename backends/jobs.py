@@ -74,6 +74,34 @@ class GenerationJob(QRunnable):
         except RuntimeError:
             pass
 
+    def _cancel_remote_spend(self, tid: str, progress: Callable[..., None]) -> None:
+        """Best-effort cancel of a hosted prediction after this take FAILED terminally mid-render.
+
+        The H4 network retries (PR #93) mean a single blip no longer fails a hosted take, but a
+        take that DOES fail terminally after the create POST returned a prediction id (poll retries
+        exhausted, download error, an unwind, etc.) leaves the Replicate prediction running to
+        completion at full cost with its output never claimed (card follow-up H4). If the take is a
+        replicate one and recorded a `backend_job_id` (stamped mid-render by the runner's on_submit),
+        POST a cancel to stop the remaining spend. This does NOT change the take's terminal status -
+        it stayed FAILED above; the cancel only stops the bleed. A never-submitted take (no
+        backend_job_id) and the local/comfyui backend are skipped. Called only from the genuine-
+        terminal-failure branch, never for a deliberate stop (that's `_stopping`/`request_stop`,
+        which already issued its own cancel) or a re-queue. Swallows all transport errors, like
+        request_stop - a cancel that itself fails must never take down the worker. Re-fetches the
+        take so it reads the id on_submit persisted mid-render, not a stale snapshot."""
+        if self.backend != "replicate":
+            return
+        t = self.project.get_take(tid)
+        pred_id = t.backend_job_id if t else None
+        if not pred_id:
+            return
+        try:
+            from backends import replicate_client
+            replicate_client.cancel_prediction(pred_id)
+            progress(f"attempted cancel of prediction {pred_id} to stop remote spend")
+        except Exception:  # noqa: BLE001 - best-effort; a failed cancel must not abort the worker
+            pass
+
     @Slot()
     def run(self) -> None:
         # Belt-and-braces: a QRunnable::run() override that lets ANY exception escape propagates
@@ -170,6 +198,7 @@ class GenerationJob(QRunnable):
                 interrupted = bool(getattr(e, CRASH_INTERRUPTED_ATTR, False))
                 self.project.update_take(tid, status=STATUS_FAILED, error=err, interrupted=interrupted)
                 self.project.update_job(job.id, state="failed", log="\n".join(log_lines + [err]))
+                self._cancel_remote_spend(tid, progress)
                 self._emit("status_changed", tid, STATUS_FAILED)
                 self._emit("failed", tid, err)
                 final = STATUS_FAILED

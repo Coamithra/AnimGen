@@ -24,7 +24,7 @@ paths.SCRATCH_DIR = Path(tempfile.mkdtemp())  # keep untitled-project scratch ou
 
 from store.project import Project  # noqa: E402
 from store.models import (  # noqa: E402
-    STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
+    STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, STATUS_GENERATING, STATUS_PENDING,
 )
 
 
@@ -629,6 +629,98 @@ def test_takes_view_stop_rendering_menu() -> None:
     print("TakesView stop-rendering menu OK: generating-only, jobs-gated, routes to request_stop")
 
 
+def test_cancel_remote_spend_on_terminal_failure() -> None:
+    """A hosted take that FAILS terminally mid-render fires a best-effort cancel_prediction to
+    stop remaining Replicate spend (card follow-up H4). Drives GenerationJob._run directly with
+    a runner that raises and a stubbed replicate_client.cancel_prediction, asserting: cancel is
+    attempted EXACTLY ONCE when the take is replicate + has a backend_job_id; NOT attempted when
+    there's no backend_job_id or the backend is comfyui; the take still lands FAILED (the cancel
+    only stops the bleed, it does not flip status to CANCELLED); a raising cancel is swallowed;
+    and a DELIBERATE stop (_stopping) records CANCELLED and does NOT fire this path (request_stop
+    already issued its own cancel)."""
+    from backends import jobs as jobs_mod
+    from backends import replicate_client
+
+    calls: list[str] = []
+    orig_cancel = replicate_client.cancel_prediction
+    replicate_client.cancel_prediction = lambda pred_id, token=None: calls.append(pred_id)
+
+    def make_job(project, take_id, backend, *, cancelled=None, stopping=None):
+        sig = jobs_mod._JobSignals()
+        done: list[tuple[str, str]] = []
+        job = jobs_mod.GenerationJob(
+            project, take_id, backend, lambda progress: (_ for _ in ()).throw(RuntimeError("boom")),
+            sig, cancelled if cancelled is not None else set(),
+            stopping if stopping is not None else set(), set(),
+            lambda tid, status: done.append((tid, status)))
+        return job, done
+
+    try:
+        # (a) replicate take with a backend_job_id -> cancel fired exactly once, take FAILED.
+        project = Project.new()
+        shot = project.add_shot("kick", model_id="seedance-2.0-std")
+        t = project.add_take(shot.id, status=STATUS_PENDING,
+                             settings_snapshot={"backend": "replicate"})
+        project.update_take(t.id, backend_job_id="pred_abc")   # stamped mid-render by on_submit
+        job, done = make_job(project, t.id, "replicate")
+        job._run()
+        assert calls == ["pred_abc"], calls
+        assert project.get_take(t.id).status == STATUS_FAILED
+        assert done == [(t.id, STATUS_FAILED)], done
+
+        # (b) replicate take with NO backend_job_id (never submitted / create POST never returned)
+        #     -> no cancel attempted (nothing to cancel), still FAILED.
+        calls.clear()
+        t2 = project.add_take(shot.id, status=STATUS_PENDING,
+                              settings_snapshot={"backend": "replicate"})
+        job, _ = make_job(project, t2.id, "replicate")
+        job._run()
+        assert calls == [], calls
+        assert project.get_take(t2.id).status == STATUS_FAILED
+
+        # (c) comfyui (local) take with a job id -> never cancelled via this hosted path.
+        calls.clear()
+        t3 = project.add_take(shot.id, status=STATUS_PENDING,
+                              settings_snapshot={"backend": "comfyui"})
+        project.update_take(t3.id, backend_job_id="prompt_123")
+        job, _ = make_job(project, t3.id, "comfyui")
+        job._run()
+        assert calls == [], calls
+        assert project.get_take(t3.id).status == STATUS_FAILED
+
+        # (d) a raising cancel is swallowed - the worker still lands the take FAILED, no re-raise.
+        calls.clear()
+        def boom_cancel(pred_id, token=None):
+            calls.append(pred_id)
+            raise ConnectionError("cancel POST failed")
+        replicate_client.cancel_prediction = boom_cancel
+        t4 = project.add_take(shot.id, status=STATUS_PENDING,
+                              settings_snapshot={"backend": "replicate"})
+        project.update_take(t4.id, backend_job_id="pred_def")
+        job, done = make_job(project, t4.id, "replicate")
+        job._run()   # must not raise despite the cancel throwing
+        assert calls == ["pred_def"], calls
+        assert project.get_take(t4.id).status == STATUS_FAILED
+        assert done == [(t4.id, STATUS_FAILED)], done
+
+        # (e) a DELIBERATE stop (id in _stopping) records CANCELLED, not FAILED, and does NOT
+        #     fire the terminal-failure cancel path (request_stop already cancelled remote spend).
+        replicate_client.cancel_prediction = lambda pred_id, token=None: calls.append(pred_id)
+        calls.clear()
+        t5 = project.add_take(shot.id, status=STATUS_PENDING,
+                              settings_snapshot={"backend": "replicate"})
+        project.update_take(t5.id, backend_job_id="pred_stop")
+        job, _ = make_job(project, t5.id, "replicate", stopping={t5.id})
+        job._run()
+        assert calls == [], calls   # cancel path not reached for a deliberate stop
+        assert project.get_take(t5.id).status == STATUS_CANCELLED
+    finally:
+        replicate_client.cancel_prediction = orig_cancel
+
+    print("cancel-remote-spend OK: fires once on replicate terminal failure w/ job id, "
+          "skipped without id / for comfyui, cancel errors swallowed, deliberate stop excluded")
+
+
 def test_runner_uses_snapshot_not_live_shot() -> None:
     """A queued take renders its frozen settings_snapshot, not the live Shot. Editing the
     source shot's prompt/negative/canvas/crop after queueing (before the serialized worker
@@ -1205,6 +1297,7 @@ if __name__ == "__main__":
     test_take_tile_tooltip()
     test_bin_neutralizes_queued_take()
     test_takes_view_stop_rendering_menu()
+    test_cancel_remote_spend_on_terminal_failure()
     test_assets_view()
     test_asset_picker()
     test_card_and_window()
