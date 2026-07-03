@@ -1535,7 +1535,26 @@ def test_load_orphan_takes_preserved() -> None:
     reopened.save()
     after_save = _json.loads(takes_file.read_text(encoding="utf-8"))
     assert "orphan1" in {t["id"] for t in after_save["takes"]}, "orphan survives a save() too"
-    print("Project OK: load-time orphan takes preserved on disk, not dropped (L3)")
+
+    # An orphan is an INERT record: update_take / purge_takes on it are no-ops (they touch only
+    # _takes / _pending_take_purge), so an orphan can't be resurrected into the live view nor
+    # accidentally dropped from the file by a purge that thinks it removed it.
+    reopened.update_take("orphan1", starred=True)          # no-op (id not in the live/purge dicts)
+    assert reopened.get_take("orphan1") is None, "update_take does not resurrect an orphan"
+    assert reopened.purge_takes(["orphan1"]) == 0, "purge_takes reports nothing removed for an orphan"
+    still = _json.loads(takes_file.read_text(encoding="utf-8"))
+    assert "orphan1" in {t["id"] for t in still["takes"]}, "orphan untouched by update/purge"
+
+    # An orphan whose id COLLIDES with a live take is discarded at load, not merged (a foreign
+    # takes.json id isn't guaranteed uuid4-unique; keeping both would drop one in the 3-way merge).
+    doc2 = _json.loads(takes_file.read_text(encoding="utf-8"))
+    doc2["takes"].append({"id": live.id, "shot_id": "ghost-shot", "status": "done", "seed": 999})
+    takes_file.write_text(_json.dumps(doc2), encoding="utf-8")
+    collided = Project.load(path)
+    live_take = collided.get_take(live.id)
+    assert live_take is not None and live_take.seed != 999, "the live take wins the id collision"
+    assert collided.list_takes()[0].id == live.id
+    print("Project OK: load-time orphan takes preserved (inert) + id-collision discarded (L3)")
 
 
 def test_update_filters_stray_kwargs() -> None:

@@ -141,11 +141,13 @@ class Project:
         # any concurrent write-through keeps them on disk; save() clears the buffer, making the
         # purge durable exactly when the authoring deletion lands.
         self._pending_take_purge: dict[str, Take] = {}
-        # Takes loaded from takes.json whose shot_id matches no shot (L3). Kept out of the live
-        # view/queue but STILL serialized by _write_takes_file, so a write-through can't
-        # permanently erase a take whose shot is only transiently missing (a half-written
-        # .animproj, a shot deleted-but-unsaved in a prior session). UNLIKE _pending_take_purge
-        # this is NOT cleared by save() - orphans are preserved indefinitely, not purged.
+        # Takes loaded from takes.json whose shot_id matches no shot (L3). INERT preserved
+        # records: kept out of the live view/queue (not surfaced by get_take/list_takes, not
+        # updatable/purgeable) but STILL serialized by _write_takes_file, so a write-through
+        # can't permanently erase a take whose shot is only transiently missing (a half-written
+        # .animproj, a shot deleted-but-unsaved in a prior session). NOT reclaimed if the shot
+        # reappears - the sole goal is to avoid the old destructive drop. UNLIKE
+        # _pending_take_purge this is NOT cleared by save() - orphans persist indefinitely.
         self._orphan_takes: dict[str, Take] = {}
         self._jobs: dict[str, Job] = {}          # in-memory only, never persisted
         self.dirty = False                       # unsaved *authoring* edits
@@ -190,12 +192,22 @@ class Project:
                 take = proj._take_from_dict(td)
                 if take.shot_id in proj._shots:
                     proj._takes[take.id] = take
+                elif take.id in proj._takes:
+                    # An orphan whose id collides with a live take (ids come from possibly
+                    # hand-edited / foreign takes.json, so uuid4-uniqueness isn't guaranteed).
+                    # Keeping both would make the 3-way merge in _write_takes_file last-writer-
+                    # wins and silently drop one; the live take wins, the orphan is discarded
+                    # with a warning rather than corrupting the merge.
+                    _log.warning("loaded %s: orphan take %s collides with a live take id; "
+                                 "the orphan record was discarded", path, take.id)
                 else:
-                    # L3: a take whose shot_id no longer matches any shot is HELD (out of the
-                    # live view/queue) but still re-serialized, NOT dropped - so the next
-                    # write-through doesn't PERMANENTLY erase it. (A shot temporarily missing -
-                    # a partially-written .animproj, or a shot deleted-but-not-yet-saved in an
-                    # earlier session - can reappear; dropping the take made that loss final.)
+                    # L3: a take whose shot_id matches no shot is HELD as an INERT preserved
+                    # record (out of the live view/queue, not updatable/purgeable) but still
+                    # re-serialized, NOT dropped - so a write-through can't PERMANENTLY erase it.
+                    # It is not reclaimed if its shot later reappears; the point is only to avoid
+                    # the old destructive drop that lost the take forever. (Its shot may be
+                    # transiently missing: a half-written .animproj, a shot deleted-but-unsaved
+                    # in an earlier session.)
                     proj._orphan_takes[take.id] = take
                     orphans += 1
             if orphans:
@@ -247,10 +259,11 @@ class Project:
         """Copy an image into the project's .assets/ root (leaving the original) and
         return the new path. Names are made filesystem-safe and collision-free.
 
-        Rejects a non-image source (L19): list_assets only surfaces files whose suffix is in
-        _IMAGE_EXTS, so importing e.g. a .txt copied a file the Assets grid could never show -
-        a silent no-op that only left cruft in .assets/. Raise instead so the caller (picker /
-        drag-drop / migration) can report it rather than pretend it worked."""
+        Rejects a source whose SUFFIX isn't in _IMAGE_EXTS (L19) - a by-extension check, not
+        content/magic-byte validation. list_assets only surfaces files with those suffixes, so
+        importing e.g. a .txt copied a file the Assets grid could never show - a silent no-op
+        that only left cruft in .assets/. Raise instead so the caller (picker / drag-drop /
+        migration) can report it rather than pretend it worked."""
         src = Path(src)
         if src.suffix.lower() not in _IMAGE_EXTS:
             raise ValueError(f"not an importable image (expected {', '.join(_IMAGE_EXTS)}): {src.name}")
@@ -466,8 +479,10 @@ class Project:
             # empties the buffer before this runs, so a committed deletion drops them for good.
             # Include _orphan_takes: takes whose shot was missing at load must ALSO survive a
             # write-through, not be permanently erased (L3) - unlike the purge buffer these are
-            # never cleared. All three dicts are DISJOINT (uuid4 ids; nothing moves a take
-            # between them), so merge order is moot.
+            # never cleared. The three dicts are DISJOINT: _takes/_pending_take_purge split by
+            # construction (delete_shot pops _takes -> purge); _orphan_takes is deduped against
+            # _takes at load time (a colliding orphan id is discarded there), and nothing moves
+            # a take between the dicts afterward - so the merge can't silently drop a record.
             merged = {**self._orphan_takes, **self._pending_take_purge, **self._takes}
             doc = {"version": VERSION,
                    "takes": [self._take_to_dict(t) for t in self._ordered(merged)]}
@@ -535,7 +550,7 @@ class Project:
         return shot
 
     def get_shot(self, shot_id: str) -> Optional[Shot]:
-        return self._shots.get(shot_id)
+        return self._shots.get(shot_id)   # single-key get: O(1), no iteration -> lock-free (M12)
 
     def list_shots(self) -> list[Shot]:
         # Snapshot under the lock (M12): _ordered iterates _shots.values(), and a concurrent
