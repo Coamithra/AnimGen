@@ -1535,9 +1535,13 @@ def test_guarded_emit_and_daemon_workers() -> None:
     from ui.main_window import _OrphanReconciler
     from backends import comfy_client
 
-    strip = _StripLoader([("t1", "does-not-exist.mp4")], gen=0)
-    shiboken6.delete(strip)
-    strip._run()                     # decode fails -> no emit; a decodable clip would hit guarded_emit
+    # _StripLoader only emits when a clip actually decodes, so feed a real one: a dead source
+    # is then reached on the guarded `ready` emit (a bad clip would skip the emit entirely).
+    with tempfile.TemporaryDirectory() as td:
+        clip = _make_mp4(Path(td) / "strip.mp4", n=3)
+        strip = _StripLoader([("t1", str(clip))], gen=0)
+        shiboken6.delete(strip)
+        strip._run()                 # decodes -> guarded_emit(self, "ready", ...) on a dead source
 
     frame = _FrameLoader("does-not-exist.mp4")
     shiboken6.delete(frame)
