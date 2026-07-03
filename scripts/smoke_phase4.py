@@ -824,6 +824,14 @@ def test_shot_tab_missing_model_flag() -> None:
     assert tab.model_valid(), "picking a real model clears the invalid flag"
     assert "d9534f" not in tab.model_combo.styleSheet()
     assert tab.model_combo.findData("ghost-model-9000") < 0, "placeholder dropped after a real pick"
+
+    # A BLANK model_id (a bare new shot) is NOT the missing-model case: it defaults to
+    # index 0, stays valid, and gets no placeholder.
+    blank = project.add_shot("blank")
+    tab2 = ShotTab(project, blank)
+    assert tab2.model_valid(), "a blank model_id defaults to the first roster model, not invalid"
+    assert tab2.model_combo.currentIndex() == 0
+    assert tab2._missing_model_idx is None, "no placeholder for a blank id"
     print("shot-tab missing-model OK: placeholder held + flagged red, real pick clears + drops it")
 
 

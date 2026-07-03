@@ -484,7 +484,7 @@ class ShotTab(QWidget):
             btn.setIcon(QIcon()); btn.setText("Choose…")
 
     # ---- model + params -------------------------------------------------
-    def _current_model(self) -> dict:
+    def _current_model(self) -> Optional[dict]:
         return library.get_model(self.model_combo.currentData())
 
     def _select_model(self, model_id: str) -> None:
@@ -494,7 +494,7 @@ class ShotTab(QWidget):
         instead of silently snapping to index 0."""
         self._drop_missing_model_item()
         idx = self.model_combo.findData(model_id)
-        if idx < 0 and model_id:
+        if idx < 0 and model_id:   # blank id (a new shot) -> default to index 0, no placeholder
             self.model_combo.blockSignals(True)
             self.model_combo.addItem(f"(missing) {model_id}", model_id)
             self._missing_model_idx = self.model_combo.count() - 1
