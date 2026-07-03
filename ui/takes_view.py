@@ -299,6 +299,22 @@ class _ResizeHandle(QFrame):
         event.accept()
 
 
+class _TakesListView(QListView):
+    """The grid's QListView with keyboard triage shortcuts, so a review pass over N takes
+    never has to leave the keyboard (card UX4). Keys act on the current selection through the
+    owner TakesView's existing action methods (delete / toggle_star / open-in-viewer), so the
+    same queue-neutralize + write-through invariants apply as the mouse paths - the view only
+    supplies the key binding. Unhandled keys (arrows, page-up/down, type-ahead) fall through to
+    QListView so its native selection navigation is unchanged."""
+    def __init__(self, owner: "TakesView"):
+        super().__init__()
+        self._owner = owner
+
+    def keyPressEvent(self, event):  # noqa: N802 - Qt override
+        if not self._owner.handle_grid_key(event.key()):
+            super().keyPressEvent(event)
+
+
 class TakesView(QWidget):
     changed = Signal()
     export_requested = Signal(list)   # list[take_id]
@@ -353,7 +369,7 @@ class TakesView(QWidget):
         head.addWidget(export_btn)
 
         self.model = QStandardItemModel()
-        self.view = QListView()
+        self.view = _TakesListView(self)
         self.view.setModel(self.model)
         self.view.setViewMode(QListView.ViewMode.IconMode)
         self.view.setResizeMode(QListView.ResizeMode.Adjust)
@@ -626,6 +642,27 @@ class TakesView(QWidget):
 
     def all_take_ids(self) -> list:
         return [self.model.item(r).data(_USER_ROLE) for r in range(self.model.rowCount())]
+
+    def handle_grid_key(self, key: int) -> bool:
+        """Map a triage key to a selection action (card UX4). Delete -> bin, S -> toggle star,
+        Enter/Return -> open the first selected take in the viewer. Returns True when the key was
+        consumed (so the view doesn't also run its default handling), False to fall through to
+        QListView's native navigation. A no-selection triage key is consumed but does nothing, so
+        it doesn't accidentally type-ahead search. Routed through the same delete/toggle_star/
+        _open_in_viewer the mouse uses, so the queue-neutralize + write-through invariants hold."""
+        if key in (int(Qt.Key.Key_Delete), int(Qt.Key.Key_S),
+                   int(Qt.Key.Key_Return), int(Qt.Key.Key_Enter)):
+            ids = self.selected_take_ids()
+            if not ids:
+                return True
+            if key == int(Qt.Key.Key_Delete):
+                self.delete(ids)
+            elif key == int(Qt.Key.Key_S):
+                self.toggle_star(ids)
+            else:                                      # Return / Enter
+                self.open_take_requested.emit(ids[0])
+            return True
+        return False
 
     def _context_menu(self, pos) -> None:
         ids = self.selected_take_ids()
