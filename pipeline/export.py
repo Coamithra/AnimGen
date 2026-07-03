@@ -67,29 +67,37 @@ def _export_into(folder: Path, shot, take) -> int:
 
 def export_takes(project, take_ids: list, label: str = "selection",
                  dest_root: Path | str = EXPORTS_DIR) -> dict:
-    """Export the given takes. Returns {parent, exported:[(folder,n_frames)], skipped:[ids]}."""
-    takes = []
+    """Export the given takes. Returns {parent, exported:[(folder,n_frames)], skipped:[ids]}.
+
+    An id is skipped (never silently dropped) when it resolves to no take, its take has
+    no playable video, or its shot was since deleted (get_shot -> None, which would
+    otherwise AttributeError on shot.name).
+    """
+    pairs = []                       # (take, shot) for exportable ids, in request order
+    skipped = []
     for tid in take_ids:
         t = project.get_take(tid)
-        if t and t.video_path and Path(t.video_path).exists():
-            takes.append(t)
-    skipped = [tid for tid in take_ids if project.get_take(tid)
-               and tid not in {t.id for t in takes}]
+        if not (t and t.video_path and Path(t.video_path).exists()):
+            skipped.append(tid)      # unknown id or no playable video
+            continue
+        shot = project.get_shot(t.shot_id)
+        if shot is None:             # shot deleted out from under the take
+            skipped.append(tid)
+            continue
+        pairs.append((t, shot))
 
-    if not takes:
+    if not pairs:
         return {"parent": None, "exported": [], "skipped": skipped}
 
-    if len(takes) == 1:
-        t = takes[0]
-        shot = project.get_shot(t.shot_id)
+    if len(pairs) == 1:
+        t, shot = pairs[0]
         folder = Path(dest_root) / f"{_safe(shot.name)}_{_stamp()}_{t.id[:6]}"
         n = _export_into(folder, shot, t)
         return {"parent": folder, "exported": [(folder, n)], "skipped": skipped}
 
     parent = Path(dest_root) / f"{_safe(label)}_{_stamp()}"
     exported = []
-    for t in takes:
-        shot = project.get_shot(t.shot_id)
+    for t, shot in pairs:
         sub = parent / f"{_safe(shot.name)}_{t.id[:6]}"
         n = _export_into(sub, shot, t)
         exported.append((sub, n))

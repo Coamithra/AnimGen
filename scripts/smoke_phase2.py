@@ -431,7 +431,10 @@ def test_total_price() -> None:
     assert total_price_text([0.72, None, 0.0]) == "Full set: $0.72  (+1 unknown)"
     assert total_price_text([]) == "Full set: $0.00"
     assert total_price_text([None, None]) == "Full set: $0.00  (+2 unknown)"
-    print("cost_confirm total_price_text OK: sum, free, unknown tally, empty")
+    # L13 sibling surface: a sub-cent full set doesn't collapse to $0.00 either.
+    assert total_price_text([0.004]) == "Full set: $0.004"
+    assert total_price_text([0.0004]) == "Full set: <$0.01"
+    print("cost_confirm total_price_text OK: sum, free, unknown tally, empty, sub-cent")
 
 
 def test_cost_summary() -> None:
@@ -481,6 +484,30 @@ def test_launch_label() -> None:
     _, total_m, has_spend_m = build_summary(mixed_items)
     assert launch_button_label(total_m, has_spend_m) == "Launch (spend ~$0.72)"
     print("cost_confirm launch_button_label OK: unknown-not-free, free, known, mixed")
+
+
+def test_subcent_cost_display() -> None:
+    """L13: sub-cent totals must NOT collapse to '$0.00' next to a 'spend real money'
+    warning. _fmt_cost shows sub-cent precision (or '<$0.01'), and the launch label
+    inherits it so the gate can't read '$0.00 spend'."""
+    from ui.cost_confirm import _fmt_cost, launch_button_label, build_summary
+
+    assert _fmt_cost(None) == "?"
+    assert _fmt_cost(0) == "free"          # exactly free stays "free", not "<$0.01"
+    assert _fmt_cost(0.0004) == "<$0.01"   # below the 3-decimal floor
+    assert _fmt_cost(0.004) == "$0.004"    # sub-cent but representable to 3 decimals
+    assert _fmt_cost(0.009) == "$0.009"
+    assert _fmt_cost(0.01) == "$0.01"      # cent boundary keeps 2-decimal form
+    assert _fmt_cost(0.72) == "$0.72"
+    assert _fmt_cost(2.0) == "$2.00"
+
+    # A batch whose total is sub-cent no longer renders "$0.00" in header or launch label.
+    body, total, has_spend = build_summary(
+        [{"name": "tiny", "model_display": "Cheap v1", "est_cost": 0.004, "params": {}}])
+    assert "$0.00 " not in body and "$0.004" in body, body
+    label = launch_button_label(total, has_spend)
+    assert label == "Launch (spend ~$0.004)", label
+    print("cost_confirm sub-cent OK: <$0.01 / $0.00X, no $0.00 spend")
 
 
 def test_job_manager() -> None:
@@ -2290,6 +2317,7 @@ if __name__ == "__main__":
     test_total_price()
     test_cost_summary()
     test_launch_label()
+    test_subcent_cost_display()
     test_cancel_pending()
     test_cancel_shot_takes()
     test_inflight_stop_maps_to_cancelled()

@@ -22,6 +22,8 @@ def _fmt_cost(c: Optional[float]) -> str:
         return "?"
     if c == 0:
         return "free"
+    if c < 0.01:                     # sub-cent: don't collapse to "$0.00" in the gate
+        return "<$0.01" if c < 0.001 else f"${c:.3f}"
     return f"${c:.2f}"
 
 
@@ -88,7 +90,9 @@ def total_price_text(costs: list[Optional[float]]) -> str:
     """
     total = sum(c for c in costs if c is not None)   # known costs; local $0 adds nothing
     unknown = sum(1 for c in costs if c is None)
-    text = f"Full set: ${total:.2f}"
+    # Sub-cent totals get _fmt_cost's precision (L13); an all-$0/empty set keeps "$0.00".
+    dollars = _fmt_cost(total) if 0 < total < 0.01 else f"${total:.2f}"
+    text = f"Full set: {dollars}"
     if unknown:
         text += f"  (+{unknown} unknown)"
     return text
