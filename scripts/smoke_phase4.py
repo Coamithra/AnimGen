@@ -347,7 +347,7 @@ def test_take_tile_tooltip() -> None:
     assert "Model: seedance-2.0-std (replicate)" in tip
     assert "Created: 2026-06-18T10:00:00" in tip
     assert "Render time: 12s" in tip                     # started -> completed, not created
-    assert "Seed: 1234" in tip                            # take.seed wins over snapshot seed
+    assert "Seed: 1234" in tip                            # take.seed (authoritative post-roll)
     assert "Cost: $0.042" in tip and "Est. cost" not in tip   # actual present -> actual shown
 
     # A failed take: the FULL error text is in the tooltip so the tile reveals why.
@@ -364,27 +364,45 @@ def test_take_tile_tooltip() -> None:
     assert "(no error detail was recorded)" in take_tile_tooltip(
         Take(id="f2", shot_id="s", status=STATUS_FAILED))
 
-    # Est. cost is labelled as an estimate when no actual is recorded; snapshot seed is a
-    # fallback when the take has no seed of its own.
+    # A crash-interrupted FAILED take is restartable (rule #17) - the error label says so, so a
+    # hover distinguishes a crash victim from a genuine workflow failure.
+    itip = take_tile_tooltip(
+        Take(id="f3", shot_id="s", status=STATUS_FAILED, interrupted=True, error="lost render"))
+    assert "restartable" in itip and "lost render" in itip
+    assert "restartable" not in ftip                     # a genuine failure is NOT labelled restartable
+
+    # Est. cost is labelled as an estimate when no actual is recorded; a not-yet-rolled take
+    # shows no seed (the snapshot's pre-roll placeholder is deliberately not surfaced) and no
+    # render-time line (not finished).
     pend = Take(id="p1", shot_id="s", status=STATUS_PENDING, cost_estimate=0.08,
                 settings_snapshot={"settings": {"seed": 999}})
     ptip = take_tile_tooltip(pend)
     assert "Est. cost: $0.080" in ptip
-    assert "Seed: 999" in ptip
+    assert "Seed" not in ptip                             # no post-roll seed yet -> no seed line
     assert "Render time" not in ptip                     # not finished -> no duration line
 
-    # Wired live: the tooltip is set on the item in load() and refreshed in update_take().
+    # Wired live: the tooltip is set on the item in load() (full metadata) and refreshed in
+    # update_take() on a status transition - both go through the real widget, not just the helper.
     app = QApplication.instance() or QApplication([])  # noqa: F841
     project = Project.new()
     shot = project.add_shot("kick", model_id="seedance-2.0-std")
-    t = project.add_take(shot.id, status=STATUS_PENDING, cost_estimate=0.05)
+    d = project.add_take(
+        shot.id, status=STATUS_DONE, seed=1234, cost_estimate=0.05,
+        settings_snapshot={"model_id": "seedance-2.0-std", "backend": "replicate"},
+        started="2026-06-18T10:00:00", completed="2026-06-18T10:00:12")
     tv = TakesView(project, shot.id)
+    dtip = tv._items[d.id].toolTip()                      # what actually landed on the item via load()
+    assert "Status: done" in dtip
+    assert "Model: seedance-2.0-std (replicate)" in dtip
+    assert "Render time: 12s" in dtip and "Seed: 1234" in dtip and "Est. cost: $0.050" in dtip
+    t = project.add_take(shot.id, status=STATUS_PENDING, cost_estimate=0.05)
+    tv.load()
     assert "Status: pending" in tv._items[t.id].toolTip()
     project.update_take(t.id, status=STATUS_FAILED, error="boom")
     tv.update_take(t.id)
     assert "Status: failed" in tv._items[t.id].toolTip()
     assert "boom" in tv._items[t.id].toolTip()           # error refreshed on the transition
-    print("TakesView tooltip OK: rich per-take metadata, full error on failure, live on load/update")
+    print("TakesView tooltip OK: rich per-take metadata, full error + interrupted note, live on load/update")
 
 
 def test_bin_neutralizes_queued_take() -> None:

@@ -88,8 +88,10 @@ def _render_duration(started: str, completed: str) -> str:
     """Human render duration between two second-precision ISO stamps (started -> completed),
     e.g. "3m15s". Both come from store.project._now() / jobs.GenerationJob (no timezone), so a
     plain fromisoformat diff is safe. Returns "" if either is missing/unparseable or the span is
-    negative (clock skew). Mirrors queue_view._elapsed; kept local so this module stays pure and
-    Qt-free without importing the queue view. Pure so it's unit-testable headlessly."""
+    negative (clock skew). Same arithmetic as queue_view._elapsed, kept local so this module stays
+    pure and Qt-free without importing the queue view; unlike queue_view.done_elapsed it does NOT
+    fall back to `created` for the start, so a take with no `started` stamp shows no duration line
+    rather than mislabelling its queue wait as render time. Pure so it's unit-testable headlessly."""
     if not started or not completed:
         return ""
     try:
@@ -138,11 +140,11 @@ def take_tile_tooltip(take) -> str:
     if dur:
         lines.append(f"Render time: {dur}")
 
-    seed = take.seed
-    if seed is None:
-        seed = (snap.get("settings") or {}).get("seed")
-    if seed is not None:
-        lines.append(f"Seed: {seed}")
+    # take.seed is the authoritative post-roll value; the snapshot's settings seed is the
+    # pre-roll value frozen at launch (a placeholder before a batch take's per-take reroll in
+    # _queue_take), so only show a seed once the take actually has one assigned.
+    if take.seed is not None:
+        lines.append(f"Seed: {take.seed}")
 
     cost = take.cost_actual if take.cost_actual is not None else take.cost_estimate
     if cost is not None:
@@ -152,7 +154,9 @@ def take_tile_tooltip(take) -> str:
     if status == "failed":
         err = (take.error or "").strip()
         lines.append("")
-        lines.append("Error:")
+        # A crash/death-interrupted take (rule #17) is restartable; a genuine workflow failure
+        # is not - surface which one this is so a hover distinguishes them without the viewer.
+        lines.append("Error (interrupted by crash - restartable):" if take.interrupted else "Error:")
         lines.append(err or "(no error detail was recorded)")
 
     return "\n".join(lines)
