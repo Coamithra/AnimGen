@@ -1343,23 +1343,20 @@ def test_export_starred_takes() -> None:
     captured: dict = {}
     win.export_takes = lambda ids, label=None: captured.update(ids=list(ids), label=label)  # type: ignore[method-assign]
     win.export_starred_takes()
-    assert set(captured["ids"]) == {a.id, b.id}, captured["ids"]
+    assert set(captured["ids"]) == {a.id, b.id}, captured["ids"]  # d (deleted) excluded
     assert captured["label"] == "starred"
-    assert d.id not in captured["ids"], "a deleted starred take is not exported"
 
-    # View filter obeyed: filter to 'punch' only -> only s2's starred take.
+    # View filter obeyed: star only s1 and enable 'Starred shots' so the view narrows to
+    # {s1}; the export then yields only s1's starred take, never s2's.
     captured.clear()
-    win.model_filter  # noqa: B018  (built in reload)
-    # Star-shots filter: star only s1, enable 'Starred shots' -> only s1's starred take exported.
     project.set_shot_starred(s1.id, True)
     win.starred_shots_filter.setChecked(True)   # triggers reload -> cards == {s1}
     win.export_starred_takes()
     assert set(captured["ids"]) == {a.id}, captured["ids"]
 
-    # Empty view -> a message, no delegate call. Unstar every take under the still-active
-    # 'Starred shots' filter (cards == {s1}, which now has no starred take).
+    # Empty view -> a message, no delegate call. Unstar s1's only starred take under the
+    # still-active 'Starred shots' filter (cards == {s1}, which now has no starred take).
     project.update_take(a.id, starred=False)
-    win.starred_filter  # noqa: B018
     captured.clear()
     _orig_info = QMessageBox.information
     QMessageBox.information = staticmethod(lambda *a, **k: None)  # type: ignore[assignment]
