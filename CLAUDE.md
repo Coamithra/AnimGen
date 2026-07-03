@@ -280,7 +280,16 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
    COPIES it into `.assets/` (deliberate; the original is left untouched). Delete-to-bin
    only moves files under the project's `.assets/`; a take pointing at an external file
    (e.g. a seeded `../Fighter/out/` gif) is flagged deleted but left in place. Never
-   relocate/delete anything outside the project.
+   relocate/delete anything outside the project. **Binning a non-terminal take neutralizes
+   it in the queue first (H2, PR #92):** `TakesView.delete` cancels a PENDING take
+   (`jobs.cancel_take`) / stops a GENERATING one (`jobs.request_stop`) before `move_to_bin`,
+   so a binned take can't keep spending or stick PENDING. Belt-and-braces: the queue-wide
+   sweeps (`cancel_pending`/`pause_local`/`abandon_local`) and orphan recovery
+   (`recovery.comfy_orphans`) scan with `include_deleted=True`, and a binned orphan's
+   RECLAIMed media lands in `.bin/<take_id>/`, not the live `takes/` dir (the take stays
+   deleted throughout). `pending_count` deliberately stays `include_deleted=False` - a
+   binned take shouldn't inflate the user-visible pending count now that bin-time
+   neutralize exists.
 3. **Each take stores an immutable `settings_snapshot`** — frozen at launch
    (`main_window.generate_shot`). This is the whole point (the source project had no
    per-take metadata). Don't mutate it. It captures model/backend/replicate id/workflow,
