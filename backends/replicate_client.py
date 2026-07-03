@@ -411,6 +411,16 @@ def cancel_prediction(pred_id: str, token: Optional[str] = None) -> None:
     api_request(token or load_token(), f"{API}/predictions/{pred_id}/cancel", method="POST")
 
 
+def get_prediction(pred_id: str, token: Optional[str] = None) -> dict:
+    """Fetch a prediction's current state (an idempotent GET - retried on transient errors,
+    NO spend: it only observes). Returns the raw prediction dict (`status` is one of
+    starting/processing/succeeded/failed/canceled; `output`/`error`/`logs` present as
+    applicable). Used by hosted orphan reconciliation on load to reconcile a take a prior
+    session left GENERATING without re-running or re-charging it. Raises ReplicateError on a
+    non-transient HTTP error or an exhausted network give-up."""
+    return api_request(token or load_token(), f"{API}/predictions/{pred_id}")
+
+
 def _output_video_url(output: object) -> str:
     """Resolve a succeeded prediction's `output` to a video URL, raising ReplicateError
     (quoting the raw output) when it carries no recognizable URL. A non-str URL — a list
@@ -459,6 +469,18 @@ def _download_result(url: str, token: str, out_path: Path) -> None:
                 continue
             raise ReplicateError(_network_error_message(url, e)) from e
     raise ReplicateError(f"Gave up retrying the result download after repeated transient errors: {url}")
+
+
+def download_output(prediction: dict, out_path: Path, token: Optional[str] = None) -> None:
+    """Download a succeeded prediction's video to `out_path` (an idempotent GET, no spend).
+    Resolves the prediction's `output` to a video URL and fetches it with the same
+    retry-with-backoff as the render path. Raises ReplicateError if the output carries no
+    usable URL or the download exhausts its retries. Used by hosted orphan reconciliation to
+    claim a render a prior session already paid for."""
+    url = _output_video_url(prediction.get("output"))
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _download_result(url, token or load_token(), out_path)
 
 
 def run_prediction(token: str, replicate_model_id: str, inp: dict, out_path: Path,

@@ -76,6 +76,30 @@ def recovery_banner_text(interrupted_count: int) -> Optional[str]:
             f"{'was' if n == 1 else 'were'} interrupted - restart them?")
 
 
+def generating_takes(project) -> list:
+    """Takes currently mid-render (status GENERATING), either backend - the ones that keep
+    spending money (hosted) or GPU (local) if the app exits without stopping them. Pure, so
+    the closeEvent decision is smoke-testable without a window. Excludes binned takes: a
+    delete-to-bin already neutralized them in the queue (H2)."""
+    return [t for t in project.list_takes() if t.status == STATUS_GENERATING]
+
+
+def close_warning_text(takes: list) -> Optional[str]:
+    """The closeEvent warning body when takes are still rendering, else None (pure). Notes the
+    hosted-vs-local split so the user knows some renders are still BILLING on Replicate."""
+    if not takes:
+        return None
+    n = len(takes)
+    hosted = sum(1 for t in takes
+                 if (t.settings_snapshot or {}).get("backend") == "replicate")
+    lines = [f"{n} take{'' if n == 1 else 's'} {'is' if n == 1 else 'are'} still rendering."]
+    if hosted:
+        lines.append(f"{hosted} {'is' if hosted == 1 else 'are'} hosted (Replicate) and will "
+                     "keep billing on Replicate's servers after this window closes.")
+    lines.append("Close anyway, or stop the in-flight renders first?")
+    return "\n\n".join(lines)
+
+
 class _OrphanReconciler(QObject):
     """Off-thread fetch of ComfyUI /history + /queue for orphan-take recovery.
 
@@ -97,6 +121,35 @@ class _OrphanReconciler(QObject):
         # fetch returns, a raw emit would raise 'Signal source has been deleted' and abort the
         # process at the C++ layer.
         guarded_emit(self, "ready", hist, queue)
+
+
+class _ReplicateReconciler(QObject):
+    """Off-thread poll of each orphaned hosted take's prediction (an idempotent GET - it
+    OBSERVES, never re-runs or re-charges). Runs on a daemon thread because a slow/unreachable
+    Replicate would otherwise block the GUI thread. Emits {take_id: prediction_or_None}: a take
+    with no backend_job_id, or one whose poll raised (network down / HTTP error), maps to None
+    so the planner marks it FAILED + interrupted (restartable) rather than a frozen zombie."""
+    ready = Signal(object)
+
+    def __init__(self, orphans, parent=None):
+        super().__init__(parent)
+        # (id, backend_job_id) snapshot so the worker never touches the live take objects.
+        self._items = [(o.id, o.backend_job_id) for o in orphans]
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        statuses: dict = {}
+        for take_id, job_id in self._items:
+            if not job_id:
+                statuses[take_id] = None      # never recorded a prediction id -> unverifiable
+                continue
+            try:
+                statuses[take_id] = replicate_client.get_prediction(job_id)
+            except Exception:  # noqa: BLE001 - unreachable/HTTP error -> unverifiable, don't crash
+                statuses[take_id] = None
+        self.ready.emit(statuses)
 
 
 class _InfoBanner(QFrame):
@@ -1423,21 +1476,27 @@ class MainWindow(QMainWindow):
 
     # ---- orphan recovery -----------------------------------------------
     def _recover_orphans(self) -> None:
-        """Reconcile takes a prior session left mid-render on the local backend.
+        """Reconcile takes a prior session left mid-render on either backend.
 
-        On a cold load there are no live workers, so any comfyui take still at generating/pending
-        is orphaned. On an A->B->A project switch, though, the original A worker may still be
-        rendering under the OLD Project instance - `jobs.live_take_ids()` names those takes and
-        they're EXCLUDED from the orphan set (they aren't orphans; a live worker owns them), so
-        we never spawn a second monitor racing that worker's write-through (M7). Fetch ComfyUI
-        state off-thread (the server outlives the app), then reclaim finished renders, re-attach
-        running ones, and clear the dead ones."""
-        if not recovery.comfy_orphans(self.project, self.jobs.live_take_ids()):
-            return
+        On a cold load there are no live workers, so any take still at generating/pending is
+        orphaned. Local (comfyui) takes reconcile against the surviving ComfyUI server (/history +
+        /queue); hosted (replicate) takes reconcile against each prediction on Replicate
+        (get_prediction - an idempotent GET, no spend). Both fetch off-thread and apply on the GUI
+        thread. On an A->B->A project switch, though, the original A worker may still be rendering
+        under the OLD Project instance - `jobs.live_take_ids()` names those takes and they're
+        EXCLUDED from the comfy orphan set (they aren't orphans; a live worker owns them), so we
+        never spawn a second monitor racing that worker's write-through (M7)."""
         proj = self.project                       # guard against a project switch mid-fetch
-        self._reconciler = _OrphanReconciler()    # kept on self so it isn't GC'd
-        self._reconciler.ready.connect(lambda h, q: self._apply_recovery(proj, h, q))
-        self._reconciler.start()
+        if recovery.comfy_orphans(proj, self.jobs.live_take_ids()):
+            self._reconciler = _OrphanReconciler()    # kept on self so it isn't GC'd
+            self._reconciler.ready.connect(lambda h, q: self._apply_recovery(proj, h, q))
+            self._reconciler.start()
+        hosted = recovery.replicate_orphans(proj)
+        if hosted:
+            self._replicate_reconciler = _ReplicateReconciler(hosted)   # kept on self (not GC'd)
+            self._replicate_reconciler.ready.connect(
+                lambda statuses: self._apply_replicate_recovery(proj, statuses))
+            self._replicate_reconciler.start()
 
     def _apply_recovery(self, proj, history, queue) -> None:
         if proj is not self.project:              # user switched projects before the fetch returned
@@ -1516,6 +1575,60 @@ class MainWindow(QMainWindow):
             self._log("orphan recovery: " + ", ".join(f"{n} {a}" for a, n in counts.items()))
         self._refresh_cancel_action()
         self._refresh_recovery_banner()   # recovery may have produced interrupted takes
+
+    def _apply_replicate_recovery(self, proj, statuses) -> None:
+        if proj is not self.project:              # user switched projects before the poll returned
+            return
+        orphans = recovery.replicate_orphans(proj)
+        if not orphans:
+            return
+        self._execute_replicate_plans(recovery.plan_replicate_recovery(orphans, statuses or {}))
+
+    def _execute_replicate_plans(self, plans) -> None:
+        """Apply hosted reconciliation plans. RECLAIM downloads the already-paid-for output
+        (idempotent GET, no spend) and stamps it DONE; FAIL/CANCEL clear the frozen take.
+        Mirrors _execute_plans (local) incl. fps/frame_count stamping and the bin destination
+        for a take deleted mid-flight (H2)."""
+        counts: Counter = Counter()
+        for p in plans:
+            if p.action == recovery.RECLAIM:
+                try:
+                    take = self.project.get_take(p.take_id)
+                    dest_dir = (self.project.bin_dir / p.take_id if take and take.deleted
+                                else self.project.takes_dir)
+                    dst = dest_dir / f"{p.take_id}.mp4"
+                    replicate_client.download_output(p.prediction, dst)
+                    fps, frame_count = extract.probe_media_fields(str(dst))
+                    self.project.update_take(
+                        p.take_id, status=STATUS_DONE, video_path=str(dst),
+                        fps=fps, frame_count=frame_count, backend_job_id=p.prompt_id,
+                        completed=datetime.now().isoformat(timespec="seconds"))
+                except Exception as e:  # noqa: BLE001 - a failed download must not abort the rest
+                    # The render SUCCEEDED and is already paid for - the download just couldn't
+                    # complete this session (Replicate blip). Leave the take GENERATING so NEXT
+                    # launch's reconciliation retries the FREE download; marking it FAILED would
+                    # push it into "Restart interrupted takes" -> a re-render that RE-BILLS an
+                    # output we already have. The row un-freezes next launch, not this one.
+                    self._log(f"hosted orphan {p.take_id[:8]}: reclaim download deferred "
+                              f"(will retry next launch): {e}")
+                    counts["deferred"] += 1
+                    continue
+            elif p.action == recovery.FAIL:
+                # interrupted is set explicitly by the planner: False = genuine render failure,
+                # True = crash/lost/unverifiable (restartable via rule #17).
+                self.project.update_take(p.take_id, status=STATUS_FAILED, error=p.reason,
+                                         interrupted=bool(p.interrupted))
+            elif p.action == recovery.CANCEL:
+                self.project.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason,
+                                         interrupted=bool(p.interrupted))
+            counts[p.action] += 1
+            self._log(f"hosted orphan {p.take_id[:8]}: {p.reason}")
+            self._refresh_shot(p.shot_id)
+        if counts:
+            self._log("hosted orphan recovery: "
+                      + ", ".join(f"{n} {a}" for a, n in counts.items()))
+        self._refresh_cancel_action()
+        self._refresh_recovery_banner()   # hosted recovery may have produced interrupted takes
 
     # ---- export ---------------------------------------------------------
     def export_takes(self, take_ids: list, label: Optional[str] = None) -> None:
@@ -1816,10 +1929,45 @@ class MainWindow(QMainWindow):
                            event.spontaneous(), self.isMinimized())
         super().hideEvent(event)
 
+    def _confirm_close_with_inflight_renders(self) -> bool:
+        """If any take is still GENERATING (either backend), warn before closing - a hosted
+        render keeps BILLING on Replicate after the app exits and would be left a frozen
+        "running" row until next-launch reconciliation. Returns True to proceed with the close,
+        False to abort it. Offers to STOP the in-flight renders first (best-effort
+        jobs.request_stop - stops spend/GPU, NEVER creates any). No takes generating -> True."""
+        takes = generating_takes(self.project)
+        text = close_warning_text(takes)
+        if text is None:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Renders still in progress")
+        box.setText(text)
+        close_btn = box.addButton("Close anyway", QMessageBox.ButtonRole.DestructiveRole)
+        stop_btn = box.addButton("Stop renders && close", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is cancel_btn:
+            return False
+        if clicked is stop_btn:
+            for t in takes:                      # best-effort: stops spend/GPU, never creates it
+                try:
+                    self.jobs.request_stop(t.id)
+                except Exception as e:  # noqa: BLE001 - a failed stop must not block the close
+                    applog.logger.info("request_stop failed for %s at close: %s", t.id[:8], e)
+        return True
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         # spontaneous() = the window system initiated it (you clicked X / the OS asked it
         # to close) vs a programmatic close. Logged so a vanished window is explainable.
         spontaneous = event.spontaneous()
+        if not self._confirm_close_with_inflight_renders():
+            applog.logger.info("close aborted at in-flight-render prompt (spontaneous=%s)",
+                               spontaneous)
+            event.ignore()
+            return
         had_edits = self._has_unsaved_edits()
         if not self._maybe_save_changes():
             applog.logger.info("close aborted at unsaved-changes prompt (spontaneous=%s)", spontaneous)
