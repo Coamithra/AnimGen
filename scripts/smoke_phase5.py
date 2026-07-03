@@ -1080,6 +1080,81 @@ def test_take_media_probe() -> None:
     print("take media probe OK: fps/frame_count stamped (helper + job + export), best-effort")
 
 
+def test_delete_shot_discard_preserves_takes() -> None:
+    """Review finding H1: delete_shot is a BUFFERED (discardable) authoring edit, so it must
+    not destructively purge the shot's takes from takes.json until the deletion is committed
+    by save(). Five properties:
+      (1) delete_shot -> reload (== Discard) brings BOTH the shot and its takes back;
+      (2) a take write-through for a SURVIVING shot after a delete keeps the deleted shot's
+          takes on disk (the concurrent-write-through leak);
+      (2b) update_take reaches a HELD take, so a stopped worker's terminal status persists;
+      (2c) a failed save RESTORES the purge buffer instead of committing the purge in memory;
+      (3) delete_shot -> save -> reload drops the deleted shot's takes for good."""
+    tmp = Path(tempfile.mkdtemp())
+    path = tmp / "proj.animproj"
+
+    p = Project.new()
+    doomed = p.add_shot("doomed", model_id="seedance-2.0-std")
+    keep = p.add_shot("keep", model_id="seedance-2.0-std")
+    t1 = p.add_take(doomed.id, status=STATUS_DONE, seed=11, starred=True)
+    t2 = p.add_take(doomed.id, status=STATUS_DONE, seed=12)
+    p.save_as(path)   # titled + clean, takes.json on disk with both takes
+
+    # --- (1) delete -> Discard (reload from disk) restores shot + its takes ---
+    p.delete_shot(doomed.id)
+    assert p.get_shot(doomed.id) is None, "shot gone from live view immediately"
+    assert p.list_takes(doomed.id) == [], "deleted shot's takes gone from live view immediately"
+    assert p.get_shot(keep.id) is not None and p.dirty, "surviving shot intact; deletion buffered dirty"
+
+    reloaded = Project.load(path)   # == the Discard path (fresh load from untouched disk)
+    assert reloaded.get_shot(doomed.id) is not None, "Discard brings the shot back from the .animproj"
+    got = {t.id: t for t in reloaded.list_takes(doomed.id)}
+    assert set(got) == {t1.id, t2.id}, "Discard restores BOTH takes from takes.json (no data loss)"
+    assert got[t1.id].seed == 11 and got[t1.id].starred, "take metadata (seed/star) survives"
+
+    # --- (2) a surviving shot's write-through must NOT flush away the held takes ---
+    p.add_take(keep.id, status=STATUS_DONE, seed=99)   # write-through to takes.json
+    mid = Project.load(path)
+    assert {t.id for t in mid.list_takes(doomed.id)} == {t1.id, t2.id}, \
+        "held takes survive a concurrent write-through until save"
+    mid_t2 = next(t for t in mid.list_takes(doomed.id) if t.id == t2.id)
+    assert mid_t2.seed == 12 and not mid_t2.starred, "held take metadata not mangled by the merge"
+
+    # --- (2b) update_take reaches a HELD take: a worker unwinding a stopped render after
+    # the delete must still record its terminal status, not leave a stale one behind ---
+    p.update_take(t2.id, status=STATUS_FAILED, error="stopped after delete")
+    held_reload = Project.load(path)
+    got2 = next(t for t in held_reload.list_takes(doomed.id) if t.id == t2.id)
+    assert got2.status == STATUS_FAILED and got2.error == "stopped after delete", \
+        "a held take's terminal update routes into the buffer and persists"
+
+    # --- (2c) a FAILED save must restore the purge buffer, not commit the purge in memory ---
+    real_write = p._write_takes_file
+    def boom():
+        raise PermissionError("simulated AV lock on takes.json")
+    p._write_takes_file = boom
+    try:
+        p.save()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save must propagate the takes.json write failure")
+    finally:
+        p._write_takes_file = real_write
+    assert set(p._pending_take_purge) == {t1.id, t2.id}, \
+        "failed save restores the held takes (purge not silently committed in memory)"
+    assert p.dirty, "failed save leaves the project dirty for a retry"
+
+    # --- (3) save commits the deletion: the takes are dropped for good ---
+    p.save()
+    assert not p._pending_take_purge, "save clears the pending-purge buffer"
+    final = Project.load(path)
+    assert final.get_shot(doomed.id) is None, "saved deletion removes the shot"
+    assert final.list_takes(doomed.id) == [], "saved deletion drops its takes"
+    assert {t.shot_id for t in final.list_takes()} == {keep.id}, "only the surviving shot's takes remain"
+    print("delete_shot discard OK: takes survive Discard + write-through, dropped only on save (H1)")
+
+
 if __name__ == "__main__":
     test_export()
     test_take_media_probe()
@@ -1101,4 +1176,5 @@ if __name__ == "__main__":
     test_run_survives_deleted_signals()
     test_refresher_survives_deleted_signals()
     test_save_as_rollback_on_write_failure()
+    test_delete_shot_discard_preserves_takes()
     print("PHASE 5 SMOKE: PASS")
