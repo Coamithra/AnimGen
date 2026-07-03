@@ -752,7 +752,64 @@ def test_queue_view() -> None:
     print("QueueView OK: zero per-row widgets, bounded child count, 1-row progress, coalesced rebuild, cancel menu, done counter, last-finished strip, paint")
 
 
+def test_recovery_banner_predicate() -> None:
+    """The pure banner-text predicate: None below 1, present + correct singular/plural at 1+."""
+    from ui.main_window import recovery_banner_text
+
+    assert recovery_banner_text(0) is None
+    assert recovery_banner_text(-1) is None
+    one = recovery_banner_text(1)
+    assert one is not None and "1 take was interrupted" in one, one
+    many = recovery_banner_text(3)
+    assert many is not None and "3 takes were interrupted" in many, many
+    print("recovery banner predicate OK: none <1, singular/plural text")
+
+
+def test_recovery_banner() -> None:
+    """The one-time crash-recovery banner: hidden with no interrupted takes; shown (with the
+    N-take message) when the project loads with interrupted takes; the Dismiss (x) hides it;
+    a fresh window with zero interrupted takes stays hidden. Non-modal, so smoke never blocks."""
+    from PySide6.QtWidgets import QApplication
+    from store.models import STATUS_CANCELLED
+    from ui.main_window import MainWindow, recovery_banner_text
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    # (a) clean project -> banner stays hidden.
+    clean = Project.new()
+    clean.add_shot("kick", model_id="seedance-2.0-std")
+    win = MainWindow(clean)
+    assert win.recovery_banner.isHidden(), "no interrupted takes -> banner hidden"
+
+    # (b) a project that loads with interrupted takes -> banner shown with the right text.
+    proj = Project.new()
+    shot = proj.add_shot("kick", model_id="seedance-2.0-std")
+    proj.add_take(shot.id, status=STATUS_CANCELLED, interrupted=True,
+                  error="cancelled: ComfyUI/the app was closed mid-render")
+    proj.add_take(shot.id, status=STATUS_CANCELLED, interrupted=True,
+                  error="cancelled: ComfyUI/the app was closed mid-render")
+    # a deliberately-cancelled take must NOT count toward the banner
+    proj.add_take(shot.id, status=STATUS_CANCELLED, interrupted=False)
+    win2 = MainWindow(proj)
+    assert win2._interrupted_take_count() == 2, win2._interrupted_take_count()
+    assert not win2.recovery_banner.isHidden(), "interrupted takes -> banner shown"
+    assert win2.recovery_banner._label.text() == recovery_banner_text(2)
+    assert "2 takes were interrupted" in win2.recovery_banner._label.text()
+
+    # (c) the Dismiss (x) hides the banner (find the close button by objectName).
+    from PySide6.QtWidgets import QPushButton
+    close_btn = next(b for b in win2.recovery_banner.findChildren(QPushButton)
+                     if b.objectName() == "infoBannerClose")
+    close_btn.click()
+    assert win2.recovery_banner.isHidden(), "Dismiss -> banner hidden"
+
+    print("recovery banner OK: hidden clean, shown with N-take text on interrupted load, "
+          "Dismiss hides, deliberate cancel excluded")
+
+
 if __name__ == "__main__":
+    test_recovery_banner_predicate()
+    test_recovery_banner()
     test_bin_restore()
     test_takes_view()
     test_takes_view_incremental_update()

@@ -28,8 +28,8 @@ from typing import Optional
 from PySide6.QtCore import Qt, QObject, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDockWidget, QFileDialog, QLabel, QMainWindow,
-    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+    QCheckBox, QComboBox, QDialog, QDockWidget, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
     QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -64,6 +64,17 @@ def _skipped_text(skipped: list) -> str:
     return "\n".join(f"  - {name}: {reason}" for name, reason in skipped)
 
 
+def recovery_banner_text(interrupted_count: int) -> Optional[str]:
+    """The one-time load-banner message when a prior session left takes interrupted, else
+    None (pure, so it's smoke-testable without a window). Crash recovery is otherwise
+    silent - only log-dock lines and a button in a maybe-closed tab (review UX #3)."""
+    if interrupted_count <= 0:
+        return None
+    n = interrupted_count
+    return (f"Your last session ended while {n} take{'' if n == 1 else 's'} "
+            f"{'was' if n == 1 else 'were'} interrupted - restart them?")
+
+
 class _OrphanReconciler(QObject):
     """Off-thread fetch of ComfyUI /history + /queue for orphan-take recovery.
 
@@ -82,6 +93,40 @@ class _OrphanReconciler(QObject):
         except Exception:  # noqa: BLE001 - unreachable/down server -> recover what we can offline
             hist = queue = None
         self.ready.emit(hist, queue)
+
+
+class _InfoBanner(QFrame):
+    """A dismissable, NON-modal inline notice strip (message + one action + a close x),
+    docked at the top of the Shots tab. Non-modal on purpose: headless smoke must never
+    block on a .exec() (rule #4). Hidden until show_message() arms it; the close x or the
+    action's own handler hides it again."""
+
+    def __init__(self, action_text: str, on_action, parent=None):
+        super().__init__(parent)
+        self.setObjectName("infoBanner")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(
+            "#infoBanner { background: #3a3320; border: 1px solid #6b5d2f; border-radius: 4px; }")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 6, 6, 6)
+        self._label = QLabel()
+        self._label.setWordWrap(True)
+        lay.addWidget(self._label, 1)
+        action_btn = QPushButton(action_text)
+        action_btn.clicked.connect(on_action)
+        lay.addWidget(action_btn)
+        close_btn = QPushButton("✕")   # x
+        close_btn.setObjectName("infoBannerClose")
+        close_btn.setToolTip("Dismiss")
+        close_btn.setFixedWidth(24)
+        close_btn.setFlat(True)
+        close_btn.clicked.connect(self.hide)
+        lay.addWidget(close_btn)
+        self.hide()
+
+    def show_message(self, text: str) -> None:
+        self._label.setText(text)
+        self.show()
 
 
 class MainWindow(QMainWindow):
@@ -108,6 +153,7 @@ class MainWindow(QMainWindow):
         self.reload()
         self._restore_tab_state()   # reopen the tabs this project was last saved with
         self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
+        self._refresh_recovery_banner()   # takes already interrupted on load (recovery is async)
         self._maybe_refresh_schemas_on_startup()
         self._remote = None
         self._maybe_start_remote()   # opt-in localhost control server (ANIMGEN_REMOTE)
@@ -262,6 +308,12 @@ class MainWindow(QMainWindow):
         shots_tab = QWidget()
         shots_layout = QVBoxLayout(shots_tab)
         shots_layout.setContentsMargins(0, 0, 0, 0)
+        # One-time crash-recovery notice (hidden until orphan recovery / load finds interrupted
+        # takes); its action re-fires the same restart path as the Queue tab's button (rule #1
+        # cost gate still applies inside restart_cancelled_takes).
+        self.recovery_banner = _InfoBanner("Restart interrupted takes",
+                                           self._restart_from_banner)
+        shots_layout.addWidget(self.recovery_banner)
         shots_layout.addWidget(self._build_controls())
         shots_layout.addWidget(scroll, 1)
 
@@ -357,7 +409,9 @@ class MainWindow(QMainWindow):
         self.queue_tab.set_project(project)
         self.reload()
         self._restore_tab_state()   # reopen the tabs this project was last saved with
+        self.recovery_banner.hide()   # stale notice from the previous project
         self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
+        self._refresh_recovery_banner()   # takes already interrupted on load (recovery is async)
 
     def _maybe_save_changes(self) -> bool:
         """Prompt before discarding unsaved authoring edits. Return False to abort. Covers
@@ -942,7 +996,26 @@ class MainWindow(QMainWindow):
         removed = self.project.purge_takes(ids)
         self._log(f"removed {removed} cancelled take(s)")
         self.reload()             # rebuilds cards + refreshes the purge/restart action states
+        if self._interrupted_take_count() == 0:
+            self.recovery_banner.hide()   # purged the interrupted takes the banner referred to
         self.queue_tab.refresh()  # drop the purged takes from the Queue tab
+
+    # ---- one-time crash-recovery banner --------------------------------
+    def _refresh_recovery_banner(self) -> None:
+        """Show the load-time banner if a prior session left interrupted takes, else keep it
+        hidden. Called after orphan recovery settles (and once at startup for takes that were
+        already interrupted on load). Not driven from reload(), so a Dismiss stays dismissed."""
+        text = recovery_banner_text(self._interrupted_take_count())
+        if text:
+            self.recovery_banner.show_message(text)
+        else:
+            self.recovery_banner.hide()
+
+    def _restart_from_banner(self) -> None:
+        """The banner's action: run the normal restart (its own cost gate). The banner is not
+        pre-hidden - _restart_takes retires it only once the interrupted takes are actually
+        consumed, so cancelling the cost gate leaves the notice up to try again."""
+        self.restart_cancelled_takes()
 
     # ---- restart interrupted takes -------------------------------------
     def restart_cancelled_takes(self) -> None:
@@ -1008,6 +1081,8 @@ class MainWindow(QMainWindow):
                 f"marked failed:\n\n{detail}")
         self.reload()
         self._refresh_cancel_action()
+        if self._interrupted_take_count() == 0:
+            self.recovery_banner.hide()   # nothing left to restart -> retire the notice
         self.queue_tab.refresh()
 
     def _restart_in_place(self, take) -> None:
@@ -1307,6 +1382,7 @@ class MainWindow(QMainWindow):
             if parts:
                 self._log("orphan recovery: " + "; ".join(parts))
             self._refresh_cancel_action()
+            self._refresh_recovery_banner()   # recovery just produced interrupted takes
             return
         self._execute_plans(recovery.plan_comfy_recovery(orphans, history, queue))
 
@@ -1356,6 +1432,7 @@ class MainWindow(QMainWindow):
         if counts:
             self._log("orphan recovery: " + ", ".join(f"{n} {a}" for a, n in counts.items()))
         self._refresh_cancel_action()
+        self._refresh_recovery_banner()   # recovery may have produced interrupted takes
 
     # ---- export ---------------------------------------------------------
     def export_takes(self, take_ids: list, label: Optional[str] = None) -> None:
