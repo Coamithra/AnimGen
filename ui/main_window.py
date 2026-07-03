@@ -136,6 +136,11 @@ class MainWindow(QMainWindow):
         exp_view = QAction("Export view", self)
         exp_view.triggered.connect(self.export_current_view)
         tb.addAction(exp_view)
+        exp_starred = QAction("Export starred takes", self)
+        exp_starred.setToolTip("Export every starred take across the shots currently shown "
+                               "(obeys the model / starred-shot view filters)")
+        exp_starred.triggered.connect(self.export_starred_takes)
+        tb.addAction(exp_starred)
         batch_act = QAction("Generate batch...", self)
         batch_act.setToolTip("Queue every eligible shot for an unattended (overnight) run, "
                              "with optional power-down when it finishes")
@@ -1381,6 +1386,19 @@ class MainWindow(QMainWindow):
         for card in self.cards.values():
             ids.extend(card._row_export_ids())
         self.export_takes(ids, label="view")
+
+    def export_starred_takes(self) -> None:
+        """Export every starred take across the shots currently shown (obeys the view
+        filters, like Export view). Iterates the displayed cards so the model/starred-shot
+        filters apply, and delegates to the shared export path."""
+        ids = []
+        for shot_id in self.cards:
+            ids.extend(t.id for t in self.project.list_takes(shot_id, starred_only=True))
+        if not ids:
+            QMessageBox.information(self, "Export starred takes",
+                                    "No starred takes in the current view.")
+            return
+        self.export_takes(ids, label="starred")
 
     def _report_export(self, res: dict) -> None:
         parent = res.get("parent")
