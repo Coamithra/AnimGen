@@ -598,18 +598,20 @@ class TakesView(QWidget):
             t = self.project.get_take(tid)
             if not t:
                 continue
-            # Neutralize a non-terminal take BEFORE binning it - a bare move_to_bin only
-            # flips deleted=True, leaving the take in the queue: a PENDING one still fires
-            # the backend (spend/GPU into a binned take) and a GENERATING one keeps billing,
-            # and the queue scans excluded it (include_deleted=False) so it could never be
-            # cancelled/held again. Mirror delete_shot: cancel a queued take, stop a rendering
-            # one (both best-effort - jobs is None in headless tests / plain viewers).
+            # Neutralize a non-terminal take BEFORE binning it (H2) - a bare move_to_bin only
+            # flips deleted=True, leaving the take live in the queue: a PENDING one would still
+            # fire the backend (spend/GPU into a binned take) and a GENERATING one keeps
+            # billing. Mirror delete_shot: cancel a queued take, stop a rendering one. This is
+            # the primary fix; the queue-wide sweeps (cancel_pending/pause_local/abandon_local)
+            # include binned takes only as belt-and-braces. When jobs is None (plain viewers /
+            # headless tests) those sweeps are the only net.
             if self.jobs is not None:
                 if t.status == "pending":
                     self.jobs.cancel_take(tid)
                 elif t.status == "generating":
                     self.jobs.request_stop(tid)
-            takes_io.move_to_bin(self.project.get_take(tid) or t, self.project)
+            # update_take mutates the Take in place, so `t` already reflects the cancel.
+            takes_io.move_to_bin(t, self.project)
         self.load()
         self.changed.emit()
 

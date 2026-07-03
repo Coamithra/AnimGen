@@ -368,7 +368,10 @@ def test_bin_neutralizes_queued_take() -> None:
 
     binned3 = project2.add_take(shot2.id, status=STATUS_PENDING, deleted=True,
                                 settings_snapshot={"backend": "comfyui"})
-    assert jm2.abandon_local("crashed") >= 1              # ... and swept by abandon_local
+    # binned2 is still PENDING (held by the pause above, never resumed), so abandon_local
+    # sweeps exactly binned2 + binned3 - a never-resumed held binned take can't stick either.
+    assert jm2.abandon_local("crashed") == 2
+    assert project2.get_take(binned2.id).status == STATUS_CANCELLED
     assert project2.get_take(binned3.id).status == STATUS_CANCELLED
     print("TakesView bin OK: pending cancelled + generating stopped on bin; scans sweep binned")
 
