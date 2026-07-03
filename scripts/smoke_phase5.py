@@ -674,6 +674,52 @@ def test_generate_picker_keyframe_survives_open_tab() -> None:
     print("MainWindow OK: picker keyframe survives an open tab — snapshot gets it (H3 follow-on)")
 
 
+def test_generate_gate_cancel_refreshes_after_import() -> None:
+    """L11: generating a shot with NO start frame pops a keyframe picker, imports + saves the
+    picked keyframe, THEN shows the cost gate. Cancelling the gate must still leave the UI
+    reflecting the imported keyframe (the project already changed on disk) — not the stale
+    pre-import state. generate_shot reload()s after the import, before the gate, so the shot
+    card is rebuilt with the new start frame regardless of the gate outcome. No take queued."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui import main_window
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p",
+                            crop={"aspect": "16:9", "start": {"scale": 1.0, "cx": 0.5, "cy": 0.5}})
+    project.save_as(Path(tempfile.mkdtemp()) / "l11.animproj")
+    win = MainWindow(project)
+    card_before = win.cards[shot.id]
+    assert card_before.shot.start_frame in (None, ""), "shot starts with no start frame"
+
+    class _Picker:
+        @staticmethod
+        def getOpenFileName(*a, **k):
+            return ("picked.png", "")
+
+    orig_qfd, orig_import = main_window.QFileDialog, project.import_asset
+    orig_confirm, orig_enqueue = main_window.confirm_launch, win.jobs.enqueue
+    main_window.QFileDialog = _Picker
+    project.import_asset = lambda src: Path("picked.png")   # no real file needed
+    main_window.confirm_launch = lambda *a, **k: False        # user CANCELS the cost gate
+    win.jobs.enqueue = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no take may queue"))
+    try:
+        win.generate_shot(shot.id)
+    finally:
+        main_window.QFileDialog, project.import_asset = orig_qfd, orig_import
+        main_window.confirm_launch, win.jobs.enqueue = orig_confirm, orig_enqueue
+
+    assert not project.list_takes(shot.id), "cancelling the gate queues no take"
+    assert project.get_shot(shot.id).start_frame == "picked.png", "the picked keyframe persisted"
+    # The card was rebuilt (reload ran) and now shows the imported start frame, not the stale state.
+    card_after = win.cards[shot.id]
+    assert card_after is not card_before, "generate_shot reload()ed after the import (L11)"
+    assert card_after.shot.start_frame == "picked.png", "the refreshed card reflects the import"
+    print("MainWindow OK: gate-cancel after no-start-frame import still refreshes the card (L11)")
+
+
 def test_batch_gate_matches_snapshot_with_uncommitted_tab() -> None:
     """Card H3 (batch side): start_batch has the identical pre-save/post-gate hazard. It must
     save (flushing open tabs) BEFORE plan_batch + the single cost gate, so the plan/cost the
@@ -1450,6 +1496,244 @@ def test_export_starred_takes() -> None:
     print("export starred takes OK: gathers view's starred takes, excludes deleted, empty->message")
 
 
+def test_save_as_over_neighbour_preserves_doc() -> None:
+    """M1: a Save-As over an OCCUPIED neighbour whose .animproj write SUCCEEDS but whose
+    takes.json write then FAILS must leave the neighbour's .animproj AND sidecar exactly as
+    they were - not paired with THIS project's shots document. Previously only the sidecar was
+    displaced, so the neighbour ended up carrying our doc after the partial-failure rollback."""
+    tmp = Path(tempfile.mkdtemp())
+
+    # A different project already lives at the target: a recognizable .animproj + sidecar.
+    target = tmp / "N.animproj"
+    target_assets = Project._assets_for(target)
+    target_assets.mkdir(parents=True)
+    (target_assets / "NEIGHBOUR.png").write_bytes(b"neighbour asset")
+    (target_assets / "takes.json").write_text('{"version": 1, "takes": []}', encoding="utf-8")
+    neighbour_doc = '{"format": "animgen-project", "version": 1, "name": "Neighbour", "shots": []}'
+    target.write_text(neighbour_doc, encoding="utf-8")
+
+    # Our (already-saved elsewhere) project Save-As'd OVER the neighbour; the doc write lands but
+    # takes.json fails - the exact M1 window.
+    p = Project.new()
+    p.add_shot("mine", model_id="seedance-2.0-std")
+    p.save_as(tmp / "mine.animproj")
+    mine_path = p.path
+
+    def boom_takes(*_a, **_k):
+        raise PermissionError("simulated lock on takes.json")
+    p._write_takes_file = boom_takes
+    try:
+        p.save_as(target)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("save_as must propagate the takes.json failure over an occupied target")
+    finally:
+        del p._write_takes_file
+
+    assert p.path == mine_path, "identity rolled back to our original saved path"
+    assert target.read_text(encoding="utf-8") == neighbour_doc, \
+        "neighbour's .animproj restored verbatim (not clobbered with our shots document)"
+    assert (target_assets / "NEIGHBOUR.png").read_bytes() == b"neighbour asset", \
+        "neighbour's sidecar restored"
+    assert not list(tmp.glob("N.animproj.*.bak")), "the displaced-doc backup was cleaned up"
+    assert not list(tmp.glob("N.assets.*.bak")), "the displaced-sidecar backup was cleaned up"
+
+    # And a CLEAN Save-As over an occupied neighbour commits our doc and drops the .bak.
+    p.save_as(target)
+    assert p.path == target and "mine" in [s.name for s in Project.load(target).list_shots()]
+    assert not list(tmp.glob("N.animproj.*.bak")), "clean overwrite leaves no doc backup"
+    print("Project OK: save_as over a neighbour preserves its .animproj on a takes.json failure (M1)")
+
+
+def test_load_corrupt_takes_json_degrades() -> None:
+    """L2: a corrupt/unreadable takes.json must NOT make the whole project unopenable. Project
+    opens with its shots intact and ZERO takes, warns, and moves the bad file aside (so the
+    first write-through can't clobber whatever might be manually recoverable)."""
+    tmp = Path(tempfile.mkdtemp())
+    path = tmp / "corrupt.animproj"
+    p = Project.new()
+    s = p.add_shot("kick", model_id="seedance-2.0-std")
+    p.add_take(s.id, status=STATUS_DONE)
+    p.save_as(path)
+
+    takes_file = Project._assets_for(path) / "takes.json"
+    assert takes_file.exists()
+    takes_file.write_text("{ this is not json", encoding="utf-8")   # corrupt it
+
+    reopened = Project.load(path)                      # must NOT raise
+    assert reopened.get_shot(s.id) is not None, "shots still load despite corrupt takes.json"
+    assert reopened.list_takes() == [], "degrades to zero takes"
+    baks = list(Project._assets_for(path).glob("takes.json.corrupt.*.bak"))
+    assert len(baks) == 1, "the corrupt file was moved aside, not left in place"
+    assert not takes_file.exists(), "no live takes.json until the next write recreates it"
+    print("Project OK: corrupt takes.json degrades to zero takes + moved aside (L2)")
+
+
+def test_load_orphan_takes_preserved() -> None:
+    """L3: a take whose shot_id matches no shot is PRESERVED on disk (held out of the live
+    view/queue), not permanently dropped - so a write-through can't erase a take whose shot is
+    only transiently missing. Unlike the delete-purge buffer these survive a save() too."""
+    tmp = Path(tempfile.mkdtemp())
+    path = tmp / "orphan.animproj"
+    p = Project.new()
+    s = p.add_shot("kick", model_id="seedance-2.0-std")
+    live = p.add_take(s.id, status=STATUS_DONE, seed=1)
+    p.save_as(path)
+
+    # Hand-edit takes.json to add a take pointing at a shot that isn't in the .animproj.
+    takes_file = Project._assets_for(path) / "takes.json"
+    import json as _json
+    doc = _json.loads(takes_file.read_text(encoding="utf-8"))
+    doc["takes"].append({"id": "orphan1", "shot_id": "ghost-shot", "status": "done", "seed": 42})
+    takes_file.write_text(_json.dumps(doc), encoding="utf-8")
+
+    reopened = Project.load(path)
+    assert {t.id for t in reopened.list_takes()} == {live.id}, "orphan stays OUT of the live view"
+    assert reopened.get_take("orphan1") is None, "orphan not surfaced via get_take"
+
+    # A write-through (a live take update) must NOT erase the orphan from takes.json.
+    reopened.update_take(live.id, starred=True)
+    on_disk = _json.loads(takes_file.read_text(encoding="utf-8"))
+    assert {t["id"] for t in on_disk["takes"]} == {live.id, "orphan1"}, \
+        "orphan preserved on disk through a write-through"
+
+    # And a save() (which purges the delete-buffer) still keeps the orphan.
+    reopened.save()
+    after_save = _json.loads(takes_file.read_text(encoding="utf-8"))
+    assert "orphan1" in {t["id"] for t in after_save["takes"]}, "orphan survives a save() too"
+
+    # An orphan is an INERT record: update_take / purge_takes on it are no-ops (they touch only
+    # _takes / _pending_take_purge), so an orphan can't be resurrected into the live view nor
+    # accidentally dropped from the file by a purge that thinks it removed it.
+    reopened.update_take("orphan1", starred=True)          # no-op (id not in the live/purge dicts)
+    assert reopened.get_take("orphan1") is None, "update_take does not resurrect an orphan"
+    assert reopened.purge_takes(["orphan1"]) == 0, "purge_takes reports nothing removed for an orphan"
+    still = _json.loads(takes_file.read_text(encoding="utf-8"))
+    assert "orphan1" in {t["id"] for t in still["takes"]}, "orphan untouched by update/purge"
+
+    # An orphan whose id COLLIDES with a live take is discarded at load, not merged (a foreign
+    # takes.json id isn't guaranteed uuid4-unique; keeping both would drop one in the 3-way merge).
+    doc2 = _json.loads(takes_file.read_text(encoding="utf-8"))
+    doc2["takes"].append({"id": live.id, "shot_id": "ghost-shot", "status": "done", "seed": 999})
+    takes_file.write_text(_json.dumps(doc2), encoding="utf-8")
+    collided = Project.load(path)
+    live_take = collided.get_take(live.id)
+    assert live_take is not None and live_take.seed != 999, "the live take wins the id collision"
+    assert collided.list_takes()[0].id == live.id
+    print("Project OK: load-time orphan takes preserved (inert) + id-collision discarded (L3)")
+
+
+def test_update_filters_stray_kwargs() -> None:
+    """L4: update_shot / update_take drop any kwarg that isn't a declared dataclass field, so a
+    stray key can't be serialized and then TypeError Shot(**d)/Take(**d) on the next load."""
+    tmp = Path(tempfile.mkdtemp())
+    path = tmp / "kw.animproj"
+    p = Project.new()
+    s = p.add_shot("kick", model_id="seedance-2.0-std")
+    t = p.add_take(s.id, status=STATUS_DONE)
+
+    # A real field is applied; a stray key is dropped (no setattr, not serialized).
+    p.update_shot(s.id, prompt="real", bogus_shot_key="X")
+    p.update_take(t.id, seed=7, bogus_take_key="Y")
+    assert p.get_shot(s.id).prompt == "real"
+    assert p.get_take(t.id).seed == 7
+    assert not hasattr(p.get_shot(s.id), "bogus_shot_key"), "stray shot kwarg not set"
+    assert not hasattr(p.get_take(t.id), "bogus_take_key"), "stray take kwarg not set"
+
+    # The stray keys never reach disk, so a reload succeeds (would TypeError if they did).
+    p.save_as(path)
+    reopened = Project.load(path)                      # must NOT raise
+    assert reopened.get_shot(s.id).prompt == "real" and reopened.get_take(t.id).seed == 7
+    print("Project OK: update_shot/update_take filter stray kwargs against dataclass fields (L4)")
+
+
+def test_atomic_write_no_tmp_leak_and_import_rejects_nonimage() -> None:
+    """L19: _atomic_write_json finally-unlinks its tmp on a non-PermissionError failure (no
+    orphan *.tmp beside the target); import_asset rejects a non-image source."""
+    from store import project as proj_mod
+
+    tmp = Path(tempfile.mkdtemp())
+    target = tmp / "out.json"
+
+    # A json.dumps failure (unserializable value) must not leave a *.tmp behind.
+    class _Unserializable:
+        pass
+    try:
+        proj_mod._atomic_write_json(target, {"bad": _Unserializable()})
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("_atomic_write_json must propagate the serialization error")
+    assert not list(tmp.glob("out.json.*.tmp")), "no leaked tmp on a serialization failure"
+
+    # A normal write leaves no tmp either (success path consumes it).
+    proj_mod._atomic_write_json(target, {"ok": 1})
+    assert target.exists() and not list(tmp.glob("out.json.*.tmp")), "no tmp after a clean write"
+
+    # import_asset rejects a non-image source (would be invisible to list_assets otherwise).
+    p = Project.new()
+    txt = tmp / "notes.txt"
+    txt.write_text("not an image", encoding="utf-8")
+    try:
+        p.import_asset(txt)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("import_asset must reject a non-image file")
+    assert p.list_assets() == [], "no cruft left in .assets/ from the rejected import"
+
+    # An actual image imports fine and shows up.
+    png = tmp / "kf.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    imported = p.import_asset(png)
+    assert imported.suffix == ".png" and imported in p.list_assets()
+    print("Project OK: _atomic_write_json no tmp leak + import_asset rejects non-image (L19)")
+
+
+def test_list_reads_snapshot_under_lock() -> None:
+    """M12: list_takes / list_shots snapshot under the RLock, so a concurrent mutation resizing
+    the dict mid-iteration can't raise 'dictionary changed size during iteration'. Hammer the
+    read paths on one thread while another thread churns add/delete."""
+    import threading as _threading
+
+    p = Project.new()
+    s = p.add_shot("kick", model_id="seedance-2.0-std")
+    for _ in range(50):
+        p.add_take(s.id, status=STATUS_DONE)
+
+    errors: list = []
+    stop = _threading.Event()
+
+    def churn():
+        while not stop.is_set():
+            extra = p.add_shot("tmp", model_id="seedance-2.0-std")
+            t = p.add_take(extra.id, status=STATUS_DONE)
+            p.purge_takes([t.id])
+            p.delete_shot(extra.id)
+
+    def reader():
+        try:
+            for _ in range(2000):
+                p.list_takes()
+                p.list_shots()
+                p.used_model_ids()
+        except Exception as e:  # noqa: BLE001 - any RuntimeError here is the M12 bug
+            errors.append(e)
+
+    churner = _threading.Thread(target=churn)
+    readers = [_threading.Thread(target=reader) for _ in range(3)]
+    churner.start()
+    for r in readers:
+        r.start()
+    for r in readers:
+        r.join()
+    stop.set()
+    churner.join()
+    assert not errors, f"concurrent read raised: {errors[:3]}"
+    print("Project OK: list_takes/list_shots snapshot under the lock, no resize-race (M12)")
+
+
 def test_shot_tab_missing_model_commit_and_generate() -> None:
     """Card M9: loading a shot whose model_id left the roster must NOT silently rewrite it.
     commit() round-trips the stored id unchanged (was: snapped to the first roster model), the
@@ -1496,7 +1780,196 @@ def test_shot_tab_missing_model_commit_and_generate() -> None:
     print("shot-tab missing-model OK: commit round-trips off-roster id, Generate blocked, real pick unblocks")
 
 
+def test_guarded_emit_and_daemon_workers() -> None:
+    """The shared qt_guard.guarded_emit helper (card #48 / Wave3 G) must drop a signal whose
+    C++ source was deleted instead of raising RuntimeError('Signal source has been deleted') -
+    an unguarded emit from a daemon thread invoked out of C++ aborts the process. Covers the
+    helper directly (live emit works, dead-source emit no-ops) and each of the four remaining
+    daemon-thread workers routed through it (_StripLoader / _FrameLoader / _GifExporter /
+    _OrphanReconciler); jobs.GenerationJob and _ReplicateRefresher are covered by their own
+    tests above."""
+    import shiboken6
+    from PySide6.QtCore import QObject, Signal
+    from PySide6.QtWidgets import QApplication
+
+    from qt_guard import guarded_emit
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    class _Probe(QObject):
+        fired = Signal(int)
+
+    # (a) live source: the signal reaches a connected slot.
+    got = []
+    live = _Probe()
+    live.fired.connect(lambda v: got.append(v))
+    guarded_emit(live, "fired", 7)
+    app.processEvents()
+    assert got == [7], got
+
+    # (b) dead source: the C++ half is gone -> the emit must silently no-op, not raise.
+    dead = _Probe()
+    shiboken6.delete(dead)
+    assert not shiboken6.isValid(dead)
+    guarded_emit(dead, "fired", 1)   # must NOT raise
+
+    # (c) each daemon worker's _run must survive its own emit hitting a dead source.
+    from ui.takes_view import _StripLoader
+    from ui.take_player import _FrameLoader, _GifExporter
+    from ui.main_window import _OrphanReconciler
+    from backends import comfy_client
+
+    # _StripLoader only emits when a clip actually decodes, so feed a real one: a dead source
+    # is then reached on the guarded `ready` emit (a bad clip would skip the emit entirely).
+    with tempfile.TemporaryDirectory() as td:
+        clip = _make_mp4(Path(td) / "strip.mp4", n=3)
+        strip = _StripLoader([("t1", str(clip))], gen=0)
+        shiboken6.delete(strip)
+        strip._run()                 # decodes -> guarded_emit(self, "ready", ...) on a dead source
+
+    frame = _FrameLoader("does-not-exist.mp4")
+    shiboken6.delete(frame)
+    frame._run()                     # decode raises -> the except-branch failed emit hits a dead source
+
+    gif = _GifExporter("does-not-exist.mp4", str(Path(tempfile.gettempdir()) / "x.gif"))
+    shiboken6.delete(gif)
+    gif._run()                       # encode raises -> the except-branch failed emit hits a dead source
+
+    # _OrphanReconciler: force the fetch to raise so _run reaches its (guarded) ready emit fast.
+    saved = (comfy_client.history_view, comfy_client.queue_view)
+    comfy_client.history_view = lambda timeout=4: (_ for _ in ()).throw(OSError("down"))
+    comfy_client.queue_view = lambda timeout=4: None
+    try:
+        orphan = _OrphanReconciler()
+        shiboken6.delete(orphan)
+        orphan._run()                # ready emit on a dead source must no-op
+    finally:
+        (comfy_client.history_view, comfy_client.queue_view) = saved
+
+    print("qt_guard OK: guarded_emit drops dead-source signals; daemon workers survive teardown")
+
+
+def test_delete_shot_closes_take_tab() -> None:
+    """M10: deleting a shot with an open take-viewer tab must close that tab (drop it from
+    take_tabs) so it can't dangle on a removed take, and so the next save doesn't capture a
+    dead 'take' descriptor into ui_state. Mirrors remove_cancelled_takes, which already does
+    this before purge_takes."""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from ui import main_window
+    from ui.main_window import MainWindow
+    from ui.take_player import TakePlayerTab
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    path = Path(tempfile.mkdtemp()) / "del.animproj"
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_DONE)   # no video -> no decode thread
+    project.save_as(path)
+
+    win = MainWindow(project)
+    win.open_take(take.id)
+    assert take.id in win.take_tabs and isinstance(win.take_tabs[take.id], TakePlayerTab)
+    # Capture the layout WITH the take tab open, proving a stale descriptor would land in ui_state.
+    assert win.save_project()
+    kinds = {(d.get("kind"), d.get("id")) for d in (project.ui_state.get("tabs") or [])}
+    assert ("take", take.id) in kinds, "the open take tab is captured into ui_state pre-delete"
+
+    orig_question = main_window.QMessageBox.question
+    main_window.QMessageBox.question = lambda *_a, **_k: QMessageBox.StandardButton.Yes
+    try:
+        win.delete_shot(shot.id)
+    finally:
+        main_window.QMessageBox.question = orig_question
+
+    assert take.id not in win.take_tabs, "delete_shot closed the dangling take-viewer tab"
+    assert not any(isinstance(win.tabs.widget(i), TakePlayerTab) for i in range(win.tabs.count())), \
+        "no TakePlayerTab widget survives the shot delete"
+    # The next save must not record the removed take's descriptor.
+    assert win.save_project()
+    kinds = {(d.get("kind"), d.get("id")) for d in (project.ui_state.get("tabs") or [])}
+    assert ("take", take.id) not in kinds, "ui_state carries no dead take descriptor after delete"
+    print("MainWindow OK: delete_shot closes open take tab, no dead ui_state descriptor (M10)")
+
+
+def test_take_viewer_refreshes_on_status(tmp_mp4: Path) -> None:
+    """L6: a take viewer opened while its take is still generating must catch up when the take
+    finishes. _refresh_shot_for_take (the status_changed / finished fan-out) now reaches open
+    take_tabs, and the player's cheap refresh_status() decodes the video once it appears."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from ui.take_player import TakePlayerTab
+    from store.models import STATUS_GENERATING
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_GENERATING)   # no video yet -> no decode
+    project.save_as(Path(tempfile.mkdtemp()) / "viewer.animproj")
+
+    win = MainWindow(project)
+    win.open_take(take.id)
+    viewer = win.take_tabs[take.id]
+    assert isinstance(viewer, TakePlayerTab)
+    assert not viewer._frames and viewer._loader is None, "a still-generating take decodes nothing"
+
+    # The fan-out reaches the open viewer: record that refresh_status was invoked for this take.
+    called = {"n": 0}
+    orig = TakePlayerTab.refresh_status
+    TakePlayerTab.refresh_status = lambda self: (called.__setitem__("n", called["n"] + 1),
+                                                 orig(self))[1]  # type: ignore[assignment]
+    try:
+        # The take finishes: a real video lands and the status flips.
+        project.update_take(take.id, status=STATUS_DONE, video_path=str(tmp_mp4))
+        win._refresh_shot_for_take(take.id)
+    finally:
+        TakePlayerTab.refresh_status = orig  # type: ignore[assignment]
+    assert called["n"] == 1, "_refresh_shot_for_take fans out to the open take viewer (L6)"
+    # refresh_status kicked off a decode of the now-present video (loader created, not None).
+    assert viewer._loader is not None, "refresh_status started decoding the finished take's video"
+
+    # Idempotent: a second status signal on an already-decoding viewer must not restart the load.
+    loader = viewer._loader
+    viewer.refresh_status()
+    assert viewer._loader is loader, "refresh_status no-ops once a decode is under way"
+    print("MainWindow OK: take viewer refreshes when its take finishes (L6)")
+
+
+def test_purge_cancelled_action_live_on_cancel() -> None:
+    """L12: the Edit-menu 'Remove cancelled takes' action enables on a queue status change,
+    not only on reload(). Cancelling a pending take (which fires status_changed CANCELLED)
+    must flip the action live, without any intervening reload()."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.main_window import MainWindow
+    from store.models import STATUS_CANCELLED
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_PENDING)   # a queued-but-unstarted take
+    project.save_as(Path(tempfile.mkdtemp()) / "cancel.animproj")
+
+    win = MainWindow(project)
+    assert not win.purge_cancelled_act.isEnabled(), "no cancelled takes yet -> action disabled"
+
+    # cancel_pending marks the pending take CANCELLED and emits status_changed inline, which
+    # _on_status_changed handles -> the purge action must be live WITHOUT a reload.
+    win.cancel_pending()
+    assert project.get_take(take.id).status == STATUS_CANCELLED, "take was cancelled"
+    assert win.purge_cancelled_act.isEnabled(), \
+        "'Remove cancelled takes' enabled live on the cancel, no reload needed (L12)"
+    print("MainWindow OK: purge-cancelled action enables on queue status change (L12)")
+
+
 if __name__ == "__main__":
+    test_save_as_over_neighbour_preserves_doc()
+    test_load_corrupt_takes_json_degrades()
+    test_load_orphan_takes_preserved()
+    test_update_filters_stray_kwargs()
+    test_atomic_write_no_tmp_leak_and_import_rejects_nonimage()
+    test_list_reads_snapshot_under_lock()
     test_export()
     test_take_media_probe()
     test_extract_frames_wide_padding()
@@ -1511,6 +1984,7 @@ if __name__ == "__main__":
     test_snapshot_includes_framing()
     test_generate_gate_matches_snapshot_with_uncommitted_tab()
     test_generate_picker_keyframe_survives_open_tab()
+    test_generate_gate_cancel_refreshes_after_import()
     test_batch_gate_matches_snapshot_with_uncommitted_tab()
     test_generate_shot_missing_shot()
     test_take_player_settings_panel()
@@ -1520,8 +1994,12 @@ if __name__ == "__main__":
     test_runner_self_cancel_during_submit()
     test_run_survives_deleted_signals()
     test_refresher_survives_deleted_signals()
+    test_guarded_emit_and_daemon_workers()
     test_save_as_rollback_on_write_failure()
     test_delete_shot_discard_preserves_takes()
+    test_delete_shot_closes_take_tab()
+    test_take_viewer_refreshes_on_status(_make_mp4(Path(tempfile.mkdtemp()) / "l6.mp4"))
+    test_purge_cancelled_action_live_on_cancel()
     test_export_starred_takes()
     test_shot_tab_missing_model_commit_and_generate()
     print("PHASE 5 SMOKE: PASS")

@@ -10,10 +10,12 @@ dir (LoadImage reads from there). dry_run prepares the workflow WITHOUT submitti
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -53,6 +55,39 @@ def _log(cb: ProgressCb, msg: str) -> None:
         cb(msg)
 
 
+def _http_error_detail(e: "urllib.error.HTTPError") -> str:
+    """Best-effort node-level error text pulled from a ComfyUI HTTP error body.
+
+    A /prompt validation failure (invalid workflow / missing model file) is a 400 whose
+    body carries {error, node_errors}; surfacing that beats the generic 'unreachable'
+    message, which used to swallow it (HTTPError is a URLError subclass). Falls back to a
+    truncated raw body, then to just the status line, if the body isn't the expected JSON.
+    """
+    try:
+        raw = e.read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - the body may already be consumed / unreadable
+        raw = ""
+    if not raw.strip():
+        return str(e.reason or e)     # empty/unreadable body: at least the status text
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw.strip()[:1500]
+    if isinstance(payload, dict):
+        parts = []
+        err = payload.get("error")
+        if isinstance(err, dict):
+            parts.append(str(err.get("message") or err.get("type") or err))
+        elif err:
+            parts.append(str(err))
+        node_errors = payload.get("node_errors")
+        if node_errors:
+            parts.append(f"node_errors: {json.dumps(node_errors)[:1000]}")
+        if parts:
+            return " | ".join(parts)
+    return json.dumps(payload)[:1500]
+
+
 def _api(path: str, data=None, timeout: int = 30) -> dict:
     req = urllib.request.Request(COMFY_URL + path)
     if data is not None:
@@ -61,8 +96,15 @@ def _api(path: str, data=None, timeout: int = 30) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
+    except urllib.error.HTTPError as e:  # a real HTTP response (4xx/5xx), NOT unreachable
+        raise ComfyError(f"ComfyUI HTTP {e.code} on {path}: {_http_error_detail(e)}") from e
     except urllib.error.URLError as e:  # type: ignore[name-defined]
         raise ComfyError(f"ComfyUI unreachable at {COMFY_URL} ({e}). Is it running?") from e
+    except socket.timeout as e:  # read timed out mid-body (server alive but stalled)
+        raise ComfyError(f"ComfyUI timed out on {path} after {timeout}s. "
+                         "It may be busy loading weights.") from e
+    except (json.JSONDecodeError, ValueError) as e:  # truncated / non-JSON body
+        raise ComfyError(f"ComfyUI returned a malformed response on {path} ({e}).") from e
 
 
 # Dynamic VRAM (ComfyUI's comfy-aimdo engine, default-ON) streams model weights
@@ -380,8 +422,13 @@ def restart_server(progress_cb: ProgressCb = None, ready_timeout_s: int = 120,
     _log(progress_cb, "comfy crash detected - restarting ComfyUI")
     try:
         stop_server()                 # kill our proc or whatever holds the port; ok if down
-    except ComfyError:
-        pass
+    except (ComfyError, subprocess.SubprocessError, OSError) as e:
+        # A transient taskkill stall (subprocess.TimeoutExpired) or an OS-level kill error
+        # must NOT abandon the whole local queue (L9): the relaunch below rebinds the port
+        # regardless, and a truly stuck old process fails fast via the is_alive watch. Only
+        # ComfyError was swallowed before, so a TimeoutExpired escaped and read as
+        # 'restart failed'. Log and continue to the relaunch.
+        _log(progress_cb, f"stop before restart failed (continuing to relaunch): {e}")
     if settle_s > 0:
         time.sleep(settle_s)          # let the OS release the port before we rebind it
     proc = launch_server()            # detached, with --disable-dynamic-vram --cache-none
@@ -486,11 +533,27 @@ def _post(path: str, data: Optional[dict] = None, timeout: int = 5) -> None:
         raise ComfyError(f"ComfyUI POST {path} failed ({e}). Is it running?") from e
 
 
-def stop_work(timeout: int = 5) -> None:
-    """Cancel current ComfyUI work without shutting the server down: wipe the pending
-    queue, then interrupt the running prompt. Raises ComfyError if the server is down."""
-    _post("/queue", {"clear": True}, timeout=timeout)   # drop anything not yet started
-    _post("/interrupt", {}, timeout=timeout)            # stop the one in progress
+def stop_work(prompt_id: Optional[str] = None, timeout: int = 5) -> None:
+    """Cancel ComfyUI work without shutting the server down: drop our pending prompt (or,
+    with no id, the whole queue), then interrupt the running one. Raises ComfyError if the
+    server is down.
+
+    When `prompt_id` is given, only THAT prompt is dropped from the pending queue
+    (POST /queue {delete: [id]}) - not the whole queue. Clearing the entire queue
+    (`clear: True`) deleted foreign prompts (other tools sharing the server) AND left our
+    own cleared prompt without a /history entry, so the take sat GENERATING for the full 1h
+    timeout occupying the serialized local slot (L8). Falling back to `clear: True` only when
+    we don't know the prompt id preserves the old blanket behaviour for callers that can't
+    target (e.g. a manual Stop-work with nothing tracked).
+
+    /interrupt is still global (ComfyUI has no per-prompt interrupt), but on our serialized
+    local queue only our prompt is ever running, so interrupting stops just our render.
+    """
+    if prompt_id:
+        _post("/queue", {"delete": [prompt_id]}, timeout=timeout)  # drop just our pending prompt
+    else:
+        _post("/queue", {"clear": True}, timeout=timeout)          # no id: drop everything pending
+    _post("/interrupt", {}, timeout=timeout)                       # stop the one in progress
 
 
 def stop_server(timeout: int = 10) -> None:
@@ -555,15 +618,29 @@ def _kill_pid(pid: int, timeout: int = 10) -> None:
 
 
 def copy_input_image(path: str | Path) -> str:
-    """Copy a keypose into ComfyUI/input/ so LoadImage can read it. Returns basename."""
+    """Copy a keypose into ComfyUI/input/ so LoadImage can read it. Returns basename.
+
+    The destination is named by the file's CONTENT hash (kp_<sha1>.<ext>), not its source
+    name. Every local keypose used to be called start.png/end.png, so distinct framings all
+    contested the same ComfyUI/input/ slot and the only staleness guard was equal byte size -
+    two framings that compressed to the same size would silently render the first one's image
+    (M8). A content-derived name gives each distinct image its own stable slot: two renders of
+    the same bytes reuse one file (cheap, correct dedupe), two different images never collide.
+    """
     path = Path(path)
     if not path.exists():
         raise ComfyError(f"Keypose not found: {path}")
+    data = path.read_bytes()
+    digest = hashlib.sha1(data).hexdigest()
+    ext = path.suffix.lower() or ".png"
+    name = f"kp_{digest}{ext}"
     COMFY_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    dest = COMFY_INPUT_DIR / path.name
-    if not (dest.exists() and dest.stat().st_size == path.stat().st_size):
-        shutil.copy2(path, dest)
-    return path.name
+    dest = COMFY_INPUT_DIR / name
+    # Same content hash + same size => already the right bytes; only rewrite on a size mismatch
+    # (a truncated/partial prior copy), which a hash collision would never otherwise reach.
+    if not (dest.exists() and dest.stat().st_size == len(data)):
+        dest.write_bytes(data)
+    return name
 
 
 def _nodes_by_class(wf: dict, class_type: str) -> list[str]:
@@ -947,11 +1024,27 @@ def _entry_outputs(entry: dict) -> list[Path]:
 
 
 def _claim_output(produced: list[Path], out_path: Path) -> dict:
-    """Copy the last produced file to out_path and return the take-result dict."""
-    if produced:
-        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(produced[-1], out_path)
+    """Copy the last produced file to out_path and return the take-result dict.
+
+    Raises ComfyError if `produced` is empty: a /history entry can report outputs under
+    only unrecognized keys (none of images/video/videos/gifs), which would otherwise yield a
+    DONE take pointing at an out_path that was never written (L10). No file = not a success.
+    """
+    if not produced:
+        raise ComfyError("ComfyUI reported outputs but none were a recognized media file "
+                         "(images/video/videos/gifs) - nothing to claim.")
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(produced[-1], out_path)
     return {"video_path": str(out_path), "produced": [str(p) for p in produced]}
+
+
+# A single failed /history poll is NOT fatal: a busy ComfyUI can block its HTTP thread past
+# the socket timeout while loading 14B weights, and a 1h render polls ~720 times. Tolerate a
+# short run of consecutive poll failures (with a brief backoff) before giving up, so one
+# transient stall doesn't raise out of the runner and get misread as a crash / lose an hour
+# of GPU work. A poll that SUCCEEDS resets the streak; only a sustained outage is fatal.
+_POLL_MAX_CONSECUTIVE_FAILURES = 6
+_POLL_FAILURE_BACKOFF_S = 5
 
 
 def _poll_until_done(pid: str, out_path: Path, progress_cb: ProgressCb,
@@ -960,11 +1053,38 @@ def _poll_until_done(pid: str, out_path: Path, progress_cb: ProgressCb,
 
     Shared by submit() (which queues first) and monitor() (which re-attaches to a
     prompt some earlier, now-dead worker queued). Raises ComfyError on failure.
+
+    A transient poll failure (server briefly unreachable / a read timeout while it loads
+    weights) is tolerated: it's retried with a short backoff up to
+    _POLL_MAX_CONSECUTIVE_FAILURES in a row before the last error is re-raised. This keeps a
+    momentary HTTP stall from failing the whole render (M4).
     """
     t0 = time.time()
+    fails = 0
     while True:
         time.sleep(poll_s)
-        hist = _api(f"/history/{pid}")
+        try:
+            hist = _api(f"/history/{pid}")
+            fails = 0
+        except ComfyError as e:
+            # Deliberate: ANY poll error counts toward the streak, including a wrapped 4xx.
+            # Real ComfyUI answers /history/{unknown pid} with 200 {} (never 404), so a
+            # sustained HTTP error here is a genuinely broken server, and failing after the
+            # streak beats waiting out the full 1h. Trade-off: a real crash (server gone) is
+            # also retried, so crash recovery sees the failure up to
+            # ~MAX_CONSECUTIVE_FAILURES * BACKOFF (~30s) late - accepted, transient stalls
+            # are far more common than crashes and the recovery path is unchanged after.
+            fails += 1
+            if fails >= _POLL_MAX_CONSECUTIVE_FAILURES:
+                raise ComfyError(f"lost contact with ComfyUI while polling {pid} "
+                                 f"({fails} consecutive failures): {e}") from e
+            _log(progress_cb, f"poll stalled ({fails}/{_POLL_MAX_CONSECUTIVE_FAILURES}), "
+                              f"retrying: {e}")
+            # +backoff so the sleep below can't push total runtime past timeout_s
+            if time.time() - t0 + _POLL_FAILURE_BACKOFF_S > timeout_s:
+                raise ComfyError("timed out after 1h") from e
+            time.sleep(_POLL_FAILURE_BACKOFF_S)
+            continue
         if pid in hist:
             entry = hist[pid]
             status = entry.get("status", {})
