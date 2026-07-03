@@ -446,6 +446,106 @@ def test_http_error_handling() -> None:
     print("replicate_client OK: humanized HTTP errors + transient 504/429 retry, 402 fails fast")
 
 
+def test_network_error_retry() -> None:
+    """A bare network blip (URLError / read TimeoutError) mid-request is folded into the same
+    backoff loop as a transient 5xx - but ONLY for idempotent GET polls. A non-idempotent POST
+    (create prediction / file upload) is NOT retried (that would risk a double-create, finding
+    M2); it wraps the raw error in ReplicateError on the first blip. On final give-up an
+    idempotent GET wraps too. No real network (urlopen + sleep are stubbed)."""
+    import socket
+    import urllib.error
+
+    from backends import replicate_client as rc
+
+    # Pure predicate: GET (no body, no explicit method) is idempotent; a POST body or an
+    # explicit non-GET method is not.
+    assert rc._is_idempotent(None, None) is True                       # plain GET poll
+    assert rc._is_idempotent("GET", None) is True                      # explicit GET
+    assert rc._is_idempotent(None, b'{"input": {}}') is False          # create POST (has a body)
+    assert rc._is_idempotent("POST", None) is False                    # cancel POST (explicit)
+    # Pure formatter: names the endpoint + the transport reason, no HTTP code.
+    nmsg = rc._network_error_message("https://api.replicate.com/v1/predictions/abc",
+                                     urllib.error.URLError("connection reset by peer"))
+    assert "Network error" in nmsg and "predictions/abc" in nmsg and "connection reset" in nmsg, nmsg
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"ok": true}'
+
+    saved_open, saved_sleep = rc.urllib.request.urlopen, rc.time.sleep
+    rc.time.sleep = lambda *_: None
+    try:
+        # (a) an idempotent GET (a poll: no body, no method) retries a URLError, then recovers.
+        calls = {"n": 0}
+        def flaky_get(req, timeout=0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise urllib.error.URLError("connection reset by peer")   # transient blip
+            return _Resp()
+        rc.urllib.request.urlopen = flaky_get
+        out = rc.api_request("tok", "https://api.replicate.com/v1/predictions/abc")
+        assert out == {"ok": True} and calls["n"] == 2, (out, calls)      # retried once, then ok
+
+        # (b) a read TimeoutError on a GET is also transient and retried.
+        calls["n"] = 0
+        def flaky_timeout(req, timeout=0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("read timed out")
+            return _Resp()
+        rc.urllib.request.urlopen = flaky_timeout
+        assert rc.api_request("tok", "https://api.replicate.com/v1/x") == {"ok": True}
+        assert calls["n"] == 2, calls
+
+        # (c) a NON-idempotent create POST (payload => body) is NOT retried - it wraps on the
+        # first network error, so a double-create can't happen (M2 caution).
+        calls["n"] = 0
+        def always_reset(req, timeout=0):
+            calls["n"] += 1
+            raise urllib.error.URLError("connection reset by peer")
+        rc.urllib.request.urlopen = always_reset
+        try:
+            rc.api_request("tok", "https://api.replicate.com/v1/models/m/predictions",
+                           payload={"input": {}})
+            raise AssertionError("expected ReplicateError on a create-POST network blip")
+        except rc.ReplicateError as e:
+            assert "Network error" in str(e), str(e)
+            assert calls["n"] == 1, calls                                 # NOT retried
+
+        # (d) an idempotent GET that keeps failing eventually gives up - wrapped, all attempts used.
+        calls["n"] = 0
+        rc.urllib.request.urlopen = always_reset
+        try:
+            rc.api_request("tok", "https://api.replicate.com/v1/predictions/abc")
+            raise AssertionError("expected ReplicateError after exhausting GET retries")
+        except rc.ReplicateError as e:
+            assert "Network error" in str(e), str(e)
+            assert calls["n"] == 8, calls                                 # 8 attempts, then give up
+
+        # (e) the result download retries a network blip on the (idempotent) fetch, then succeeds.
+        import tempfile
+        from pathlib import Path
+        calls["n"] = 0
+        class _Bytes:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b"VIDEO-BYTES"
+        def flaky_download(req, timeout=0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise socket.timeout("timed out")
+            return _Bytes()
+        rc.urllib.request.urlopen = flaky_download
+        with tempfile.TemporaryDirectory() as td:
+            out_path = Path(td) / "v.mp4"
+            rc._download_result("https://replicate.delivery/v.mp4", "tok", out_path)
+            assert out_path.read_bytes() == b"VIDEO-BYTES" and calls["n"] == 2, calls
+    finally:
+        rc.urllib.request.urlopen, rc.time.sleep = saved_open, saved_sleep
+    print("replicate_client OK: network blips retried on idempotent GET + download, not on create POST")
+
+
 def test_data_uri_fit() -> None:
     """For requires_data_uri models (vidu/q3-pro) an oversized input is auto-shrunk under the
     ~256KB base64 cap instead of being refused; a small image passes through untouched; the
@@ -589,6 +689,7 @@ if __name__ == "__main__":
     test_keypose_migration_persist_failure()
     test_output_url_parsing()
     test_http_error_handling()
+    test_network_error_retry()
     test_data_uri_fit()
     test_purge_takes()
     test_remove_cancelled_takes_action()
