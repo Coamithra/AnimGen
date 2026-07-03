@@ -310,7 +310,7 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
    makes the snapshot coherent (card H3):** `generate_shot` and `start_batch` call
    `save_project()` (which `_commit_open_shot_tabs()` flushes every open shot-tab editor into
    the buffer, mutating the live Shot in place) BEFORE they read model/settings/est, show the
-   cost gate, and freeze the snapshot -- so the gate confirms exactly what renders (rule #1) and
+   cost gate, and freeze the snapshot — so the gate confirms exactly what renders (rule #1) and
    the snapshot can't mix pre-commit backend/replicate-id/settings with post-commit
    prompt/crop/frames. Keep the save FIRST; don't reintroduce a compute-then-save order. The
    ShotTab-Generate path already `commit()`s its own tab first (`shot_tab._generate`), but the

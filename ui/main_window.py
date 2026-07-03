@@ -647,8 +647,8 @@ class MainWindow(QMainWindow):
         self.reload()
 
     def generate_shot(self, shot_id: str) -> None:
-        shot = self.project.get_shot(shot_id)
-        if not shot:
+        if not self.project.get_shot(shot_id):
+            # Existence probe only (the real fetch happens after the save below).
             # generate_requested is a queued signal; the shot can be deleted between the
             # emit and this slot running (benign double-click / stale-tab race). Guard the
             # deref like open_shot/toggle_shot_star/delete_shot do, plus a log line since a
@@ -687,10 +687,12 @@ class MainWindow(QMainWindow):
             if not start:
                 return
             self.project.update_shot(shot.id, start_frame=str(self.project.import_asset(start)))
-            # Re-persist so the picked keyframe is committed before the take snapshots it.
-            if not self.save_project():
-                self._log("generation cancelled (project not saved)")
-                return
+            # Persist the picked keyframe DIRECTLY (project.save(), not save_project()): the
+            # project is titled by now (the save above succeeded), and save_project()'s
+            # _commit_open_shot_tabs() would re-commit this shot's open tab — whose editor
+            # still has no start frame — reverting the keyframe we just picked before the
+            # snapshot freezes it.
+            self.project.save()
             shot = self.project.get_shot(shot_id)
             if not shot:
                 self._log("generate ignored: shot deleted while picking a keyframe")

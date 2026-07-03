@@ -608,6 +608,51 @@ def test_generate_gate_matches_snapshot_with_uncommitted_tab() -> None:
     print("MainWindow OK: generate_shot commits open tabs before the gate — gate == snapshot (H3)")
 
 
+def test_generate_picker_keyframe_survives_open_tab() -> None:
+    """Card H3 follow-on: when a shot with NO start frame is generated from its card while
+    its own tab is OPEN, the picker-set keyframe must survive to the gate + snapshot. The
+    picker edit is persisted via project.save() directly — save_project() would re-run
+    _commit_open_shot_tabs(), and this shot's open tab (whose editor still has no start
+    frame) would commit over the buffer and revert the just-picked keyframe."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui import main_window
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std", prompt="p",
+                            settings={"seed": 5},
+                            crop={"aspect": "16:9", "start": {"scale": 1.0, "cx": 0.5, "cy": 0.5}})
+    project.save_as(Path(tempfile.mkdtemp()) / "p.animproj")
+    win = MainWindow(project)
+    win.open_shot(shot.id)   # the shot's own tab is open, editor has no start frame
+
+    class _Picker:
+        @staticmethod
+        def getOpenFileName(*a, **k):
+            return ("picked.png", "")
+
+    orig_qfd, orig_import = main_window.QFileDialog, project.import_asset
+    orig_confirm, orig_enqueue = main_window.confirm_launch, win.jobs.enqueue
+    main_window.QFileDialog = _Picker
+    project.import_asset = lambda src: Path("picked.png")   # no real file needed
+    main_window.confirm_launch = lambda *a, **k: True
+    win.jobs.enqueue = lambda *a, **k: None
+    try:
+        win.generate_shot(shot.id)
+    finally:
+        main_window.QFileDialog, project.import_asset = orig_qfd, orig_import
+        main_window.confirm_launch, win.jobs.enqueue = orig_confirm, orig_enqueue
+
+    takes = project.list_takes(shot.id)
+    assert takes, "the take was queued"
+    snap = takes[-1].settings_snapshot
+    assert snap["start_frame"] == "picked.png", snap.get("start_frame")
+    assert project.get_shot(shot.id).start_frame == "picked.png", "picked keyframe persisted"
+    print("MainWindow OK: picker keyframe survives an open tab — snapshot gets it (H3 follow-on)")
+
+
 def test_batch_gate_matches_snapshot_with_uncommitted_tab() -> None:
     """Card H3 (batch side): start_batch has the identical pre-save/post-gate hazard. It must
     save (flushing open tabs) BEFORE plan_batch + the single cost gate, so the plan/cost the
@@ -1215,6 +1260,7 @@ if __name__ == "__main__":
     test_take_player_failure_message()
     test_snapshot_includes_framing()
     test_generate_gate_matches_snapshot_with_uncommitted_tab()
+    test_generate_picker_keyframe_survives_open_tab()
     test_batch_gate_matches_snapshot_with_uncommitted_tab()
     test_generate_shot_missing_shot()
     test_take_player_settings_panel()
