@@ -376,6 +376,46 @@ def test_bin_neutralizes_queued_take() -> None:
     print("TakesView bin OK: pending cancelled + generating stopped on bin; scans sweep binned")
 
 
+def test_takes_view_stop_rendering_menu() -> None:
+    """The takes-grid right-click menu (no exec()) offers 'Stop rendering' for a GENERATING take
+    when a JobManager is wired in, routing to request_stop so spend/GPU halts in place (UX1). A
+    non-generating take (or a view with no jobs) offers no such entry."""
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+    from ui.takes_view import TakesView
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    jm = JobManager(project)
+    g = project.add_take(shot.id, status=STATUS_GENERATING,
+                         settings_snapshot={"backend": "replicate"})
+    d = project.add_take(shot.id, status=STATUS_DONE)
+
+    tv = TakesView(project, shot.id, jobs=jm)
+    # A GENERATING take offers Stop rendering.
+    assert "Stop rendering" in [a.text() for a in tv._build_context_menu([g.id]).actions()]
+    # A DONE take does not.
+    assert "Stop rendering" not in [a.text() for a in tv._build_context_menu([d.id]).actions()]
+    # A mixed selection offers it (acting only on the generating take).
+    labels = [a.text() for a in tv._build_context_menu([g.id, d.id]).actions()]
+    assert "Stop rendering" in labels
+
+    # Firing it routes to JobManager.request_stop, which flags the take in _stopping (the worker
+    # would unwind it to CANCELLED). replicate + no backend_job_id keeps the backend cancel a
+    # no-op, so no network is touched.
+    tv.stop_rendering([g.id])
+    assert g.id in jm._stopping
+
+    # A view with NO JobManager (plain viewer / headless) offers nothing to stop and no-ops safely.
+    tv_nojobs = TakesView(project, shot.id)
+    assert "Stop rendering" not in [a.text() for a in tv_nojobs._build_context_menu([g.id]).actions()]
+    tv_nojobs.stop_rendering([g.id])   # no jobs -> silent no-op, must not raise
+    print("TakesView stop-rendering menu OK: generating-only, jobs-gated, routes to request_stop")
+
+
 def test_runner_uses_snapshot_not_live_shot() -> None:
     """A queued take renders its frozen settings_snapshot, not the live Shot. Editing the
     source shot's prompt/negative/canvas/crop after queueing (before the serialized worker
@@ -726,11 +766,23 @@ def test_queue_view() -> None:
     app.processEvents()                                        # fire the coalescing timer
     assert qv._rebuild_count == before + 1, qv._rebuild_count  # one rebuild, not 204
 
-    # (d) The queued-take right-click menu (no exec()) only offers Cancel for PENDING takes.
+    # (d) The queue-row right-click menu (no exec()): a PENDING take offers Cancel, a GENERATING
+    #     take offers Stop rendering (UX1), and a mixed selection offers both.
     pending_id = next(t.id for t in qv.model.rows() if t.status == STATUS_PENDING)
     menu = qv._build_context_menu([pending_id])
     assert [a.text() for a in menu.actions()] == ["Cancel queued generation"]
-    assert qv._build_context_menu([g.id]).actions() == []      # a generating take: nothing to cancel
+    menu = qv._build_context_menu([g.id])                      # a GENERATING take: Stop rendering
+    assert [a.text() for a in menu.actions()] == ["Stop rendering"]
+    menu = qv._build_context_menu([pending_id, g.id])         # mixed: both entries present
+    assert [a.text() for a in menu.actions()] == ["Cancel queued generation", "Stop rendering"]
+    # Firing Stop rendering routes to JobManager.request_stop, which flags the generating take in
+    # _stopping (the worker would then unwind it to CANCELLED). Use a REPLICATE take with no
+    # backend_job_id so the backend cancel is a no-op - no live GPU/network is touched (a comfyui
+    # stop would POST /interrupt to a down server and block on the socket timeout).
+    gr = add(STATUS_GENERATING, backend="replicate")
+    qv.refresh()
+    qv._stop([gr.id])
+    assert gr.id in jobs._stopping
 
     # (d2) Header gains a cumulative 'N done' counter and the 'Last finished' strip surfaces the
     #      newest finished take, so a result is visible without scrolling the queue (card #77).
@@ -749,7 +801,7 @@ def test_queue_view() -> None:
     #     asserts above don't exercise the paint path.
     qv.resize(900, 360)
     assert not qv.grab().isNull()
-    print("QueueView OK: zero per-row widgets, bounded child count, 1-row progress, coalesced rebuild, cancel menu, done counter, last-finished strip, paint")
+    print("QueueView OK: zero per-row widgets, bounded child count, 1-row progress, coalesced rebuild, cancel + stop-rendering menu, done counter, last-finished strip, paint")
 
 
 if __name__ == "__main__":
@@ -760,6 +812,7 @@ if __name__ == "__main__":
     test_take_star_toggle_incremental()
     test_take_progress_label()
     test_bin_neutralizes_queued_take()
+    test_takes_view_stop_rendering_menu()
     test_assets_view()
     test_asset_picker()
     test_card_and_window()
