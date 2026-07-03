@@ -923,8 +923,15 @@ def test_orphan_recovery() -> None:
     project.add_take(shot.id, status=STATUS_DONE, settings_snapshot=snap_local)      # excluded
     project.add_take(shot.id, status=STATUS_GENERATING, seed=1,                      # excluded:
                      settings_snapshot={"backend": "replicate"})                     # hosted
+    # A take binned while still mid-flight IS reconciled (H2) - otherwise it sits `generating`
+    # forever and its ComfyUI render keeps running unclaimed. It's oldest (added last -> newest
+    # created, so it sorts after gen among the generating group; keep the assertion order-agnostic).
+    binned = project.add_take(shot.id, status=STATUS_GENERATING, seed=300, deleted=True,
+                              settings_snapshot=snap_local)
     orphans = recovery.comfy_orphans(project)
-    assert [o.id for o in orphans] == [gen.id, pend.id], "generating-first, hosted/done excluded"
+    assert orphans[-1].id == pend.id, "pending sorts last"
+    assert {gen.id, binned.id} == {o.id for o in orphans[:2]}, "both generating orphans, incl. binned"
+    assert set() == {o.id for o in orphans} - {gen.id, binned.id, pend.id}, "hosted/done excluded"
 
     # plan_comfy_recovery: the four actions + prompt-id match + seed match + claim dedup.
     def t(tid, status, seed=None, job=None):

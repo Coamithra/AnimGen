@@ -312,6 +312,67 @@ def test_take_progress_label() -> None:
     print("TakesView progress OK: generating tile shows live %, done tile ignores late tail")
 
 
+def test_bin_neutralizes_queued_take() -> None:
+    """Deleting a non-terminal take to the bin must first neutralize it in the queue (H2):
+    a PENDING take is cancelled (so its runnable never fires the backend), a GENERATING one
+    is asked to stop (so spend/GPU halts). A bare move_to_bin only sets deleted=True and the
+    queue scans (include_deleted=False) would then never touch it again."""
+    from PySide6.QtWidgets import QApplication
+
+    from backends.jobs import JobManager
+    from store.models import STATUS_CANCELLED
+    from ui.takes_view import TakesView
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    jm = JobManager(project)
+
+    # Bin-while-PENDING: cancel_take flips it to CANCELLED and records it in _cancelled, then
+    # it's binned. Without the neutralize step it would stay PENDING+deleted and its runnable
+    # would later fire the backend into a binned take.
+    p = project.add_take(shot.id, status=STATUS_PENDING,
+                         settings_snapshot={"backend": "comfyui"})
+    tv = TakesView(project, shot.id, jobs=jm)
+    tv.delete([p.id])
+    got = project.get_take(p.id)
+    assert got.deleted and got.status == STATUS_CANCELLED, (got.deleted, got.status)
+    assert p.id in jm._cancelled
+
+    # Bin-while-GENERATING: request_stop flags it in _stopping (the worker would unwind to
+    # CANCELLED) and issues the best-effort backend stop; using replicate with no backend_job_id
+    # keeps the backend cancel a no-op (no network). Then it's binned.
+    g = project.add_take(shot.id, status=STATUS_GENERATING,
+                         settings_snapshot={"backend": "replicate"})
+    tv.load()
+    tv.delete([g.id])
+    assert g.id in jm._stopping
+    assert project.get_take(g.id).deleted
+
+    # Belt-and-braces: the queue-wide scans now sweep a binned-but-PENDING take too, so even a
+    # bin that somehow skipped the neutralize step can't leave a runnable firing / a stuck take.
+    project2 = Project.new()
+    shot2 = project2.add_shot("punch", model_id="local-flf-wan14b")
+    jm2 = JobManager(project2)
+    binned = project2.add_take(shot2.id, status=STATUS_PENDING, deleted=True,
+                               settings_snapshot={"backend": "comfyui"})
+    assert jm2.cancel_pending() == 1                       # the binned pending take is swept
+    assert project2.get_take(binned.id).status == STATUS_CANCELLED
+
+    binned2 = project2.add_take(shot2.id, status=STATUS_PENDING, deleted=True,
+                                settings_snapshot={"backend": "comfyui"})
+    held = jm2.pause_local()                               # ... and held on pause, not dropped
+    assert binned2.id in held
+    jm2.clear_local_pause()
+
+    binned3 = project2.add_take(shot2.id, status=STATUS_PENDING, deleted=True,
+                                settings_snapshot={"backend": "comfyui"})
+    assert jm2.abandon_local("crashed") >= 1              # ... and swept by abandon_local
+    assert project2.get_take(binned3.id).status == STATUS_CANCELLED
+    print("TakesView bin OK: pending cancelled + generating stopped on bin; scans sweep binned")
+
+
 def test_runner_uses_snapshot_not_live_shot() -> None:
     """A queued take renders its frozen settings_snapshot, not the live Shot. Editing the
     source shot's prompt/negative/canvas/crop after queueing (before the serialized worker
@@ -695,6 +756,7 @@ if __name__ == "__main__":
     test_take_star_badge()
     test_take_star_toggle_incremental()
     test_take_progress_label()
+    test_bin_neutralizes_queued_take()
     test_assets_view()
     test_asset_picker()
     test_card_and_window()
