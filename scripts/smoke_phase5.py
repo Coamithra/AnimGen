@@ -1496,6 +1496,71 @@ def test_shot_tab_missing_model_commit_and_generate() -> None:
     print("shot-tab missing-model OK: commit round-trips off-roster id, Generate blocked, real pick unblocks")
 
 
+def test_guarded_emit_and_daemon_workers() -> None:
+    """The shared qt_guard.guarded_emit helper (card #48 / Wave3 G) must drop a signal whose
+    C++ source was deleted instead of raising RuntimeError('Signal source has been deleted') -
+    an unguarded emit from a daemon thread invoked out of C++ aborts the process. Covers the
+    helper directly (live emit works, dead-source emit no-ops) and each of the four remaining
+    daemon-thread workers routed through it (_StripLoader / _FrameLoader / _GifExporter /
+    _OrphanReconciler); jobs.GenerationJob and _ReplicateRefresher are covered by their own
+    tests above."""
+    import shiboken6
+    from PySide6.QtCore import QObject, Signal
+    from PySide6.QtWidgets import QApplication
+
+    from qt_guard import guarded_emit
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    class _Probe(QObject):
+        fired = Signal(int)
+
+    # (a) live source: the signal reaches a connected slot.
+    got = []
+    live = _Probe()
+    live.fired.connect(lambda v: got.append(v))
+    guarded_emit(live, "fired", 7)
+    app.processEvents()
+    assert got == [7], got
+
+    # (b) dead source: the C++ half is gone -> the emit must silently no-op, not raise.
+    dead = _Probe()
+    shiboken6.delete(dead)
+    assert not shiboken6.isValid(dead)
+    guarded_emit(dead, "fired", 1)   # must NOT raise
+
+    # (c) each daemon worker's _run must survive its own emit hitting a dead source.
+    from ui.takes_view import _StripLoader
+    from ui.take_player import _FrameLoader, _GifExporter
+    from ui.main_window import _OrphanReconciler
+    from backends import comfy_client
+
+    strip = _StripLoader([("t1", "does-not-exist.mp4")], gen=0)
+    shiboken6.delete(strip)
+    strip._run()                     # decode fails -> no emit; a decodable clip would hit guarded_emit
+
+    frame = _FrameLoader("does-not-exist.mp4")
+    shiboken6.delete(frame)
+    frame._run()                     # decode raises -> the except-branch failed emit hits a dead source
+
+    gif = _GifExporter("does-not-exist.mp4", str(Path(tempfile.gettempdir()) / "x.gif"))
+    shiboken6.delete(gif)
+    gif._run()                       # encode raises -> the except-branch failed emit hits a dead source
+
+    # _OrphanReconciler: force the fetch to raise so _run reaches its (guarded) ready emit fast.
+    saved = (comfy_client.history_view, comfy_client.queue_view)
+    comfy_client.history_view = lambda timeout=4: (_ for _ in ()).throw(OSError("down"))
+    comfy_client.queue_view = lambda timeout=4: None
+    try:
+        orphan = _OrphanReconciler()
+        shiboken6.delete(orphan)
+        orphan._run()                # ready emit on a dead source must no-op
+    finally:
+        (comfy_client.history_view, comfy_client.queue_view) = saved
+
+    print("qt_guard OK: guarded_emit drops dead-source signals; daemon workers survive teardown")
+
+
 if __name__ == "__main__":
     test_export()
     test_take_media_probe()
@@ -1520,6 +1585,7 @@ if __name__ == "__main__":
     test_runner_self_cancel_during_submit()
     test_run_survives_deleted_signals()
     test_refresher_survives_deleted_signals()
+    test_guarded_emit_and_daemon_workers()
     test_save_as_rollback_on_write_failure()
     test_delete_shot_discard_preserves_takes()
     test_export_starred_takes()

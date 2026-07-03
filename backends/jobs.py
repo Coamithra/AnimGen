@@ -17,6 +17,7 @@ from typing import Callable
 import shiboken6
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
+from qt_guard import guarded_emit
 from backends.crash_recovery import CRASH_INTERRUPTED_ATTR
 from pipeline import extract
 from store.project import Project
@@ -465,8 +466,12 @@ class JobManager(QObject):
             self._runners.pop(t.id, None)
             self.project.update_take(t.id, status=STATUS_CANCELLED, error=reason,
                                      interrupted=True)   # GPU-crash abandon, not a user cancel
-            self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
-        self._signals.queue_abandoned.emit(reason)
+            # Guard the emit (card #48): abandon_local runs on the crash-recovery worker thread,
+            # so a torn-down _JobSignals would raise 'Signal source has been deleted' and abort
+            # the process mid-loop (stranding the rest of the sibling cancellation). Each take is
+            # already persisted CANCELLED above, so a dropped signal only costs a UI refresh.
+            guarded_emit(self._signals, "status_changed", t.id, STATUS_CANCELLED)
+        guarded_emit(self._signals, "queue_abandoned", reason)
         return len(pending)
 
     def wait_for_done(self, msecs: int = -1) -> bool:

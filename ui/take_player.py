@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 import library
+from qt_guard import guarded_emit
 from store.models import STATUS_CANCELLED, STATUS_FAILED
 from store.project import Project
 from ui.placement_widget import pil_to_qimage
@@ -160,11 +161,13 @@ class _FrameLoader(QObject):
                     break
                 frames.append(pil_to_qimage(im))
             if not frames:
-                self.failed.emit("no frames could be decoded")
+                # Guard the emit (card #48): _run is a daemon thread; a torn-down tab would make
+                # a raw emit raise 'Signal source has been deleted' and abort the process.
+                guarded_emit(self, "failed", "no frames could be decoded")
                 return
-            self.done.emit(frames, float(fps))
+            guarded_emit(self, "done", frames, float(fps))
         except Exception as e:  # noqa: BLE001 - surface any decode failure in the tab
-            self.failed.emit(f"{type(e).__name__}: {e}")
+            guarded_emit(self, "failed", f"{type(e).__name__}: {e}")
 
 
 class _GifExporter(QObject):
@@ -185,9 +188,11 @@ class _GifExporter(QObject):
         try:
             from pipeline import gif_export
             path = gif_export.take_to_gif(self._source, self._out)
-            self.done.emit(str(path))
+            # Guard the emit (card #48): daemon thread; a torn-down owner would make a raw emit
+            # raise 'Signal source has been deleted' and abort the process.
+            guarded_emit(self, "done", str(path))
         except Exception as e:  # noqa: BLE001 - surface any encode failure in a dialog
-            self.failed.emit(f"{type(e).__name__}: {e}")
+            guarded_emit(self, "failed", f"{type(e).__name__}: {e}")
 
 
 def star_button_text(starred: bool) -> str:

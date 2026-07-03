@@ -1406,8 +1406,24 @@ def test_crash_recovery() -> None:
     assert len(restarts) == 3 and len(abandons) == 1, (restarts, abandons)
     assert "restart failed" in abandons[0] and "did not come back up" in abandons[0], abandons[0]
 
+    # (j) L21 (Wave3 G): max_attempts < 1 is caller misuse - the loop would never run and the
+    # trailing raw QueueAbandoned would bypass _abandon (no on_abandon, no CRASH_INTERRUPTED_ATTR).
+    # The up-front assert rejects it instead, so on_abandon is never left uncalled by a silent
+    # fall-through.
+    for bad in (0, -1):
+        raised = None
+        try:
+            run_with_crash_recovery(
+                render=lambda: {"ok": True}, server_running=lambda: True,
+                restart_server=lambda: None, note=lambda _l: None,
+                on_abandon=lambda _r: None, clock=make_clock(), max_attempts=bad)
+        except AssertionError as e:
+            raised = str(e)
+        assert raised is not None and "max_attempts" in raised, (bad, raised)
+
     print("crash_recovery OK: success/retry/abandon/workflow-error/restart-fail/"
-          "transient-down/user-abort/final-restart-recovers/final-restart-fails + format_elapsed")
+          "transient-down/user-abort/final-restart-recovers/final-restart-fails/"
+          "max-attempts-guard + format_elapsed")
 
 
 def test_wait_until_responsive() -> None:

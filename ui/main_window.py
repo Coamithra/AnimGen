@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 import applog
 import library
 import paths
+from qt_guard import guarded_emit
 from backends import batch, comfy_client, crash_recovery, recovery, replicate_client, restart
 from backends.jobs import JobManager
 from pipeline import export, extract, framing
@@ -92,7 +93,10 @@ class _OrphanReconciler(QObject):
             queue = comfy_client.queue_view(timeout=4)
         except Exception:  # noqa: BLE001 - unreachable/down server -> recover what we can offline
             hist = queue = None
-        self.ready.emit(hist, queue)
+        # Guard the emit (card #48): _run is a daemon thread; if the window tears down before the
+        # fetch returns, a raw emit would raise 'Signal source has been deleted' and abort the
+        # process at the C++ layer.
+        guarded_emit(self, "ready", hist, queue)
 
 
 class _InfoBanner(QFrame):
