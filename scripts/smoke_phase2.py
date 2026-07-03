@@ -168,7 +168,7 @@ def test_store_absent_vs_unreadable() -> None:
     def deny(path: Path):
         """Make exactly `path` raise PermissionError on open (the AV/indexer lock)."""
         def guard(file, *a, **k):
-            if Path(file) == Path(path):
+            if isinstance(file, (str, Path)) and Path(file) == Path(path):
                 raise PermissionError(13, "locked by another process")
             return real_open(file, *a, **k)
         builtins.open = guard
@@ -188,6 +188,12 @@ def test_store_absent_vs_unreadable() -> None:
     bad.write_text("{ not json", encoding="utf-8")
     try:
         _doc_io.read_doc(bad); assert False, "corrupt file must raise"
+    except _doc_io.UnreadableStoreError:
+        pass
+    empty = tmp / "empty.json"
+    empty.write_text("", encoding="utf-8")   # 0-byte = interrupted write: unreadable, NOT absent
+    try:
+        _doc_io.read_doc(empty); assert False, "empty (0-byte) file must raise, not reseed"
     except _doc_io.UnreadableStoreError:
         pass
     with deny(good):                                             # present but locked -> raise
@@ -265,8 +271,22 @@ def test_store_absent_vs_unreadable() -> None:
     finally:
         paths.SCHEMA_CACHE = saved_sc
 
-    print("store absent-vs-unreadable OK: absent->seeds/defaults; locked/corrupt->mutations "
-          "refuse (raise), readers tolerate; no clobber")
+    # --- 0-byte store file (interrupted write): a mutating op refuses, it does NOT reseed ---
+    saved_pt = paths.PROMPT_TEMPLATES
+    paths.PROMPT_TEMPLATES = tmp / "truncated_templates.json"
+    try:
+        paths.PROMPT_TEMPLATES.write_text("", encoding="utf-8")
+        try:
+            prompt_library.save("OnEmpty", "X", "Y")
+            assert False, "save() reseeded over a 0-byte file"
+        except _doc_io.UnreadableStoreError:
+            pass
+        assert paths.PROMPT_TEMPLATES.read_text(encoding="utf-8") == ""  # untouched
+    finally:
+        paths.PROMPT_TEMPLATES = saved_pt
+
+    print("store absent-vs-unreadable OK: absent->seeds/defaults; locked/corrupt/empty->"
+          "mutations refuse (raise), readers tolerate; no clobber")
 
 
 def test_roster_integrity() -> None:

@@ -7,13 +7,15 @@ once and applied anywhere. Persisted to data/prompt_templates.json.
 File shape: {"format": "animgen-prompt-templates", "version": 1,
              "templates": [{"name": <str>, "positive": <str>, "negative": <str>}, ...]}
 
-Reads tolerate a missing/corrupt file (returns the seed templates). Writes go through the
-project's atomic-write helper under a lock, mirroring store.schema_cache's discipline.
+Read-only accessors tolerate a missing/unreadable/corrupt file (returns the seed
+templates); mutating ops (save/delete) tolerate only ABSENCE - a present-but-unreadable
+file makes them raise `store._doc_io.UnreadableStoreError` instead of clobbering the user's
+templates with the seed set (M11; see `_load_list`). Writes go through the project's
+atomic-write helper under a lock, mirroring store.schema_cache's discipline.
 Paths are read from `paths` at call time so tests can override `paths.PROMPT_TEMPLATES`.
 """
 from __future__ import annotations
 
-import json
 import threading
 from typing import Optional
 

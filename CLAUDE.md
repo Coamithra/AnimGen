@@ -794,7 +794,9 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     parsed top-level `dict` (or `{}` if the JSON root isn't an object); **present but
     unreadable/corrupt** — any other `OSError` (notably a transient Windows AV/indexer
     `PermissionError`, the exact lock `store.project._atomic_write_json` retries around) or a JSON
-    `ValueError` → **raises `UnreadableStoreError`**. Previously each loader swallowed *any*
+    `ValueError` → **raises `UnreadableStoreError`**. A **0-byte file counts as unreadable, not
+    absent** (it's most plausibly an interrupted/truncated write — don't overwrite it blind;
+    deleting the file is the recovery). Previously each loader swallowed *any*
     `OSError` into "return the seed/empty set", so a mutating op (`prompt_library.save`/`delete`,
     `app_settings.set_bool`, `schema_cache.put`) reading that degraded set then wrote it back —
     silently discarding **every** user entry the locked file actually held. Now each private

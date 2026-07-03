@@ -35,14 +35,16 @@ class UnreadableStoreError(Exception):
     """
 
 
-def read_doc(path) -> Optional[dict]:
+def read_doc(path: str | Path) -> Optional[dict]:
     """Read a JSON store file, distinguishing absent from present-but-unreadable.
 
     Returns `None` when the file does not exist (caller should use seeds/defaults). Returns
     the parsed top-level object as a `dict` (or `{}` if the JSON root isn't an object) when
     it reads cleanly. Raises `UnreadableStoreError` when the file is present but can't be
     opened/read (e.g. a transient Windows AV/indexer `PermissionError`) or holds invalid
-    JSON - so callers can tell "nothing here yet" apart from "don't clobber this".
+    JSON - so callers can tell "nothing here yet" apart from "don't clobber this". An
+    EMPTY (0-byte) file counts as unreadable, not absent: it's most plausibly an
+    interrupted/truncated write, exactly the state a mutating op must not overwrite blind.
     """
     try:
         with open(path, encoding="utf-8") as f:

@@ -10,11 +10,14 @@ File shape: {"format": "animgen-schema-cache", "version": 1,
              "schemas": {<replicate_model_id>: {"props": {...}, "fields": <int>,
                                                  "fetched": <unix-seconds>}}}
 
-Reads tolerate a missing/corrupt file (returns nothing). Writes go through the project's
-atomic-write helper and are serialized under a lock, so the off-thread fetch-all loop and
-the GUI thread reading entries can't clobber each other (mirrors store.project's RLock +
-atomic JSON discipline). Paths are read from `paths` at call time so tests can override
-`paths.SCHEMA_CACHE`, the same way they override `paths.SCRATCH_DIR`.
+Read-only accessors tolerate a missing/unreadable/corrupt file (return nothing); `put`
+tolerates only ABSENCE - a present-but-unreadable file makes it raise
+`store._doc_io.UnreadableStoreError` instead of clobbering the other cached schemas (M11;
+see `_load_doc`). Writes go through the project's atomic-write helper and are serialized
+under a lock, so the off-thread fetch-all loop and the GUI thread reading entries can't
+clobber each other (mirrors store.project's RLock + atomic JSON discipline). Paths are
+read from `paths` at call time so tests can override `paths.SCHEMA_CACHE`, the same way
+they override `paths.SCRATCH_DIR`.
 """
 from __future__ import annotations
 
@@ -48,7 +51,8 @@ def _load_doc(*, strict: bool = False) -> dict:
         return {}
     if doc is None:
         return {}
-    return doc.get("schemas", {}) if isinstance(doc.get("schemas"), dict) else {}
+    schemas = doc.get("schemas")
+    return schemas if isinstance(schemas, dict) else {}
 
 
 def all_entries() -> dict:

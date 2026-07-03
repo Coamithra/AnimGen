@@ -6,8 +6,11 @@ wholesale on every save via `_remember_last`). First key: `update_schemas_on_sta
 (whether to refresh every Replicate model's input schema at launch).
 
 Same discipline as store.schema_cache / store.prompt_library: lock-guarded, atomic writes
-through store.project._atomic_write_json, tolerant of a missing/corrupt file. Paths are
-read from `paths` at call time so tests can override `paths.APP_SETTINGS`.
+through store.project._atomic_write_json. Reads tolerate a missing/unreadable/corrupt
+file; `set_bool` tolerates only ABSENCE - a present-but-unreadable file makes it raise
+`store._doc_io.UnreadableStoreError` instead of clobbering the other stored preferences
+(M11; see `_load_doc`). Paths are read from `paths` at call time so tests can override
+`paths.APP_SETTINGS`.
 """
 from __future__ import annotations
 
@@ -43,7 +46,8 @@ def _load_doc(*, strict: bool = False) -> dict:
         return {}
     if doc is None:
         return {}
-    return doc.get("settings", {}) if isinstance(doc.get("settings"), dict) else {}
+    settings = doc.get("settings")
+    return settings if isinstance(settings, dict) else {}
 
 
 def get_bool(key: str, default: bool | None = None) -> bool:
