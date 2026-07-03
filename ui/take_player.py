@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 import library
+from qt_guard import guarded_emit
 from store.models import STATUS_CANCELLED, STATUS_FAILED
 from store.project import Project
 from ui.placement_widget import pil_to_qimage
@@ -160,11 +161,13 @@ class _FrameLoader(QObject):
                     break
                 frames.append(pil_to_qimage(im))
             if not frames:
-                self.failed.emit("no frames could be decoded")
+                # Guard the emit (card #48): _run is a daemon thread; a torn-down tab would make
+                # a raw emit raise 'Signal source has been deleted' and abort the process.
+                guarded_emit(self, "failed", "no frames could be decoded")
                 return
-            self.done.emit(frames, float(fps))
+            guarded_emit(self, "done", frames, float(fps))
         except Exception as e:  # noqa: BLE001 - surface any decode failure in the tab
-            self.failed.emit(f"{type(e).__name__}: {e}")
+            guarded_emit(self, "failed", f"{type(e).__name__}: {e}")
 
 
 class _GifExporter(QObject):
@@ -185,9 +188,11 @@ class _GifExporter(QObject):
         try:
             from pipeline import gif_export
             path = gif_export.take_to_gif(self._source, self._out)
-            self.done.emit(str(path))
+            # Guard the emit (card #48): daemon thread; a torn-down owner would make a raw emit
+            # raise 'Signal source has been deleted' and abort the process.
+            guarded_emit(self, "done", str(path))
         except Exception as e:  # noqa: BLE001 - surface any encode failure in a dialog
-            self.failed.emit(f"{type(e).__name__}: {e}")
+            guarded_emit(self, "failed", f"{type(e).__name__}: {e}")
 
 
 def star_button_text(starred: bool) -> str:
@@ -483,7 +488,24 @@ class TakePlayerTab(QWidget):
         self.toggle_play()                          # auto-play once decoded, like a preview
 
     def _on_failed(self, msg: str) -> None:
+        # Drop the dead loader so refresh_status can retry _load() if the take later gains a
+        # fresh source (e.g. a corrupt partial file rewritten by a restart-in-place): a finished
+        # _FrameLoader is spent anyway, and leaving it set would wedge the no-op guard forever.
+        self._loader = None
         self.canvas.setText(f"Could not load this take:\n{msg}")
+
+    def refresh_status(self) -> None:
+        """Cheap update path for when this take's status flips while its viewer is open —
+        e.g. a viewer opened on a still-generating take once it finishes, fails, or is
+        cancelled (L6). If frames are already decoded there's nothing to do (a produced video
+        is immutable). Otherwise re-run _load(): a now-playable take decodes and auto-plays, a
+        still-pending / status-FAILED / cancelled take repaints its placeholder / failure text,
+        and a take that lost a prior *decode* attempt (loader cleared in _on_failed) can retry
+        against a fresh source. Idempotent and safe to call on every status signal — it no-ops
+        while a decode is already under way (`_loader` set) or once frames have loaded."""
+        if self._frames or self._loader is not None:
+            return
+        self._load()
 
     # ---- playback -------------------------------------------------------
     def toggle_play(self) -> None:

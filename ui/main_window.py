@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 import applog
 import library
 import paths
+from qt_guard import guarded_emit
 from backends import batch, comfy_client, crash_recovery, recovery, replicate_client, restart
 from backends.jobs import JobManager
 from pipeline import export, extract, framing
@@ -116,7 +117,10 @@ class _OrphanReconciler(QObject):
             queue = comfy_client.queue_view(timeout=4)
         except Exception:  # noqa: BLE001 - unreachable/down server -> recover what we can offline
             hist = queue = None
-        self.ready.emit(hist, queue)
+        # Guard the emit (card #48): _run is a daemon thread; if the window tears down before the
+        # fetch returns, a raw emit would raise 'Signal source has been deleted' and abort the
+        # process at the C++ layer.
+        guarded_emit(self, "ready", hist, queue)
 
 
 class _ReplicateReconciler(QObject):
@@ -717,6 +721,10 @@ class MainWindow(QMainWindow):
         # they must run before delete_shot drops the takes.
         cancelled = self.jobs.cancel_shot_takes(shot_id)
         stopped = sum(1 for t in inflight if self.jobs.request_stop(t.id))
+        # Close any open take-viewer tabs for this shot's takes so none dangles on a take
+        # that's about to be removed (and none is captured into ui_state as a dead descriptor).
+        # Mirrors remove_cancelled_takes, which already does this before purge_takes (M10).
+        self._close_take_tabs([t.id for t in takes])
         self.project.delete_shot(shot_id)
         self.reload()
         self._refresh_cancel_action()
@@ -820,6 +828,11 @@ class MainWindow(QMainWindow):
             if not shot:
                 self._log("generate ignored: shot deleted while picking a keyframe")
                 return
+            # The import+save already changed the project on disk, so reflect the new start
+            # keyframe on the shot card + title NOW — before the cost gate. Otherwise cancelling
+            # the gate below leaves the UI showing the pre-import (no-start-frame) state while
+            # disk holds the assigned keyframe (L11).
+            self.reload()
 
         settings = {**model.get("default_params", {}), **shot.settings}
         est = library.estimate_cost(shot.model_id, settings)
@@ -1846,6 +1859,11 @@ class MainWindow(QMainWindow):
             self.cards[take.shot_id].update_take(take_id)
         if take.shot_id in self.shot_tabs:
             self.shot_tabs[take.shot_id].update_take(take_id)
+        # A take viewer opened while its take was still generating must catch up when the take
+        # finishes / fails / is cancelled — the card/tab fan-out above never reaches take_tabs (L6).
+        viewer = self.take_tabs.get(take_id)
+        if viewer is not None:
+            viewer.refresh_status()
 
     def _monitor_context(self) -> str:
         """Short app-state string for the heartbeat log (project + queue snapshot)."""
@@ -1941,6 +1959,10 @@ class MainWindow(QMainWindow):
         self._log(f"[{status}] {take_id[:8]}")
         self._refresh_shot_for_take(take_id)
         self._refresh_cancel_action()
+        # A take flipping to/from CANCELLED changes whether 'Remove cancelled takes' has
+        # anything to do; refresh its enablement here (not only on reload()) so it's live
+        # right after Cancel pending, without waiting on an unrelated refresh (L12).
+        self._refresh_purge_cancelled_action()
         if self._batch is not None:
             self._batch.mark(take_id, status)
             if self._batch.complete:
@@ -1956,3 +1978,4 @@ class MainWindow(QMainWindow):
         self._log(msg)
         self._refresh_shot_for_take(take_id)
         self._refresh_cancel_action()
+        self._refresh_purge_cancelled_action()   # keep 'Remove cancelled takes' live (L12)

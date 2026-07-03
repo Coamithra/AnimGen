@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
+from qt_guard import guarded_emit
 from pipeline import extract, takes_io
 from store.project import Project
 from ui.take_player import decode_strip, take_source
@@ -254,7 +255,10 @@ class _StripLoader(QObject):
             except Exception:  # noqa: BLE001 - a bad clip just doesn't animate
                 frames = []
             if frames:
-                self.ready.emit(take_id, frames, self._gen)
+                # Guard the emit (card #48): _run is a daemon thread; if the view tears down
+                # mid-decode a raw emit would raise 'Signal source has been deleted' and abort
+                # the process at the C++ layer.
+                guarded_emit(self, "ready", take_id, frames, self._gen)
 
 
 class _ResizeHandle(QFrame):

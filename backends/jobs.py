@@ -17,6 +17,7 @@ from typing import Callable
 import shiboken6
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
+from qt_guard import guarded_emit
 from backends.crash_recovery import CRASH_INTERRUPTED_ATTR
 from pipeline import extract
 from store.project import Project
@@ -72,6 +73,34 @@ class GenerationJob(QRunnable):
                 return
             getattr(self.signals, name).emit(*args)
         except RuntimeError:
+            pass
+
+    def _cancel_remote_spend(self, tid: str, progress: Callable[..., None]) -> None:
+        """Best-effort cancel of a hosted prediction after this take FAILED terminally mid-render.
+
+        The H4 network retries (PR #93) mean a single blip no longer fails a hosted take, but a
+        take that DOES fail terminally after the create POST returned a prediction id (poll retries
+        exhausted, download error, an unwind, etc.) leaves the Replicate prediction running to
+        completion at full cost with its output never claimed (card follow-up H4). If the take is a
+        replicate one and recorded a `backend_job_id` (stamped mid-render by the runner's on_submit),
+        POST a cancel to stop the remaining spend. This does NOT change the take's terminal status -
+        it stayed FAILED above; the cancel only stops the bleed. A never-submitted take (no
+        backend_job_id) and the local/comfyui backend are skipped. Called only from the genuine-
+        terminal-failure branch, never for a deliberate stop (that's `_stopping`/`request_stop`,
+        which already issued its own cancel) or a re-queue. Swallows all transport errors, like
+        request_stop - a cancel that itself fails must never take down the worker. Re-fetches the
+        take so it reads the id on_submit persisted mid-render, not a stale snapshot."""
+        if self.backend != "replicate":
+            return
+        t = self.project.get_take(tid)
+        pred_id = t.backend_job_id if t else None
+        if not pred_id:
+            return
+        try:
+            from backends import replicate_client
+            replicate_client.cancel_prediction(pred_id)
+            progress(f"requested cancel of prediction {pred_id} to stop remote spend (best-effort)")
+        except Exception:  # noqa: BLE001 - best-effort; a failed cancel must not abort the worker
             pass
 
     @Slot()
@@ -169,9 +198,16 @@ class GenerationJob(QRunnable):
                 # action pick it up like its abandon_local'd siblings (rule #17, card #68).
                 interrupted = bool(getattr(e, CRASH_INTERRUPTED_ATTR, False))
                 self.project.update_take(tid, status=STATUS_FAILED, error=err, interrupted=interrupted)
-                self.project.update_job(job.id, state="failed", log="\n".join(log_lines + [err]))
+                # Mutate log_lines (not a `log_lines + [err]` copy): _cancel_remote_spend's
+                # progress() milestone below re-writes the job log from log_lines, so err must
+                # be IN the list or that later write would drop the error from the persisted log.
+                log_lines.append(err)
+                self.project.update_job(job.id, state="failed", log="\n".join(log_lines))
                 self._emit("status_changed", tid, STATUS_FAILED)
                 self._emit("failed", tid, err)
+                # After the emits: the cancel POST can sit in the 5xx backoff loop for a while,
+                # and the UI should surface the failure immediately, not after the cancel returns.
+                self._cancel_remote_spend(tid, progress)
                 final = STATUS_FAILED
         finally:
             self.stopping.discard(tid)
@@ -467,8 +503,12 @@ class JobManager(QObject):
             self._runners.pop(t.id, None)
             self.project.update_take(t.id, status=STATUS_CANCELLED, error=reason,
                                      interrupted=True)   # GPU-crash abandon, not a user cancel
-            self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
-        self._signals.queue_abandoned.emit(reason)
+            # Guard the emit (card #48): abandon_local runs on the crash-recovery worker thread,
+            # so a torn-down _JobSignals would raise 'Signal source has been deleted' and abort
+            # the process mid-loop (stranding the rest of the sibling cancellation). Each take is
+            # already persisted CANCELLED above, so a dropped signal only costs a UI refresh.
+            guarded_emit(self._signals, "status_changed", t.id, STATUS_CANCELLED)
+        guarded_emit(self._signals, "queue_abandoned", reason)
         return len(pending)
 
     def wait_for_done(self, msecs: int = -1) -> bool:

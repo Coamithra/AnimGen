@@ -127,6 +127,12 @@ def run_with_crash_recovery(
     Raises QueueAbandoned only when a restart fails or the server stays unreachable - so the
     last strike is decided on the server's actual state, not on the raw attempt count alone.
     """
+    # At least one attempt, or the loop below never runs and we fall through to the trailing
+    # `raise QueueAbandoned` WITHOUT routing through _abandon - i.e. without calling on_abandon
+    # or stamping CRASH_INTERRUPTED_ATTR, breaking the abandon contract (the caller wouldn't
+    # pause the queue, the crash victim wouldn't be flagged interrupted). max_attempts < 1 is
+    # caller misuse (MAX_ATTEMPTS is 3), so assert it up front rather than special-case it.
+    assert max_attempts >= 1, "max_attempts must be >= 1"
     for attempt in range(1, max_attempts + 1):
         t0 = clock()
         try:
@@ -176,4 +182,7 @@ def run_with_crash_recovery(
             except Exception as rexc:  # noqa: BLE001 - couldn't bring the server back -> abandon
                 reason = f"ComfyUI restart failed ({rexc}); pausing the local queue."
                 raise _abandon(note, on_abandon, reason) from rexc
-    raise QueueAbandoned("crash recovery exhausted")  # unreachable (loop returns or raises)
+    # Unreachable: max_attempts >= 1 (asserted above) guarantees >= 1 iteration, and every
+    # iteration returns or raises. Kept as a defensive backstop; it does NOT route through
+    # _abandon because it can never fire.
+    raise QueueAbandoned("crash recovery exhausted")
