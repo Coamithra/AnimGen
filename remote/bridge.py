@@ -37,11 +37,18 @@ class GuiBridge(QObject):
 
         holder: dict[str, Any] = {}
         done = threading.Event()
-        cancelled = False
+        # `claimed` is decided ONCE, under `lock`, by whichever of the two racing threads
+        # wins: the GUI thread claims it before running `fn`, the caller claims it on timeout.
+        # This closes the L15 race where a 504-reported call could still execute afterward —
+        # the loser sees the flag already set and skips (no late side effect / double-click).
+        lock = threading.Lock()
+        state = {"claimed": False}
 
         def run() -> None:
-            if cancelled:  # caller already timed out and gave up; skip the late side effect
-                return
+            with lock:
+                if state["claimed"]:  # caller already timed out and gave up; skip it entirely
+                    return
+                state["claimed"] = True
             try:
                 holder["result"] = fn()
             except BaseException as exc:  # noqa: BLE001 - relayed to the caller thread
@@ -51,8 +58,13 @@ class GuiBridge(QObject):
 
         QApplication.postEvent(self, _CallEvent(run))
         if not done.wait(timeout):
-            cancelled = True
-            raise TimeoutError(f"GUI call did not complete within {timeout:.1f}s")
+            with lock:
+                if not state["claimed"]:  # the GUI thread hasn't started fn — cancel it
+                    state["claimed"] = True
+                    raise TimeoutError(f"GUI call did not complete within {timeout:.1f}s")
+            # The GUI thread claimed it just as we timed out; it's running/ran to completion.
+            # Wait for it so we return its real result instead of a spurious 504.
+            done.wait()
         if "error" in holder:
             raise holder["error"]
         return holder.get("result")
