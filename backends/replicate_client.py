@@ -13,6 +13,7 @@ import base64
 import io
 import json
 import mimetypes
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -84,6 +85,41 @@ _HTTP_EXPLAIN = {
 }
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})  # transient - safe to retry the request
 
+# A connection reset / DNS blip / read timeout mid-poll is transient too, but a raw URLError or
+# read TimeoutError isn't an HTTPError so it skips the loop above. We fold it in - but ONLY for
+# IDEMPOTENT GET requests. Retrying a non-idempotent POST (the create prediction, a file upload)
+# on a network error risks a double-create/double-spend (finding M2), so those propagate wrapped
+# on the first blip instead of being retried.
+_NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, socket.timeout)
+
+
+def _is_idempotent(method: Optional[str], body: Optional[bytes]) -> bool:
+    """True when the effective HTTP method is GET (no explicit non-GET method, no request body) -
+    the only requests safe to retry on a bare network error. urllib sends GET when data is None
+    and method is unset; anything with a body or an explicit method is treated as non-idempotent."""
+    if method is not None:
+        return method.upper() == "GET"
+    return body is None
+
+
+def _network_wait(attempt: int) -> int:
+    """Seconds of escalating backoff before retrying a transport-level failure. Pure (no sleep);
+    the same curve as _retry_wait's 5xx tail, kept in one place so the two policies can't drift."""
+    return min(4 * (attempt + 1), 20)
+
+
+def _network_error_message(url: str, err: Exception, *, retried: bool = True) -> str:
+    """A human-readable one-liner for a Replicate call that failed at the transport layer (no HTTP
+    response): a connection reset, DNS failure, or read timeout. Pure. retried=False is the
+    non-idempotent POST case - it says WHY there was no retry, so the reader isn't invited to
+    just re-send a request that may already have been accepted (and billed) server-side."""
+    reason = getattr(err, "reason", None) or err
+    head = f"Network error reaching Replicate (from {url}): {reason}"
+    if retried:
+        return f"{head}\nThe connection failed before a response - retried, then gave up."
+    return (f"{head}\nNot retried: the request may already have been accepted server-side, and "
+            f"re-sending it could create (and bill) a duplicate prediction.")
+
 
 def _http_error_message(code: int, url: str, detail: str) -> str:
     """A human-readable one-liner for a failed Replicate HTTP call: the status, a plain-English
@@ -102,7 +138,7 @@ def _retry_wait(code: int, detail: str, attempt: int) -> int:
             return int(json.loads(detail).get("retry_after", 15)) + 3
         except (ValueError, AttributeError, TypeError):
             return 15
-    return min(4 * (attempt + 1), 20)
+    return _network_wait(attempt)
 
 
 def api_request(token: str, url: str, payload=None, method=None,
@@ -116,8 +152,11 @@ def api_request(token: str, url: str, payload=None, method=None,
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    idempotent = _is_idempotent(method, body)
     # 429 (low-credit throttle) and transient 5xx (gateway timeout / unavailable) are retried;
-    # any other status fails fast with a humanized message (see _http_error_message).
+    # a bare network error (connection reset / DNS / read timeout) is retried too, but ONLY for
+    # idempotent GETs (a POST could have already committed - see M2). Any other status fails fast
+    # with a humanized message (see _http_error_message).
     for attempt in range(8):
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
@@ -128,6 +167,11 @@ def api_request(token: str, url: str, payload=None, method=None,
                 time.sleep(_retry_wait(e.code, detail, attempt))
                 continue
             raise ReplicateError(_http_error_message(e.code, url, detail)) from e
+        except _NETWORK_ERRORS as e:
+            if idempotent and attempt < 7:
+                time.sleep(_network_wait(attempt))
+                continue
+            raise ReplicateError(_network_error_message(url, e, retried=idempotent)) from e
     raise ReplicateError(f"Gave up retrying Replicate after repeated transient errors: {url}")
 
 
@@ -389,6 +433,34 @@ def _output_video_url(output: object) -> str:
     return url
 
 
+def _download_result(url: str, token: str, out_path: Path) -> None:
+    """Fetch a succeeded prediction's video to `out_path`. An idempotent GET, so a transient
+    network blip (reset / DNS / read timeout) mid-download is retried with backoff before giving
+    up; an HTTP error and a final network give-up both raise ReplicateError. The whole body is
+    read into memory then written, so a partial read never leaves a truncated file on disk - a
+    deliberate tradeoff (a transient RAM spike the size of one clip; these are short, bounded
+    videos, and the pre-existing code buffered the full body the same way)."""
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "User-Agent": _UA})
+    for attempt in range(8):
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                data = r.read()
+            out_path.write_bytes(data)
+            return
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            if e.code in _RETRY_STATUS and attempt < 7:
+                time.sleep(_retry_wait(e.code, detail, attempt))
+                continue
+            raise ReplicateError(_http_error_message(e.code, url, detail)) from e
+        except _NETWORK_ERRORS as e:
+            if attempt < 7:
+                time.sleep(_network_wait(attempt))
+                continue
+            raise ReplicateError(_network_error_message(url, e)) from e
+    raise ReplicateError(f"Gave up retrying the result download after repeated transient errors: {url}")
+
+
 def run_prediction(token: str, replicate_model_id: str, inp: dict, out_path: Path,
                    progress_cb: ProgressCb = None, poll_s: int = 10,
                    timeout_s: int = 1800,
@@ -417,9 +489,7 @@ def run_prediction(token: str, replicate_model_id: str, inp: dict, out_path: Pat
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _log(progress_cb, "downloading result")
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "User-Agent": _UA})
-    with urllib.request.urlopen(req, timeout=300) as r, open(out_path, "wb") as f:
-        f.write(r.read())
+    _download_result(url, token, out_path)
     return {"prediction_id": pred_id, "predict_time": resp.get("metrics", {}).get("predict_time")}
 
 
