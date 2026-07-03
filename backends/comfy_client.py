@@ -67,6 +67,8 @@ def _http_error_detail(e: "urllib.error.HTTPError") -> str:
         raw = e.read().decode("utf-8", "replace")
     except Exception:  # noqa: BLE001 - the body may already be consumed / unreadable
         raw = ""
+    if not raw.strip():
+        return str(e.reason or e)     # empty/unreadable body: at least the status text
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
@@ -532,8 +534,9 @@ def _post(path: str, data: Optional[dict] = None, timeout: int = 5) -> None:
 
 
 def stop_work(prompt_id: Optional[str] = None, timeout: int = 5) -> None:
-    """Cancel current ComfyUI work without shutting the server down, then interrupt the
-    running prompt. Raises ComfyError if the server is down.
+    """Cancel ComfyUI work without shutting the server down: drop our pending prompt (or,
+    with no id, the whole queue), then interrupt the running one. Raises ComfyError if the
+    server is down.
 
     When `prompt_id` is given, only THAT prompt is dropped from the pending queue
     (POST /queue {delete: [id]}) - not the whole queue. Clearing the entire queue
@@ -1064,13 +1067,21 @@ def _poll_until_done(pid: str, out_path: Path, progress_cb: ProgressCb,
             hist = _api(f"/history/{pid}")
             fails = 0
         except ComfyError as e:
+            # Deliberate: ANY poll error counts toward the streak, including a wrapped 4xx.
+            # Real ComfyUI answers /history/{unknown pid} with 200 {} (never 404), so a
+            # sustained HTTP error here is a genuinely broken server, and failing after the
+            # streak beats waiting out the full 1h. Trade-off: a real crash (server gone) is
+            # also retried, so crash recovery sees the failure up to
+            # ~MAX_CONSECUTIVE_FAILURES * BACKOFF (~30s) late - accepted, transient stalls
+            # are far more common than crashes and the recovery path is unchanged after.
             fails += 1
             if fails >= _POLL_MAX_CONSECUTIVE_FAILURES:
                 raise ComfyError(f"lost contact with ComfyUI while polling {pid} "
                                  f"({fails} consecutive failures): {e}") from e
             _log(progress_cb, f"poll stalled ({fails}/{_POLL_MAX_CONSECUTIVE_FAILURES}), "
                               f"retrying: {e}")
-            if time.time() - t0 > timeout_s:
+            # +backoff so the sleep below can't push total runtime past timeout_s
+            if time.time() - t0 + _POLL_FAILURE_BACKOFF_S > timeout_s:
                 raise ComfyError("timed out after 1h") from e
             time.sleep(_POLL_FAILURE_BACKOFF_S)
             continue

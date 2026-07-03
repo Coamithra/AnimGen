@@ -536,6 +536,15 @@ def test_poll_retry() -> None:
             assert False, "a sustained poll outage must eventually raise"
         except comfy_client.ComfyError as e:
             assert "lost contact" in str(e)
+
+        # the failure branch still honors the overall timeout (accounting for the upcoming
+        # backoff sleep): with the budget exhausted, a stalling poll raises "timed out"
+        # instead of retrying - the streak limit must not be the only bound.
+        try:
+            comfy_client._poll_until_done("P", out, None, timeout_s=0, poll_s=0)
+            assert False, "an exhausted timeout on the failure branch must raise"
+        except comfy_client.ComfyError as e:
+            assert "timed out" in str(e)
     finally:
         comfy_client._api, comfy_client.time.sleep = saved_api, saved_sleep
         comfy_client.COMFY_OUTPUT_DIR = saved_out_dir
