@@ -498,10 +498,28 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     of the visible widgets (`ref`/`class`/`name`/`text`/`rect`/`enabled`), `GET /screenshot`
     returns a PNG of the window via **`QWidget.grab()`** (Qt's own compositor — no OS
     screen-capture, works even occluded), and `POST /click|/type|/key|/set` drive a widget by
-    `ref` / `objectName` / visible `text`. Two non-obvious invariants: **(a)** the HTTP server
+    `ref` / `objectName` / visible `text`. **`/type` separates the selector from the payload
+    (Wave3 L1):** send `{keys: "...", ref?|object_name?|text?}` to type `keys` into the *selected*
+    widget, or a bare `{text: "..."}` (no selector) to type into the *focused* widget (the
+    documented "type into focus" path). `text` is a selector ONLY when `keys` is also present —
+    so a bare `{text}` can no longer be mis-resolved onto a same-text button. CLI: `type --keys
+    <s>` (with `--ref/--object-name/--text` selecting) or `type --text <s>` (types into focus);
+    `type --ref X --text hello` still types `hello` into `X`. `/set` (Wave3 L16) also drives
+    `QSpinBox`/`QDoubleSpinBox` (numeric `value`), fails honestly on a non-editable combo given
+    an unknown value (400, not a silent `ok:true`), and 404s a negative `Class:ordinal` ref (no
+    Python negative-index wrap-around). Two non-obvious invariants: **(a)** the HTTP server
     runs on a daemon thread but every widget touch is marshalled onto the GUI thread by
     `GuiBridge.call` (a posted `QEvent`); a modal runs a nested event loop so the calls still
-    land while the **cost-confirm gate** is open — the gate is *driven*, never bypassed.
+    land while the **cost-confirm gate** is open — the gate is *driven*, never bypassed. The
+    timeout↔execute race is settled with a **once-claim under a lock (Wave3 L15)**: whichever
+    of {GUI thread about to run `fn`, caller timing out} takes the claim first wins, so a
+    504-reported call can never also execute afterward (no double-click on retry); if the GUI
+    thread claims just as the caller times out, the caller *waits* for the real result instead
+    of raising a spurious 504. And `_dispatch` **never double-responds on a dead socket (Wave3
+    L20)**: a `_send_json`/`_send_png` marks `_response_started`, so an exception raised AFTER
+    a response began (a BrokenPipe mid-write) propagates for the base handler to close the
+    connection rather than triggering a second `_send_json` on the same broken socket; only
+    exceptions raised BEFORE any bytes went out map onto an error response (404/400/504/500).
     **(b)** It is **off by default** and **127.0.0.1-only, no auth** — enable per-launch with
     `ANIMGEN_REMOTE=1` (port via `ANIMGEN_REMOTE_PORT`, default 8765). Drive it with
     `scripts/remote_cli.py` or `curl`; pure helpers + a full round-trip are covered by

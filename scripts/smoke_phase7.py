@@ -25,7 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # animgen/
 
 from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QCheckBox, QLineEdit, QPushButton, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QLineEdit, QPushButton, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from remote import snapshot as snap  # noqa: E402
@@ -128,6 +129,75 @@ def test_tab_widget() -> None:
     print("tab widget OK")
 
 
+def test_do_set_spinbox_and_combo() -> None:
+    """L16: do_set drives QSpinBox/QDoubleSpinBox; a non-editable combo with an unknown value
+    fails honestly (raises, not a silent ok:true); a numeric-cast failure raises."""
+    app = _app()
+    root = QWidget()
+    lay = QVBoxLayout(root)
+    spin = QSpinBox()
+    spin.setRange(0, 100)
+    dspin = QDoubleSpinBox()
+    dspin.setRange(0.0, 10.0)
+    dspin.setDecimals(2)
+    combo = QComboBox()  # non-editable by default
+    combo.addItems(["alpha", "beta"])
+    ecombo = QComboBox()
+    ecombo.setEditable(True)
+    ecombo.addItems(["one", "two"])
+    for wdg in (spin, dspin, combo, ecombo):
+        lay.addWidget(wdg)
+    root.show()
+    app.processEvents()
+
+    assert snap.do_set(spin, value="42") == {"value": 42} and spin.value() == 42
+    res = snap.do_set(dspin, value="3.5")
+    assert res == {"value": 3.5} and abs(dspin.value() - 3.5) < 1e-9, res
+
+    try:
+        snap.do_set(spin, value="not-a-number")
+        raise AssertionError("non-numeric spinbox value must raise")
+    except ValueError:
+        pass
+
+    # Non-editable combo: a known value selects it; an unknown value raises (no silent no-op).
+    assert snap.do_set(combo, value="beta")["currentText"] == "beta" and combo.currentIndex() == 1
+    before = combo.currentIndex()
+    try:
+        snap.do_set(combo, value="gamma")
+        raise AssertionError("unknown value on a non-editable combo must raise")
+    except ValueError:
+        pass
+    assert combo.currentIndex() == before, "a failed combo set must not change the selection"
+
+    # Editable combo accepts a free-text value.
+    assert snap.do_set(ecombo, value="three")["currentText"] == "three", ecombo.currentText()
+
+    # Spinbox surfaces its value in a snapshot.
+    desc = next(d for d in snap.build_snapshot(root) if d["class"] == "QSpinBox")
+    assert desc["value"] == 42, desc
+    print("do_set spinbox/combo OK")
+
+
+def test_negative_ordinal_rejected() -> None:
+    """L16: a negative Class:ordinal ref resolves to None (404), not a Python negative index."""
+    app = _app()
+    root = QWidget()
+    lay = QVBoxLayout(root)
+    b0 = QPushButton("zero")
+    b1 = QPushButton("one")
+    for b in (b0, b1):
+        lay.addWidget(b)
+    root.show()
+    app.processEvents()
+
+    assert snap.resolve_target(root, ref="QPushButton:0") is b0
+    assert snap.resolve_target(root, ref="QPushButton:1") is b1
+    assert snap.resolve_target(root, ref="QPushButton:-1") is None, "negative ordinal must 404"
+    assert snap.resolve_target(root, ref="QPushButton:99") is None, "out-of-range must 404"
+    print("negative ordinal rejected OK")
+
+
 def test_actions() -> None:
     app = _app()
     w, btn, edit, chk = _build_form()
@@ -216,6 +286,99 @@ def test_monitor_poller_supersede() -> None:
     print("monitor poller supersede OK")
 
 
+def test_bridge_cancel_once() -> None:
+    """L15: GuiBridge.call cancellation is atomic wrt execution. Two cases:
+    (1) a call that never gets to run before the timeout must NOT execute afterward (no late
+        side effect / double-action);
+    (2) a call the GUI thread starts just as the caller times out must return its REAL result,
+        not a spurious 504 — the timeout waits for it instead of racing a re-send."""
+    app = _app()
+    from remote.bridge import GuiBridge
+
+    bridge = GuiBridge()  # lives on the GUI (main) thread
+    ran: list[str] = []
+    results: dict[str, Any] = {}
+
+    # Case 1: the GUI event loop is NOT pumped until AFTER the worker's call has timed out, so
+    # the posted event is still queued when the timeout fires. It must be cancelled and never
+    # run once the loop finally turns.
+    def worker_timeout() -> None:
+        try:
+            bridge.call(lambda: ran.append("late") or "value", timeout=0.1)
+            results["case1"] = "returned"  # should not happen
+        except TimeoutError:
+            results["case1"] = "timeout"
+        finally:
+            results["case1_done"] = True
+
+    threading.Thread(target=worker_timeout, daemon=True).start()
+    time.sleep(0.3)  # let the worker post its event and time out while the loop is idle
+    # Now pump the loop: the queued _CallEvent is delivered but must find itself cancelled.
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not results.get("case1_done"):
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
+    assert results.get("case1") == "timeout", results
+    assert ran == [], f"a timed-out call must NOT execute afterward, got {ran}"
+
+    # Case 2: a normal call under a live loop returns its result (claim-then-run path).
+    results2: dict[str, Any] = {}
+
+    def worker_ok() -> None:
+        results2["val"] = bridge.call(lambda: "hello", timeout=5.0)
+        results2["done"] = True
+
+    threading.Thread(target=worker_ok, daemon=True).start()
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not results2.get("done"):
+        app.processEvents()
+        time.sleep(0.01)
+    assert results2.get("val") == "hello", results2
+    print("bridge cancel once OK")
+
+
+def test_dispatch_no_double_response() -> None:
+    """L20: _dispatch must not re-send after a response-write failure. When a handler starts a
+    response and then the socket write raises (BrokenPipe), the exception is a dead-socket
+    write error — it must propagate, NOT trigger a second _send_json on the same socket. A
+    handler error raised BEFORE any bytes are written still maps to one error response."""
+    from remote.server import TargetNotFound, _Handler
+
+    handler = _Handler.__new__(_Handler)  # bypass __init__ (no real socket needed)
+    sent: list[tuple] = []
+
+    def record_send(obj, code=200):
+        # Mirror the real _send_json: mark response-started, then "write". Here the write
+        # itself blows up on the SECOND call — but with the fix there is never a second call.
+        handler._response_started = True
+        sent.append((code, obj))
+
+    handler._send_json = record_send  # type: ignore[assignment]
+
+    # (1) Handler that writes a good response, then its write path dies mid-payload.
+    handler._response_started = False
+    sent.clear()
+
+    def handler_writes_then_dies():
+        handler._send_json({"ok": True})          # response begins here
+        raise BrokenPipeError("client hung up mid-write")
+
+    try:
+        handler._dispatch(handler_writes_then_dies)
+        raise AssertionError("a post-response write error must propagate, not be swallowed")
+    except BrokenPipeError:
+        pass
+    assert len(sent) == 1, f"exactly ONE response must be sent, got {len(sent)}: {sent}"
+
+    # (2) Handler error BEFORE any response -> one mapped error response (404 here).
+    handler._response_started = False
+    sent.clear()
+    handler._dispatch(lambda: (_ for _ in ()).throw(TargetNotFound({"ref": "x"})))
+    assert len(sent) == 1 and sent[0][0] == 404, sent
+    print("dispatch no-double-response OK")
+
+
 def test_server_roundtrip() -> None:
     app = _app()
     win, btn, edit, chk = _build_form()
@@ -231,6 +394,8 @@ def test_server_roundtrip() -> None:
 
     clicks: list[int] = []
     btn.clicked.connect(lambda: clicks.append(1))
+    edit.setFocus()  # L1: /type {text} must land here (focus), not on the "Generate" button
+    app.processEvents()
     results: dict[str, object] = {}
 
     def get(path: str) -> bytes:
@@ -260,6 +425,11 @@ def test_server_roundtrip() -> None:
             results["snapshot"] = json.loads(get("/snapshot"))
             results["click"] = json.loads(post("/click", {"text": "Generate"}))
             results["png"] = get("/screenshot")
+            # L1: bare {text} types into the FOCUSED field (nameEdit), not the "Generate"
+            # button that shares no text with the payload — proving text is no longer a selector.
+            results["type_focus"] = json.loads(post("/type", {"text": "abc"}))
+            # L1: {keys, ref} selects the widget explicitly and types keys into it.
+            results["type_keys"] = json.loads(post("/type", {"keys": "XY", "ref": "nameEdit"}))
             # negative paths: missing target -> 404, bad JSON -> 400, non-checkable -> 400
             results["miss"] = post_status("/click", b'{"ref": "no-such-widget"}')
             results["badjson"] = post_status("/click", b"{not json")
@@ -286,17 +456,26 @@ def test_server_roundtrip() -> None:
     assert results["click"]["ok"] is True, results["click"]  # type: ignore[index]
     assert clicks == [1], "the click must have fired on the GUI thread via the bridge"
     assert results["png"][:8] == _PNG_MAGIC, "screenshot must be PNG"  # type: ignore[index]
+    # L1: the bare {text} typed into the focused nameEdit; {keys, ref} appended into the same
+    # field. Neither routed to the button (clicks stayed at 1) and the field holds both.
+    assert results["type_focus"]["target"] == "nameEdit", results["type_focus"]  # type: ignore[index]
+    assert results["type_keys"]["target"] == "nameEdit", results["type_keys"]  # type: ignore[index]
+    assert edit.text() == "abcXY", f"type must land in the field, got {edit.text()!r}"
     assert results["miss"] == 404, results.get("miss")
     assert results["badjson"] == 400, results.get("badjson")
     assert results["noncheck"] == 400, results.get("noncheck")  # genBtn isn't checkable
-    print("server round-trip OK (+ 404/400 negative paths)")
+    print("server round-trip OK (+ L1 type-into-focus, 404/400 negative paths)")
 
 
 if __name__ == "__main__":
     test_snapshot_and_resolve()
     test_resolve_prefers_visible()
     test_tab_widget()
+    test_do_set_spinbox_and_combo()
+    test_negative_ordinal_rejected()
     test_actions()
+    test_bridge_cancel_once()
+    test_dispatch_no_double_response()
     test_monitor_poller_supersede()
     test_server_roundtrip()
     print("PHASE 7 SMOKE: PASS")

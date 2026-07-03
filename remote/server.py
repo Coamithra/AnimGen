@@ -10,7 +10,8 @@ Endpoints (JSON in/out unless noted):
     GET  /snapshot               -> {"widgets": [ {ref,class,name,text,rect,enabled,...} ]}
     GET  /screenshot[?ref=...]   -> image/png of the window (or one widget via QWidget.grab)
     POST /click  {ref|object_name|text}
-    POST /type   {text, ref?|object_name?|text?}      (keystrokes; defaults to focus)
+    POST /type   {keys, ref?|object_name?|text?}      (keystrokes into a selected widget)
+                 {text}                               (keystrokes into the focused widget)
     POST /key    {key, ref?|object_name?}             (e.g. "enter", "tab", "escape")
     POST /set    {ref|object_name, value?|checked?}   (direct value set)
 """
@@ -51,9 +52,11 @@ def _require(window: QWidget, body: dict[str, Any]) -> QWidget:
     return w
 
 
-def _focus_or_require(window: QWidget, body: dict[str, Any]) -> QWidget:
-    if body.get("ref") or body.get("object_name") or body.get("text"):
-        return _require(window, body)
+def _focus_or_require(window: QWidget, selector: dict[str, Any]) -> QWidget:
+    """Resolve `selector` (ref/object_name/text) to a drivable widget, or the focused widget
+    when no selector is given."""
+    if selector.get("ref") or selector.get("object_name") or selector.get("text"):
+        return _require(window, selector)
     w = QApplication.focusWidget()
     if w is None:
         raise ValueError("no focused widget; provide 'ref', 'object_name', or 'text'")
@@ -72,6 +75,11 @@ class _Server(ThreadingHTTPServer):
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "AnimGenRemote/1.0"
+
+    # Set True the moment we start writing a response (status line onward). Once a response
+    # has begun, a later failure is a dead-socket write error, NOT a handler-logic error —
+    # _dispatch must not try to _send_json a second time on the same (broken) socket (L20).
+    _response_started: bool = False
 
     # ---- plumbing ----
     def log_message(self, format, *args) -> None:  # noqa: A002,D401 - silence access log
@@ -101,6 +109,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, obj: Any, code: int = 200) -> None:
         payload = json.dumps(obj).encode("utf-8")
+        self._response_started = True
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -108,6 +117,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _send_png(self, data: bytes) -> None:
+        self._response_started = True
         self.send_response(200)
         self.send_header("Content-Type", "image/png")
         self.send_header("Content-Length", str(len(data)))
@@ -117,14 +127,22 @@ class _Handler(BaseHTTPRequestHandler):
     def _dispatch(self, handler: Callable[[], Any]) -> None:
         try:
             handler()
-        except TargetNotFound as exc:
-            self._send_json({"error": "target not found", "query": exc.args[0]}, 404)
-        except ValueError as exc:
-            self._send_json({"error": str(exc)}, 400)
-        except TimeoutError as exc:
-            self._send_json({"error": str(exc)}, 504)
         except Exception as exc:  # noqa: BLE001 - report, don't kill the server thread
-            self._send_json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            # If a response already began, the exception is a dead-socket WRITE error (e.g.
+            # BrokenPipe mid-payload), not a handler-logic error — a second _send_json on the
+            # same broken socket would double-respond (L20). Let it propagate so the base
+            # handler closes the connection; only map exceptions raised BEFORE any bytes went
+            # out onto an error response.
+            if self._response_started:
+                raise
+            if isinstance(exc, TargetNotFound):
+                self._send_json({"error": "target not found", "query": exc.args[0]}, 404)
+            elif isinstance(exc, ValueError):
+                self._send_json({"error": str(exc)}, 400)
+            elif isinstance(exc, TimeoutError):
+                self._send_json({"error": str(exc)}, 504)
+            else:
+                self._send_json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
     # ---- routes ----
     def do_GET(self) -> None:  # noqa: N802 - http.server override
@@ -184,13 +202,23 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(self._call(act))
 
     def _route_type(self, body: dict[str, Any]) -> None:
-        text = body.get("text")
-        if not isinstance(text, str):
-            raise ValueError("'text' (string) is required")
+        # L1: keep the text-to-type distinct from the selector. Prefer an explicit 'keys'
+        # payload; then ref/object_name/text are pure selectors (so you can type into a
+        # text-matched field). With no 'keys', 'text' IS the payload — typed into the focused
+        # widget (or ref/object_name if given), which is the documented 'type into focus' path
+        # and stays back-compatible with old `{"text": ...}` callers.
+        has_keys = "keys" in body
+        payload = body.get("keys") if has_keys else body.get("text")
+        if not isinstance(payload, str):
+            raise ValueError("'keys' (or 'text') string is required")
+        if has_keys:
+            selector = {k: body.get(k) for k in ("ref", "object_name", "text")}
+        else:
+            selector = {k: body.get(k) for k in ("ref", "object_name")}
 
         def act() -> dict[str, Any]:
-            w = _focus_or_require(self._window, body)
-            snap.do_type(w, text)
+            w = _focus_or_require(self._window, selector)
+            snap.do_type(w, payload)
             return {"ok": True, "target": w.objectName() or type(w).__name__}
 
         self._send_json(self._call(act))

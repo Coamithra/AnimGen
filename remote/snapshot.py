@@ -17,8 +17,8 @@ from typing import Any, Optional
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
-    QAbstractButton, QCheckBox, QComboBox, QGroupBox, QLabel, QLineEdit,
-    QPlainTextEdit, QTabBar, QTabWidget, QTextEdit, QWidget,
+    QAbstractButton, QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QLabel, QLineEdit,
+    QPlainTextEdit, QSpinBox, QTabBar, QTabWidget, QTextEdit, QWidget,
 )
 
 # QTabBar and QTabWidget share the count()/tabText()/currentIndex()/setCurrentIndex() API,
@@ -27,7 +27,8 @@ _TABS = (QTabBar, QTabWidget)
 
 # Widgets always worth surfacing, even when they carry no text.
 _INTERACTIVE = (
-    QAbstractButton, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QTabBar, QTabWidget)
+    QAbstractButton, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QTabBar, QTabWidget,
+    QSpinBox, QDoubleSpinBox)
 
 # Single-line text accessors, tried in order.
 _TEXT_GETTERS = ("text", "currentText", "title")
@@ -104,6 +105,8 @@ def _describe(window: QWidget, w: QWidget, ordinal: int) -> dict[str, Any]:
         d["options"] = [w.itemText(i) for i in range(w.count())]
     if isinstance(w, QCheckBox):
         d["checked"] = w.isChecked()
+    if isinstance(w, (QSpinBox, QDoubleSpinBox)):
+        d["value"] = w.value()
     return d
 
 
@@ -144,9 +147,12 @@ def resolve_target(
             cls, _, idx = ref.rpartition(":")
             same = [x for x in window.findChildren(QWidget) if _class_name(x) == cls]
             try:
-                return same[int(idx)]
-            except (ValueError, IndexError):
+                n = int(idx)
+            except ValueError:
                 return None
+            if n < 0 or n >= len(same):  # reject negative ordinals (no Python wrap-around)
+                return None
+            return same[n]
     if text:
         want = text.strip()
         if not want:  # whitespace-only would otherwise substring-match every widget
@@ -220,7 +226,17 @@ def do_set(
         return {"checked": widget.isChecked()}
     if value is not None:
         if isinstance(widget, QComboBox):
-            widget.setCurrentText(str(value))
+            want = str(value)
+            if widget.isEditable():
+                widget.setCurrentText(want)
+                return {"currentText": widget.currentText()}
+            # A non-editable combo silently ignores setCurrentText for an unknown value, so
+            # match against the item list and report an honest failure on a miss (not ok:true).
+            idx = widget.findText(want)
+            if idx < 0:
+                options = [widget.itemText(i) for i in range(widget.count())]
+                raise ValueError(f"no option {want!r} in combo (options: {options})")
+            widget.setCurrentIndex(idx)
             return {"currentText": widget.currentText()}
         if isinstance(widget, _TABS):
             for i in range(widget.count()):
@@ -228,6 +244,15 @@ def do_set(
                     widget.setCurrentIndex(i)
                     return {"current": widget.currentIndex()}
             raise ValueError(f"no tab named {value!r}")
+        if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+            cast = float if isinstance(widget, QDoubleSpinBox) else int
+            try:
+                num = cast(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{type(widget).__name__} needs a numeric value, got {value!r}") from exc
+            widget.setValue(num)
+            return {"value": widget.value()}
         if isinstance(widget, (QPlainTextEdit, QTextEdit)):
             widget.setPlainText(str(value))
             return {"text": str(value)}
