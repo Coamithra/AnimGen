@@ -1321,6 +1321,56 @@ def test_delete_shot_discard_preserves_takes() -> None:
     print("delete_shot discard OK: takes survive Discard + write-through, dropped only on save (H1)")
 
 
+def test_export_starred_takes() -> None:
+    """The Shots-strip 'Export starred takes' action gathers exactly the starred takes of
+    the shots currently shown (obeying the view filters) and delegates to export_takes."""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    project = Project.new()
+    s1 = project.add_shot("kick", model_id="seedance-2.0-std")
+    s2 = project.add_shot("punch", model_id="seedance-2.0-std")
+    # s1: one starred, one un-starred, one starred-but-deleted (must be excluded).
+    a = project.add_take(s1.id, status=STATUS_DONE, starred=True)
+    project.add_take(s1.id, status=STATUS_DONE, starred=False)
+    d = project.add_take(s1.id, status=STATUS_DONE, starred=True)
+    project.soft_delete_take(d.id)
+    # s2: one starred.
+    b = project.add_take(s2.id, status=STATUS_DONE, starred=True)
+
+    win = MainWindow(project)
+
+    captured: dict = {}
+    win.export_takes = lambda ids, label=None: captured.update(ids=list(ids), label=label)  # type: ignore[method-assign]
+    win.export_starred_takes()
+    assert set(captured["ids"]) == {a.id, b.id}, captured["ids"]
+    assert captured["label"] == "starred"
+    assert d.id not in captured["ids"], "a deleted starred take is not exported"
+
+    # View filter obeyed: filter to 'punch' only -> only s2's starred take.
+    captured.clear()
+    win.model_filter  # noqa: B018  (built in reload)
+    # Star-shots filter: star only s1, enable 'Starred shots' -> only s1's starred take exported.
+    project.set_shot_starred(s1.id, True)
+    win.starred_shots_filter.setChecked(True)   # triggers reload -> cards == {s1}
+    win.export_starred_takes()
+    assert set(captured["ids"]) == {a.id}, captured["ids"]
+
+    # Empty view -> a message, no delegate call. Unstar every take under the still-active
+    # 'Starred shots' filter (cards == {s1}, which now has no starred take).
+    project.update_take(a.id, starred=False)
+    win.starred_filter  # noqa: B018
+    captured.clear()
+    _orig_info = QMessageBox.information
+    QMessageBox.information = staticmethod(lambda *a, **k: None)  # type: ignore[assignment]
+    try:
+        win.export_starred_takes()
+    finally:
+        QMessageBox.information = _orig_info  # type: ignore[assignment]
+    assert "ids" not in captured, "no starred takes -> no export delegation"
+    print("export starred takes OK: gathers view's starred takes, excludes deleted, empty->message")
+
+
 if __name__ == "__main__":
     test_export()
     test_take_media_probe()
@@ -1346,4 +1396,5 @@ if __name__ == "__main__":
     test_refresher_survives_deleted_signals()
     test_save_as_rollback_on_write_failure()
     test_delete_shot_discard_preserves_takes()
+    test_export_starred_takes()
     print("PHASE 5 SMOKE: PASS")
