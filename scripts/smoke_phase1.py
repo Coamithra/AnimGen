@@ -510,7 +510,8 @@ def test_network_error_retry() -> None:
                            payload={"input": {}})
             raise AssertionError("expected ReplicateError on a create-POST network blip")
         except rc.ReplicateError as e:
-            assert "Network error" in str(e), str(e)
+            # the message says WHY it wasn't retried (duplicate-spend), not "transient - retry me"
+            assert "Network error" in str(e) and "Not retried" in str(e), str(e)
             assert calls["n"] == 1, calls                                 # NOT retried
 
         # (d) an idempotent GET that keeps failing eventually gives up - wrapped, all attempts used.
@@ -520,7 +521,7 @@ def test_network_error_retry() -> None:
             rc.api_request("tok", "https://api.replicate.com/v1/predictions/abc")
             raise AssertionError("expected ReplicateError after exhausting GET retries")
         except rc.ReplicateError as e:
-            assert "Network error" in str(e), str(e)
+            assert "Network error" in str(e) and "retried, then gave up" in str(e), str(e)
             assert calls["n"] == 8, calls                                 # 8 attempts, then give up
 
         # (e) the result download retries a network blip on the (idempotent) fetch, then succeeds.
@@ -541,6 +542,49 @@ def test_network_error_retry() -> None:
             out_path = Path(td) / "v.mp4"
             rc._download_result("https://replicate.delivery/v.mp4", "tok", out_path)
             assert out_path.read_bytes() == b"VIDEO-BYTES" and calls["n"] == 2, calls
+
+            # (f) a download that keeps blipping gives up after all 8 attempts, wrapped + no file.
+            calls["n"] = 0
+            def never_up(req, timeout=0):
+                calls["n"] += 1
+                raise socket.timeout("timed out")
+            rc.urllib.request.urlopen = never_up
+            gone = Path(td) / "never.mp4"
+            try:
+                rc._download_result("https://replicate.delivery/never.mp4", "tok", gone)
+                raise AssertionError("expected ReplicateError after exhausting download retries")
+            except rc.ReplicateError as e:
+                assert "Network error" in str(e), str(e)
+                assert calls["n"] == 8, calls
+                assert not gone.exists()                                  # no partial file left
+
+            # (g) a transient 502 on the download is retried like the API loop, then recovers.
+            import io as iomod
+            calls["n"] = 0
+            def flaky_502(req, timeout=0):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {},
+                                                 iomod.BytesIO(b"error code: 502"))
+                return _Bytes()
+            rc.urllib.request.urlopen = flaky_502
+            out2 = Path(td) / "v2.mp4"
+            rc._download_result("https://replicate.delivery/v2.mp4", "tok", out2)
+            assert out2.read_bytes() == b"VIDEO-BYTES" and calls["n"] == 2, calls
+
+            # (h) a non-retryable HTTP error on the download (expired 404) fails fast, humanized.
+            calls["n"] = 0
+            def gone_404(req, timeout=0):
+                calls["n"] += 1
+                raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {},
+                                             iomod.BytesIO(b"expired"))
+            rc.urllib.request.urlopen = gone_404
+            try:
+                rc._download_result("https://replicate.delivery/old.mp4", "tok", Path(td) / "old.mp4")
+                raise AssertionError("expected ReplicateError on a 404 download")
+            except rc.ReplicateError as e:
+                assert "HTTP 404" in str(e), str(e)
+                assert calls["n"] == 1, calls                             # fail fast, no retry
     finally:
         rc.urllib.request.urlopen, rc.time.sleep = saved_open, saved_sleep
     print("replicate_client OK: network blips retried on idempotent GET + download, not on create POST")

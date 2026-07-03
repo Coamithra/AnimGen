@@ -93,7 +93,7 @@ _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})  # transient - safe to retr
 _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, socket.timeout)
 
 
-def _is_idempotent(method, body) -> bool:
+def _is_idempotent(method: Optional[str], body: Optional[bytes]) -> bool:
     """True when the effective HTTP method is GET (no explicit non-GET method, no request body) -
     the only requests safe to retry on a bare network error. urllib sends GET when data is None
     and method is unset; anything with a body or an explicit method is treated as non-idempotent."""
@@ -102,12 +102,23 @@ def _is_idempotent(method, body) -> bool:
     return body is None
 
 
-def _network_error_message(url: str, err: Exception) -> str:
+def _network_wait(attempt: int) -> int:
+    """Seconds of escalating backoff before retrying a transport-level failure. Pure (no sleep);
+    the same curve as _retry_wait's 5xx tail, kept in one place so the two policies can't drift."""
+    return min(4 * (attempt + 1), 20)
+
+
+def _network_error_message(url: str, err: Exception, *, retried: bool = True) -> str:
     """A human-readable one-liner for a Replicate call that failed at the transport layer (no HTTP
-    response): a connection reset, DNS failure, or read timeout. Pure."""
+    response): a connection reset, DNS failure, or read timeout. Pure. retried=False is the
+    non-idempotent POST case - it says WHY there was no retry, so the reader isn't invited to
+    just re-send a request that may already have been accepted (and billed) server-side."""
     reason = getattr(err, "reason", None) or err
-    return (f"Network error reaching Replicate (from {url}): {reason}\n"
-            f"The connection failed before a response - this is usually a transient blip.")
+    head = f"Network error reaching Replicate (from {url}): {reason}"
+    if retried:
+        return f"{head}\nThe connection failed before a response - retried, then gave up."
+    return (f"{head}\nNot retried: the request may already have been accepted server-side, and "
+            f"re-sending it could create (and bill) a duplicate prediction.")
 
 
 def _http_error_message(code: int, url: str, detail: str) -> str:
@@ -127,7 +138,7 @@ def _retry_wait(code: int, detail: str, attempt: int) -> int:
             return int(json.loads(detail).get("retry_after", 15)) + 3
         except (ValueError, AttributeError, TypeError):
             return 15
-    return min(4 * (attempt + 1), 20)
+    return _network_wait(attempt)
 
 
 def api_request(token: str, url: str, payload=None, method=None,
@@ -158,9 +169,9 @@ def api_request(token: str, url: str, payload=None, method=None,
             raise ReplicateError(_http_error_message(e.code, url, detail)) from e
         except _NETWORK_ERRORS as e:
             if idempotent and attempt < 7:
-                time.sleep(min(4 * (attempt + 1), 20))
+                time.sleep(_network_wait(attempt))
                 continue
-            raise ReplicateError(_network_error_message(url, e)) from e
+            raise ReplicateError(_network_error_message(url, e, retried=idempotent)) from e
     raise ReplicateError(f"Gave up retrying Replicate after repeated transient errors: {url}")
 
 
@@ -426,7 +437,9 @@ def _download_result(url: str, token: str, out_path: Path) -> None:
     """Fetch a succeeded prediction's video to `out_path`. An idempotent GET, so a transient
     network blip (reset / DNS / read timeout) mid-download is retried with backoff before giving
     up; an HTTP error and a final network give-up both raise ReplicateError. The whole body is
-    read into memory then written, so a partial read never leaves a truncated file on disk."""
+    read into memory then written, so a partial read never leaves a truncated file on disk - a
+    deliberate tradeoff (a transient RAM spike the size of one clip; these are short, bounded
+    videos, and the pre-existing code buffered the full body the same way)."""
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "User-Agent": _UA})
     for attempt in range(8):
         try:
@@ -442,7 +455,7 @@ def _download_result(url: str, token: str, out_path: Path) -> None:
             raise ReplicateError(_http_error_message(e.code, url, detail)) from e
         except _NETWORK_ERRORS as e:
             if attempt < 7:
-                time.sleep(min(4 * (attempt + 1), 20))
+                time.sleep(_network_wait(attempt))
                 continue
             raise ReplicateError(_network_error_message(url, e)) from e
     raise ReplicateError(f"Gave up retrying the result download after repeated transient errors: {url}")
