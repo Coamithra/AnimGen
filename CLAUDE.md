@@ -715,19 +715,23 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     re-runs or re-charges**, so reconciliation can **NEVER create spend**). Mapping: `succeeded` →
     RECLAIM (download the already-paid-for output via `replicate_client.download_output`, stamp
     fps/frame_count via `extract.probe_media_fields` — mirrors the comfy RECLAIM path, incl. a
-    binned take's media going to `.bin/<id>/`, H2), `failed` → FAILED (**genuine render error,
-    `interrupted=False`**), `canceled` → CANCELLED (`interrupted=True`), and
-    `starting`/`processing`/**no `backend_job_id`**/**network-down or poll-error (status `None`)** →
-    FAILED + `interrupted=True` (can't verify / no live worker to re-attach → restartable via this
-    rule rather than a frozen zombie). The planner attaches the `prediction` dict to RECLAIM **and**
-    the genuine-`failed` FAIL plan so `main_window._execute_replicate_plans` can set `interrupted`
-    correctly (genuine failure = not interrupted; every other terminal FAIL = interrupted). It's
-    **resilient to Replicate being unreachable** — a raised poll → `None` → FAILED+interrupted, the
-    load never crashes. Interrupted hosted takes feed the **same recovery banner / Restart
-    interrupted takes** flow. Wired in `_recover_orphans` (kicks off BOTH the comfy and the hosted
-    reconcilers), applied in `_apply_replicate_recovery` → `_execute_replicate_plans`. Smoke-tested
-    in `smoke_phase2.test_hosted_orphan_recovery` (select + each status → action, no spend, execution
-    stamps DONE/interrupted correctly with a stubbed client — the real Replicate API is never hit).
+    binned take's media going to `.bin/<id>/`, H2); `failed` → FAILED (**genuine render error,
+    `interrupted=False`**); `canceled` → CANCELLED (`interrupted=True`); `starting`/`processing`/an
+    unrecognized status/**a GENERATING take with no `backend_job_id`**/**network-down or poll-error
+    (status `None`)** → FAILED + `interrupted=True`; and a **PENDING take that was never submitted**
+    (no id, or unreachable) → CANCELLED + `interrupted=True` (mirrors the comfy never-submitted
+    CANCEL). Each plan carries an **explicit `interrupted` flag** the planner sets (not re-derived
+    in the executor), so the intent is unambiguous. **A `succeeded` prediction whose DOWNLOAD fails
+    this session** (a Replicate blip) is **left GENERATING**, not FAILED — the render is already paid
+    for, so `_execute_replicate_plans` defers it for **next launch's free-download retry** rather than
+    marking it interrupted (which would push it into Restart-interrupted → a re-render that **re-bills**
+    an output we already have). It's **resilient to Replicate being unreachable** — a raised poll →
+    `None` → the take is cleared restartable, the load never crashes. Interrupted hosted takes feed the
+    **same recovery banner / Restart interrupted takes** flow. Wired in `_recover_orphans` (kicks off
+    BOTH the comfy and the hosted reconcilers, on `__init__` and project-switch), applied in
+    `_apply_replicate_recovery` → `_execute_replicate_plans`. Smoke-tested in
+    `smoke_phase2.test_hosted_orphan_recovery` (select + each status → action + interrupted flag, the
+    paid-download-defer path, no spend — a stubbed client, the real Replicate API is never hit).
 18. **The 2026-06-18 native stack-overflow crash is ROOT-CAUSED: a runaway
     `QWidgetPrivate::paintSiblingsRecursive`. Card #72 has since REMOVED the prime suspect's
     mechanism (the Queue's per-row widgets) - see "FIX LANDED" at the end of this rule.** The genuine

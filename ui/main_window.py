@@ -1434,7 +1434,7 @@ class MainWindow(QMainWindow):
 
     # ---- orphan recovery -----------------------------------------------
     def _recover_orphans(self) -> None:
-        """Reconcile takes a prior session left mid-render on the local backend.
+        """Reconcile takes a prior session left mid-render on either backend.
 
         On load there are no live workers, so any take still at generating/pending is orphaned.
         Local (comfyui) takes reconcile against the surviving ComfyUI server (/history + /queue);
@@ -1558,24 +1558,23 @@ class MainWindow(QMainWindow):
                         fps=fps, frame_count=frame_count, backend_job_id=p.prompt_id,
                         completed=datetime.now().isoformat(timespec="seconds"))
                 except Exception as e:  # noqa: BLE001 - a failed download must not abort the rest
-                    self.project.update_take(p.take_id, status=STATUS_FAILED,
-                                             error=f"hosted recovery download failed: {e}",
-                                             interrupted=True)   # unclaimed render, restartable
-                    self._log(f"orphan {p.take_id[:8]}: hosted reclaim FAILED: {e}")
-                    counts["fail"] += 1
-                    self._refresh_shot(p.shot_id)
+                    # The render SUCCEEDED and is already paid for - the download just couldn't
+                    # complete this session (Replicate blip). Leave the take GENERATING so NEXT
+                    # launch's reconciliation retries the FREE download; marking it FAILED would
+                    # push it into "Restart interrupted takes" -> a re-render that RE-BILLS an
+                    # output we already have. The row un-freezes next launch, not this one.
+                    self._log(f"hosted orphan {p.take_id[:8]}: reclaim download deferred "
+                              f"(will retry next launch): {e}")
+                    counts["deferred"] += 1
                     continue
             elif p.action == recovery.FAIL:
-                # A genuine `failed` prediction is a real render error (not interrupted); every
-                # other FAIL here (still-running / unverifiable / no job id) is crash/lost and
-                # restartable. plan_replicate_recovery only emits CANCEL for a server-side cancel.
-                genuine = (p.prediction is not None
-                           and p.prediction.get("status") == "failed")
+                # interrupted is set explicitly by the planner: False = genuine render failure,
+                # True = crash/lost/unverifiable (restartable via rule #17).
                 self.project.update_take(p.take_id, status=STATUS_FAILED, error=p.reason,
-                                         interrupted=not genuine)
+                                         interrupted=bool(p.interrupted))
             elif p.action == recovery.CANCEL:
                 self.project.update_take(p.take_id, status=STATUS_CANCELLED, error=p.reason,
-                                         interrupted=True)   # stopped on the server, restartable
+                                         interrupted=bool(p.interrupted))
             counts[p.action] += 1
             self._log(f"hosted orphan {p.take_id[:8]}: {p.reason}")
             self._refresh_shot(p.shot_id)

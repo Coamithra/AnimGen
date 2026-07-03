@@ -1387,43 +1387,59 @@ def test_hosted_orphan_recovery() -> None:
         return Take(id=tid, shot_id="s", status=status, backend_job_id=job)
 
     orphan_list = [
-        t("succ",  STATUS_GENERATING),
-        t("fail",  STATUS_GENERATING),
-        t("canc",  STATUS_GENERATING),
-        t("run",   STATUS_GENERATING),
-        t("nojob", STATUS_GENERATING, job=None),   # never recorded a prediction id
-        t("down",  STATUS_GENERATING),             # poll failed -> None
-        t("pend",  STATUS_PENDING),                # never submitted, still pollable if id kept
+        t("succ",   STATUS_GENERATING),
+        t("fail",   STATUS_GENERATING),
+        t("canc",   STATUS_GENERATING),
+        t("run",    STATUS_GENERATING),
+        t("nojobg", STATUS_GENERATING, job=None),   # generating, never recorded a prediction id
+        t("down",   STATUS_GENERATING),             # generating, poll failed -> None
+        t("startg", STATUS_GENERATING),             # starting -> still running
+        t("pendnj", STATUS_PENDING, job=None),      # pending, never submitted (no id)
     ]
     statuses = {
-        "succ": {"status": "succeeded", "output": "https://x/v.mp4"},
-        "fail": {"status": "failed", "error": "OOM in the model"},
-        "canc": {"status": "canceled"},
-        "run":  {"status": "processing"},
-        "nojob": None,
-        "down": None,
-        "pend": {"status": "starting"},
+        "succ":  {"status": "succeeded", "output": "https://x/v.mp4"},
+        "fail":  {"status": "failed", "error": "OOM in the model"},
+        "canc":  {"status": "canceled"},
+        "run":   {"status": "processing"},
+        "nojobg": None,
+        "down":  None,
+        "startg": {"status": "starting"},
+        "pendnj": None,
     }
     plans = {p.take_id: p for p in recovery.plan_replicate_recovery(orphan_list, statuses)}
-    assert plans["succ"].action == recovery.RECLAIM, "succeeded -> reclaim the paid-for output"
+    assert plans["succ"].action == recovery.RECLAIM and plans["succ"].interrupted is False, \
+        "succeeded -> reclaim the paid-for output, not interrupted"
     assert plans["succ"].prediction["output"] == "https://x/v.mp4", "carries the prediction to download"
-    assert plans["fail"].action == recovery.FAIL and "failed on Replicate" in plans["fail"].reason
+    assert (plans["fail"].action == recovery.FAIL and plans["fail"].interrupted is False
+            and "failed on Replicate" in plans["fail"].reason), "genuine failure -> FAIL, not interrupted"
     assert "OOM" in plans["fail"].reason, "failure detail surfaced"
-    assert plans["canc"].action == recovery.CANCEL, "server-side cancel -> cancel"
-    assert plans["run"].action == recovery.FAIL, "still-running w/ no worker -> fail (restartable)"
-    assert plans["nojob"].action == recovery.FAIL, "no prediction id -> unverifiable -> fail"
-    assert plans["down"].action == recovery.FAIL, "network down (None) -> unverifiable -> fail"
-    assert plans["pend"].action == recovery.FAIL, "starting -> fail (restartable)"
+    assert plans["canc"].action == recovery.CANCEL and plans["canc"].interrupted is True
+    assert plans["run"].action == recovery.FAIL and plans["run"].interrupted is True, \
+        "still-running w/ no worker -> fail (interrupted, restartable)"
+    assert plans["startg"].action == recovery.FAIL and plans["startg"].interrupted is True, "starting -> fail"
+    assert plans["nojobg"].action == recovery.FAIL and plans["nojobg"].interrupted is True, \
+        "generating + no prediction id -> unverifiable -> fail (interrupted)"
+    assert plans["down"].action == recovery.FAIL and plans["down"].interrupted is True, \
+        "generating + network down (None) -> unverifiable -> fail (interrupted)"
+    # A PENDING take that was never submitted (no id) mirrors the comfy CANCEL, not FAIL.
+    assert plans["pendnj"].action == recovery.CANCEL and plans["pendnj"].interrupted is True, \
+        "pending + never submitted -> cancel (interrupted), matching the comfy side"
     # A take id simply absent from the statuses dict is treated as None (unverifiable).
     missing = recovery.plan_replicate_recovery([t("gone", STATUS_GENERATING)], {})[0]
-    assert missing.action == recovery.FAIL, "absent from statuses -> unverifiable -> fail"
+    assert missing.action == recovery.FAIL and missing.interrupted is True, \
+        "absent from statuses -> unverifiable -> fail (interrupted)"
+    # An unrecognized/future Replicate status can't be classified -> FAIL + interrupted, and the
+    # reason says so rather than falsely claiming the render is "running".
+    weird = recovery.plan_replicate_recovery(
+        [t("weird", STATUS_GENERATING)], {"weird": {"status": "quantum-superposition"}})[0]
+    assert weird.action == recovery.FAIL and weird.interrupted is True
+    assert "unrecognized" in weird.reason, "unknown status -> honest reason, not a false 'running'"
     # No plan carries an output_path (that's the comfy field); hosted uses `prediction`.
     assert all(p.output_path is None for p in plans.values())
 
     # Execution integration: _execute_replicate_plans applies RECLAIM (download honestly, no
-    # spend - stub the download + probe), FAIL, and CANCEL, and sets the interrupted flag
-    # correctly (genuine `failed` prediction -> NOT interrupted; everything else lost/unverifiable
-    # -> interrupted, so the Restart-interrupted banner picks it up).
+    # spend - stub the download + probe), FAIL, and CANCEL, propagating the planner's explicit
+    # interrupted flag (genuine `failed` -> NOT interrupted; canceled/unverifiable -> interrupted).
     import backends.replicate_client as rc
     import pipeline.extract as extract
     from PySide6.QtWidgets import QApplication
@@ -1465,10 +1481,23 @@ def test_hosted_orphan_recovery() -> None:
         assert gf.status == STATUS_FAILED and gf.interrupted is False, "genuine failure NOT interrupted"
         assert gc2.status == STATUS_CANCELLED and gc2.interrupted is True, "server cancel interrupted"
         assert gu.status == STATUS_FAILED and gu.interrupted is True, "unverifiable -> interrupted"
+
+        # A succeeded prediction whose DOWNLOAD fails this session (Replicate blip): the take is
+        # already PAID - leave it GENERATING so next launch retries the FREE download, NOT FAILED
+        # (which would push it to Restart-interrupted -> a re-render that RE-BILLS the same output).
+        rc.download_output = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("net blip"))
+        d = proj3.add_take(sh3.id, status=STATUS_GENERATING, backend_job_id="predD",
+                           settings_snapshot=snap_hosted)
+        win._execute_replicate_plans(recovery.plan_replicate_recovery(
+            [d], {d.id: {"status": "succeeded", "output": "https://x/v.mp4"}}))
+        gd = proj3.get_take(d.id)
+        assert gd.status == STATUS_GENERATING, "download-deferred paid take stays GENERATING (retry next launch)"
+        assert gd.interrupted is False, "deferred paid take is NOT flagged interrupted (must not re-render)"
     finally:
         rc.download_output, extract.probe_media_fields = orig_dl, orig_probe
-    print("hosted orphan recovery OK: select + succeeded/failed/canceled/running/no-id/down "
-          "-> reclaim/fail/cancel, no spend; execution stamps DONE/interrupted correctly")
+    print("hosted orphan recovery OK: select + succeeded/failed/canceled/running/no-id/down/pending "
+          "-> reclaim/fail/cancel, no spend; execution stamps DONE/interrupted + defers a paid "
+          "download rather than re-billing")
 
 
 def test_close_warning() -> None:

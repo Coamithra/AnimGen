@@ -57,6 +57,9 @@ class RecoveryPlan:
     reason: str = ""
     prediction: Optional[dict] = None   # the succeeded replicate prediction to download from
                                         # (hosted reclaim only; carries the output URL)
+    interrupted: Optional[bool] = None  # hosted plans set this explicitly (True = crash/lost/
+                                        # unverifiable -> restartable; False = genuine render
+                                        # failure). None on comfy plans (that executor sets it).
 
 
 def comfy_orphans(project) -> list:
@@ -217,52 +220,65 @@ def plan_replicate_recovery(orphans: list, statuses: dict) -> list[RecoveryPlan]
                  poll raised). A take id absent from the dict is treated as `None` too.
 
     Reconciliation NEVER creates spend - it only observes an already-running prediction, so:
-      - succeeded            -> RECLAIM (download the output the session already paid for)
-      - failed               -> FAIL    (genuine render failure; interrupted=False - see caller)
-      - canceled             -> CANCEL  (already stopped on the server)
+      - succeeded            -> RECLAIM (download the output the session already paid for; if the
+                                download itself can't complete this session the executor leaves the
+                                take GENERATING so NEXT launch retries the free download - it never
+                                re-bills an already-paid render)
+      - failed               -> FAIL    (genuine render failure; interrupted=False)
+      - canceled             -> CANCEL  (already stopped on the server; interrupted=True)
       - starting/processing  -> FAIL + interrupted (still billing on Replicate, but there's no
                                 worker to re-attach to and re-attaching would mean a fresh poll
                                 loop; mark it lost-to-restart and restartable rather than leave a
-                                permanent zombie row - the caller flags interrupted=True)
-      - status None (no job id / network down / poll error) -> FAIL + interrupted (can't verify;
-                                leave it restartable rather than a frozen "running" row)
+                                permanent zombie row)
+      - unverifiable (no prediction id, OR Replicate unreachable / poll raised -> status None):
+                                GENERATING -> FAIL + interrupted, PENDING -> CANCEL + interrupted
+                                (a never-submitted PENDING take mirrors the comfy CANCEL; both
+                                restartable). We can't tell a running from a done prediction here,
+                                so we clear the frozen row rather than leave it "running" forever.
 
-    The interrupted flag is set by the CALLER (main_window) per action: a genuine `failed`
-    prediction is NOT interrupted (a real render error), while the crash/unverifiable paths
-    (still-running, canceled, unknown) ARE - so the bulk "Restart interrupted takes" picks them
-    up (rule #17) exactly like the comfy side."""
+    Each plan carries an explicit `interrupted` flag (True = crash/lost/unverifiable, restartable
+    via rule #17; False = genuine render failure) so the executor never has to re-derive intent -
+    the bulk "Restart interrupted takes" picks up exactly the interrupted ones, like the comfy side."""
     plans: list[RecoveryPlan] = []
     for o in orphans:
         pred = statuses.get(o.id)
-        if pred is None:
-            reason = ("hosted render could not be verified on Replicate "
-                      "(no prediction id, or Replicate was unreachable at restart); "
-                      "re-Generate to run it again")
-            plans.append(RecoveryPlan(o.id, o.shot_id, FAIL, o.backend_job_id, None, reason))
-            continue
-        status = pred.get("status")
+        status = pred.get("status") if pred else None
         if status == "succeeded":
             plans.append(RecoveryPlan(
                 o.id, o.shot_id, RECLAIM, o.backend_job_id, None,
                 f"reclaimed finished hosted render {str(o.backend_job_id or '')[:8]}",
-                prediction=pred))
+                prediction=pred, interrupted=False))
         elif status == "failed":
             err = (pred.get("error") or "").strip()
             reason = "hosted render failed on Replicate" + (f": {err[:200]}" if err else "")
-            # Carry the prediction so the executor can tell a GENUINE render failure (not
-            # interrupted) from the crash/unverifiable FAILs below (interrupted, restartable).
             plans.append(RecoveryPlan(o.id, o.shot_id, FAIL, o.backend_job_id, None, reason,
-                                      prediction=pred))
+                                      prediction=pred, interrupted=False))
         elif status == "canceled":
             plans.append(RecoveryPlan(
                 o.id, o.shot_id, CANCEL, o.backend_job_id, None,
-                "hosted render was cancelled on Replicate"))
-        else:  # starting/processing (or an unexpected status) - still (or maybe) billing, but
-               # there's no worker; mark it lost-to-restart + restartable, not a frozen zombie.
+                "hosted render was cancelled on Replicate", interrupted=True))
+        elif status in _REPLICATE_RUNNING:
             plans.append(RecoveryPlan(
                 o.id, o.shot_id, FAIL, o.backend_job_id, None,
-                f"hosted render still {status or 'running'} on Replicate at restart with no "
-                "live worker; re-Generate to run it again"))
+                f"hosted render still {status} on Replicate at restart with no live worker; "
+                "re-Generate to run it again", interrupted=True))
+        elif pred is None:      # unverifiable: no prediction id, or the poll failed (network down)
+            if o.status == STATUS_GENERATING:
+                plans.append(RecoveryPlan(
+                    o.id, o.shot_id, FAIL, o.backend_job_id, None,
+                    "hosted render could not be verified on Replicate (no prediction id, or "
+                    "Replicate was unreachable at restart); re-Generate to run it again",
+                    interrupted=True))
+            else:               # pending - never actually submitted, mirrors comfy CANCEL
+                plans.append(RecoveryPlan(
+                    o.id, o.shot_id, CANCEL, o.backend_job_id, None,
+                    "hosted take was not submitted before restart (or Replicate was unreachable); "
+                    "re-Generate to run it", interrupted=True))
+        else:                   # an unrecognized status - can't classify, so clear + restartable
+            plans.append(RecoveryPlan(
+                o.id, o.shot_id, FAIL, o.backend_job_id, None,
+                f"hosted render in an unrecognized Replicate state ({status!r}) at restart with "
+                "no live worker; re-Generate to run it again", interrupted=True))
     return plans
 
 
