@@ -231,6 +231,28 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
   instantly without a Save and without marking the project dirty. Note shot-tab editor edits set the tab's own dirty flag
   *before* they're committed to the buffer, so an open-but-unsaved shot tab shows `*` on
   its tab and contributes to the project title `*` even while `project.dirty` is still False.
+- **Deleting a shot is a BUFFERED authoring edit that does NOT destroy its takes early
+  (2026-07-02 review finding H1, fixed 2026-07-03):** `delete_shot` removes the shot
+  (buffered, `dirty=True`, discardable) and moves its takes OUT of the live view/queue into a
+  `Project._pending_take_purge` buffer, but writes **nothing** to disk. `_write_takes_file`
+  serializes `_pending_take_purge` MERGED with the live `_takes` (the two dicts are disjoint
+  by construction), so a concurrent take write-through (a sibling shot finishing mid-batch)
+  still keeps the deleted shot's takes on disk. `save()` commits the purge **atomically**: it
+  clears the buffer and writes `takes.json` in one lock scope, and **restores the buffer if
+  the write fails** — otherwise the purge would be committed in memory while disk still held
+  the takes, recreating the half-state this buffer exists to prevent. `update_take` also
+  reaches held takes, so a worker unwinding a stopped render after its shot was
+  deleted-but-not-saved still records its terminal status (a Discard then restores the take
+  as CANCELLED, not a stale GENERATING). `_remap_paths` covers the held takes too — they can
+  still be serialized after a failed `save_as` rollback, so their paths must track
+  `assets_dir`. Net: delete a shot then **Discard** (or close unsaved) and reload restores
+  BOTH the shot (from the untouched `.animproj`) and its takes (from `takes.json`); Save
+  (or Save-As — both commit all buffered authoring edits) drops them for good. Previously
+  `delete_shot` immediately rewrote `takes.json` with the takes purged, so a Discard
+  resurrected the shot with its takes gone forever. Smoke-tested in
+  `smoke_phase5.test_delete_shot_discard_preserves_takes` (discard restores; a
+  surviving-shot write-through preserves; a held take's update routes; a failed save
+  restores the buffer; save drops for good).
 - **Paths:** managed media + assets serialize **relative to `assets_dir`**; external
   references (seeded `../Fighter/out/*.gif`/`.mp4` takes) stay **absolute**. Untitled
   projects keep assets in `data/_scratch/<id>/` until the first **Save As**, which
