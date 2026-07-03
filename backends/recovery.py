@@ -50,20 +50,29 @@ class RecoveryPlan:
     reason: str = ""
 
 
-def comfy_orphans(project) -> list:
+def comfy_orphans(project, skip: Optional[set] = None) -> list:
     """Takes that a prior session left mid-flight on the local backend.
 
     Only comfyui-backed takes (per the immutable settings_snapshot) - a hosted/replicate
     take orphans differently and isn't reconciled here. Generating-before-pending, then
     oldest-first, so seed claiming is deterministic.
 
+    `skip` is the set of take ids a LIVE worker is still rendering (JobManager.live_take_ids):
+    on an A->B->A project switch the original A worker keeps rendering under the OLD Project
+    while the reloaded A is reconciled here - such a take is NOT an orphan (it has a live worker
+    writing through), so reconciling it would spawn a second monitor of the same prompt and race
+    two Project instances last-writer-wins on takes.json (M7). Excluding those ids leaves the
+    live worker to finish and record the take itself.
+
     include_deleted=True: a take binned while still mid-flight is otherwise never reconciled
     (H2) - it sits `generating` forever and its ComfyUI render keeps running unclaimed. Its
     plan still runs (reclaim/fail a generating one, cancel a pending one); the take stays
     binned throughout (recovery never clears `deleted`)."""
+    skip = skip or set()
     orphans = [t for t in project.list_takes(include_deleted=True)
                if t.status in (STATUS_GENERATING, "pending")
-               and (t.settings_snapshot or {}).get("backend") == "comfyui"]
+               and (t.settings_snapshot or {}).get("backend") == "comfyui"
+               and t.id not in skip]
     orphans.sort(key=lambda t: (t.status != STATUS_GENERATING, t.created or ""))
     return orphans
 

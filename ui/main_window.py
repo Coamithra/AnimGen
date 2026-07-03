@@ -392,7 +392,43 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(idx, tab.title())
         self._update_title()
 
-    def _switch_project(self, project: Project) -> None:
+    def _confirm_switch_with_queued_work(self) -> bool:
+        """When the outgoing project still has queued/rendering takes, ask before switching.
+
+        Returns True to proceed (cancel the queued takes and continue - the in-flight render
+        finishes under the old project) or False to abort the switch. Split out so the switch
+        decision path is driveable in tests without exec()ing this modal (which never blocks
+        headlessly). Returns True immediately when nothing is in flight."""
+        if not self.jobs.has_in_flight_work():
+            return True
+        choice = QMessageBox.question(
+            self, "Queue in progress",
+            f"'{self.project.name}' still has generations queued or rendering.\n\n"
+            "Switching will cancel its queued takes (any take already rendering finishes and is "
+            "saved to this project). Switch anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return choice == QMessageBox.StandardButton.Yes
+
+    def _switch_project(self, project: Project) -> bool:
+        """Swap the open project. Returns False if the user aborted (queued work in flight)."""
+        if not self._confirm_switch_with_queued_work():
+            return False
+        # Quiesce the OUTGOING project FIRST (self.project/self.jobs.project still point at it):
+        # cancel its queued takes and clear stale queue id sets. The in-flight render is left to
+        # finish under its original Project instance (its worker holds that reference), whose
+        # write-through keeps landing in the OLD takes.json. See jobs.quiesce.
+        cancelled = self.jobs.quiesce()
+        if cancelled:
+            self._log(f"switching project: cancelled {cancelled} queued take(s)")
+        # A batch/transient-stop tracked against the OUTGOING project is now meaningless: its
+        # take ids resolve against a different document. Drop them so a stale batch can't finalize
+        # (empty report + a sleep/stop-ComfyUI power action) while the user works in the new one.
+        if self._batch is not None:
+            self._batch = None
+            self._log("switching project: active batch dropped (no power action will run)")
+        self._stop_paused_local = False
+        self.jobs.clear_local_pause()
         # Both shot tabs and take-viewer tabs reference the old project's shots/takes - close
         # them before swapping the document so nothing dangles.
         for tab in list(self.shot_tabs.values()):
@@ -415,8 +451,10 @@ class MainWindow(QMainWindow):
         self.reload()
         self._restore_tab_state()   # reopen the tabs this project was last saved with
         self.recovery_banner.hide()   # stale notice from the previous project
+        self._refresh_pause_action()   # the dropped batch may have left Pause enabled
         self._recover_orphans()   # reclaim/clear takes a prior session left mid-render
         self._refresh_recovery_banner()   # takes already interrupted on load (recovery is async)
+        return True
 
     def _maybe_save_changes(self) -> bool:
         """Prompt before discarding unsaved authoring edits. Return False to abort. Covers
@@ -437,7 +475,8 @@ class MainWindow(QMainWindow):
     def new_project(self) -> None:
         if not self._maybe_save_changes():
             return
-        self._switch_project(Project.new())
+        if not self._switch_project(Project.new()):
+            return   # user aborted (queued work in flight)
         self._log("new project")
 
     def open_project(self) -> None:
@@ -452,7 +491,8 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "Open project", f"Could not open:\n{e}")
             return
-        self._switch_project(project)
+        if not self._switch_project(project):
+            return   # user aborted (queued work in flight)
         self._remember_last()
         self._log(f"opened {project.name}")
 
@@ -1370,10 +1410,14 @@ class MainWindow(QMainWindow):
     def _recover_orphans(self) -> None:
         """Reconcile takes a prior session left mid-render on the local backend.
 
-        On load there are no live workers, so any comfyui take still at generating/pending
-        is orphaned. Fetch ComfyUI state off-thread (the server outlives the app), then
-        reclaim finished renders, re-attach running ones, and clear the dead ones."""
-        if not recovery.comfy_orphans(self.project):
+        On a cold load there are no live workers, so any comfyui take still at generating/pending
+        is orphaned. On an A->B->A project switch, though, the original A worker may still be
+        rendering under the OLD Project instance - `jobs.live_take_ids()` names those takes and
+        they're EXCLUDED from the orphan set (they aren't orphans; a live worker owns them), so
+        we never spawn a second monitor racing that worker's write-through (M7). Fetch ComfyUI
+        state off-thread (the server outlives the app), then reclaim finished renders, re-attach
+        running ones, and clear the dead ones."""
+        if not recovery.comfy_orphans(self.project, self.jobs.live_take_ids()):
             return
         proj = self.project                       # guard against a project switch mid-fetch
         self._reconciler = _OrphanReconciler()    # kept on self so it isn't GC'd
@@ -1383,7 +1427,7 @@ class MainWindow(QMainWindow):
     def _apply_recovery(self, proj, history, queue) -> None:
         if proj is not self.project:              # user switched projects before the fetch returned
             return
-        orphans = recovery.comfy_orphans(proj)
+        orphans = recovery.comfy_orphans(proj, self.jobs.live_take_ids())
         if not orphans:
             return
         if history is None:                       # ComfyUI unreachable - nothing can be verified
