@@ -791,6 +791,55 @@ def test_take_player_settings_panel() -> None:
     print("TakePlayerTab OK: settings dock toggles via button + context menu")
 
 
+def test_take_player_star() -> None:
+    """The viewer's star button (card UX4) write-throughs the take's star like the grid badge
+    (no project dirty), keeps its label/checked-state in sync, emits star_changed for MainWindow
+    to refresh the grid tile, and star_button_text is the pure label helper."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui.take_player import TakePlayerTab, star_button_text
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    assert star_button_text(True).startswith("★") and star_button_text(False).startswith("☆")
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    take = project.add_take(shot.id, status=STATUS_DONE, settings_snapshot={
+        "model_id": "seedance-2.0-std"})
+    assert take.starred is False
+    tab = TakePlayerTab(project, take.id)               # no video -> no decode thread spawned
+
+    # Button reflects the take's initial (un-starred) state.
+    assert tab.star_btn.isChecked() is False
+    assert tab.star_btn.text() == star_button_text(False)
+
+    # Toggling it on write-throughs the star + emits star_changed without ADDING project
+    # dirtiness (take stars write through to takes.json, never mark the .animproj dirty).
+    changed: list[str] = []
+    tab.star_changed.connect(changed.append)
+    dirty_before = project.dirty
+    tab.star_btn.setChecked(True)                       # user click path (toggled signal)
+    assert project.get_take(take.id).starred is True
+    assert project.dirty == dirty_before, "star write-through must not change project dirty"
+    assert changed == [take.id]
+    assert tab.star_btn.text() == star_button_text(True)
+
+    # Toggling off write-throughs the un-star too.
+    tab.star_btn.setChecked(False)
+    assert project.get_take(take.id).starred is False
+    assert changed == [take.id, take.id]
+
+    # _refresh_star_btn re-syncs to disk state WITHOUT firing the write-through (no extra emit):
+    # star it out-of-band, then refresh - button follows, emit count unchanged.
+    project.set_starred(take.id, True)
+    tab._refresh_star_btn()
+    assert tab.star_btn.isChecked() is True and len(changed) == 2
+
+    tab.close_player()
+    print("TakePlayerTab OK: star button write-through, label sync, star_changed, no dirty")
+
+
 def test_runner_self_cancel_during_submit() -> None:
     """The replicate runner's on_submit must self-cancel when a stop was requested during
     the create-POST window (before backend_job_id existed), so the take lands CANCELLED and
@@ -1339,6 +1388,7 @@ if __name__ == "__main__":
     test_batch_gate_matches_snapshot_with_uncommitted_tab()
     test_generate_shot_missing_shot()
     test_take_player_settings_panel()
+    test_take_player_star()
     test_gif_export()
     test_take_player_gif_export()
     test_runner_self_cancel_during_submit()

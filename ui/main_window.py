@@ -542,8 +542,15 @@ class MainWindow(QMainWindow):
         shot = self.project.get_shot(take.shot_id)
         title = f"▶ {shot.name if shot else take.shot_id[:6]} · {take_id[:6]}"
         tab = TakePlayerTab(self.project, take_id)
+        tab.star_changed.connect(self._on_take_star_changed)
         self.take_tabs[take_id] = tab
         self.tabs.setCurrentIndex(self.tabs.addTab(tab, title))
+
+    def _on_take_star_changed(self, take_id: str) -> None:
+        """A take's star was toggled from its player tab: refresh the matching grid tile in
+        place (card #75 incremental path) so the shot card / shot tab shows the new star, and
+        the header star-filter counts stay accurate."""
+        self._refresh_shot_for_take(take_id)
 
     def duplicate_shot(self, shot_id: str) -> None:
         dup = self.project.duplicate_shot(shot_id)

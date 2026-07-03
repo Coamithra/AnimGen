@@ -654,6 +654,62 @@ def test_take_star_toggle_incremental() -> None:
     print("TakesView star toggle OK: in-place tile update, no rebuild, Favorites membership fallback")
 
 
+def test_takes_view_keyboard() -> None:
+    """Keyboard triage in the takes grid (card UX4): Delete bins the selection, S toggles its
+    star, Enter/Return opens the first selected take in the viewer. All route through the same
+    delete/toggle_star/open_take_requested the mouse uses; a no-selection triage key is consumed
+    but harmless; an unrelated key falls through (handle_grid_key returns False)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from ui.takes_view import TakesView, _STAR_ROLE, _TakesListView
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    t1 = project.add_take(shot.id, status=STATUS_DONE)
+    t2 = project.add_take(shot.id, status=STATUS_DONE)
+    tv = TakesView(project, shot.id)
+    assert isinstance(tv.view, _TakesListView)
+
+    def select(*take_ids):
+        sm = tv.view.selectionModel()
+        sm.clear()
+        for tid in take_ids:
+            sm.select(tv.model.indexFromItem(tv._items[tid]),
+                      sm.SelectionFlag.Select)
+
+    # S on a selection toggles its star (write-through), in place - the item survives.
+    select(t1.id)
+    item1 = tv._items[t1.id]
+    assert tv.handle_grid_key(int(Qt.Key.Key_S)) is True
+    assert project.get_take(t1.id).starred is True
+    assert tv._items[t1.id] is item1 and tv._items[t1.id].data(_STAR_ROLE) is True
+
+    # Enter/Return opens the first selected take in the viewer (bubbles up to MainWindow).
+    opened: list[str] = []
+    tv.open_take_requested.connect(opened.append)
+    select(t2.id, t1.id)
+    assert tv.handle_grid_key(int(Qt.Key.Key_Return)) is True
+    assert len(opened) == 1 and opened[0] in (t1.id, t2.id)   # ids[0] of the selection
+    assert tv.handle_grid_key(int(Qt.Key.Key_Enter)) is True   # numpad Enter is also handled
+    assert len(opened) == 2
+
+    # Delete bins the whole selection (same neutralize+move_to_bin path as the menu).
+    select(t1.id, t2.id)
+    assert tv.handle_grid_key(int(Qt.Key.Key_Delete)) is True
+    assert project.get_take(t1.id).deleted and project.get_take(t2.id).deleted
+    assert tv.model.rowCount() == 0
+
+    # A triage key with nothing selected is consumed (so it doesn't type-ahead search) but is
+    # otherwise a no-op; a non-triage key falls through to QListView (returns False).
+    select()
+    assert tv.handle_grid_key(int(Qt.Key.Key_Delete)) is True
+    assert tv.handle_grid_key(int(Qt.Key.Key_A)) is False
+    print("TakesView keyboard OK: Delete bins, S stars, Enter opens; empty-sel no-op; other keys fall through")
+
+
 def test_queue_view() -> None:
     """The Queue tab is a model + delegate with ZERO per-row widgets (rule #18 root cause):
     the child-widget count stays bounded no matter how deep the pending queue is, a progress
@@ -758,6 +814,7 @@ if __name__ == "__main__":
     test_takes_view_incremental_update()
     test_take_star_badge()
     test_take_star_toggle_incremental()
+    test_takes_view_keyboard()
     test_take_progress_label()
     test_bin_neutralizes_queued_take()
     test_assets_view()

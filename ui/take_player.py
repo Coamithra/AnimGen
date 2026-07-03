@@ -190,7 +190,15 @@ class _GifExporter(QObject):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+def star_button_text(starred: bool) -> str:
+    """Label for the player's star toggle given the take's current star state. Pure so it's
+    unit-testable headlessly; the filled star reads as "starred", the outline as "not"."""
+    return "★ Starred" if starred else "☆ Star"
+
+
 class TakePlayerTab(QWidget):
+    star_changed = Signal(str)   # take_id -> the take's star was toggled here (MainWindow refreshes its grid tile)
+
     def __init__(self, project: Project, take_id: str, parent=None):
         super().__init__(parent)
         self.project = project
@@ -235,6 +243,17 @@ class TakePlayerTab(QWidget):
         self.frame_label.setMinimumWidth(96)
         self.frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        # A star toggle sits by the frame timer so the keep/cull decision - made right here in
+        # the viewer - no longer requires going back to the grid's tiny badge (card UX4). It
+        # write-throughs like the grid badge (no project dirty) and is always live (the star is
+        # a take property, available before frames decode). "S" toggles it from the keyboard.
+        self.star_btn = QPushButton()
+        self.star_btn.setCheckable(True)
+        self.star_btn.setToolTip("Star this take (keep it) — shortcut: S")
+        self.star_btn.setShortcut("S")
+        self.star_btn.toggled.connect(self._on_star_toggled)
+        self._refresh_star_btn()
+
         # The settings toggle sits to the right of the frame timer; it's always live
         # (the snapshot is available even before frames finish decoding).
         self.settings_btn = QPushButton("⚙ Settings")
@@ -252,6 +271,7 @@ class TakePlayerTab(QWidget):
         controls.addWidget(self.next_btn)
         controls.addWidget(self.slider, 1)
         controls.addWidget(self.frame_label)
+        controls.addWidget(self.star_btn)
         controls.addWidget(self.settings_btn)
 
         center = QWidget()
@@ -301,6 +321,32 @@ class TakePlayerTab(QWidget):
             self.show_settings()
         else:
             self.settings_dock.hide()
+
+    # ---- star toggle ----------------------------------------------------
+    def _current_starred(self) -> bool:
+        take = self.project.get_take(self.take_id)
+        return bool(getattr(take, "starred", False)) if take else False
+
+    def _refresh_star_btn(self) -> None:
+        """Sync the star button's checked state + label to the take's current star, without
+        firing _on_star_toggled (so it's safe to call after a write-through)."""
+        starred = self._current_starred()
+        self.star_btn.blockSignals(True)
+        self.star_btn.setChecked(starred)
+        self.star_btn.blockSignals(False)
+        self.star_btn.setText(star_button_text(starred))
+
+    def _on_star_toggled(self, checked: bool) -> None:
+        """Write the star through (same instant-persist path as the grid badge - no project
+        dirty, rule: shot/take stars write through) and tell MainWindow so it refreshes the
+        matching grid tile. A missing take (deleted underneath) just re-syncs the button."""
+        take = self.project.get_take(self.take_id)
+        if take is None:
+            self._refresh_star_btn()
+            return
+        self.project.set_starred(self.take_id, checked)
+        self.star_btn.setText(star_button_text(checked))
+        self.star_changed.emit(self.take_id)
 
     def _on_dock_visibility(self, visible: bool) -> None:
         # Keep the toggle button in sync when the dock is closed via its own [x].
