@@ -483,7 +483,24 @@ class TakePlayerTab(QWidget):
         self.toggle_play()                          # auto-play once decoded, like a preview
 
     def _on_failed(self, msg: str) -> None:
+        # Drop the dead loader so refresh_status can retry _load() if the take later gains a
+        # fresh source (e.g. a corrupt partial file rewritten by a restart-in-place): a finished
+        # _FrameLoader is spent anyway, and leaving it set would wedge the no-op guard forever.
+        self._loader = None
         self.canvas.setText(f"Could not load this take:\n{msg}")
+
+    def refresh_status(self) -> None:
+        """Cheap update path for when this take's status flips while its viewer is open —
+        e.g. a viewer opened on a still-generating take once it finishes, fails, or is
+        cancelled (L6). If frames are already decoded there's nothing to do (a produced video
+        is immutable). Otherwise re-run _load(): a now-playable take decodes and auto-plays, a
+        still-pending / status-FAILED / cancelled take repaints its placeholder / failure text,
+        and a take that lost a prior *decode* attempt (loader cleared in _on_failed) can retry
+        against a fresh source. Idempotent and safe to call on every status signal — it no-ops
+        while a decode is already under way (`_loader` set) or once frames have loaded."""
+        if self._frames or self._loader is not None:
+            return
+        self._load()
 
     # ---- playback -------------------------------------------------------
     def toggle_play(self) -> None:
