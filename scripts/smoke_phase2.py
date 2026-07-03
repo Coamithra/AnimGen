@@ -1360,6 +1360,157 @@ def test_orphan_recovery() -> None:
           "+ fixed-seed ambiguity guard (M5) + offline fail/cancel")
 
 
+def test_hosted_orphan_recovery() -> None:
+    """recovery.replicate_orphans + plan_replicate_recovery (L5): reconcile a hosted take a
+    prior session left GENERATING against its prediction - succeeded/failed/canceled/still-
+    running/no-job-id/network-down - WITHOUT spend (observe only)."""
+    from backends import recovery
+
+    # replicate_orphans selects only mid-flight replicate takes (generating before pending),
+    # ignoring done takes and comfyui ones. Mirrors comfy_orphans.
+    project = Project.new()
+    shot = project.add_shot("kick", model_id="seedance-2.0-std")
+    snap_hosted = {"backend": "replicate"}
+    pend = project.add_take(shot.id, status=STATUS_PENDING, settings_snapshot=snap_hosted)
+    gen = project.add_take(shot.id, status=STATUS_GENERATING, settings_snapshot=snap_hosted)
+    project.add_take(shot.id, status=STATUS_DONE, settings_snapshot=snap_hosted)     # excluded
+    project.add_take(shot.id, status=STATUS_GENERATING,                              # excluded:
+                     settings_snapshot={"backend": "comfyui"})                       # local
+    binned = project.add_take(shot.id, status=STATUS_GENERATING, deleted=True,       # H2: binned
+                              settings_snapshot=snap_hosted)                          # mid-flight
+    orphans = recovery.replicate_orphans(project)
+    assert {o.id for o in orphans} == {gen.id, binned.id, pend.id}, "local/done excluded, binned in"
+    assert orphans[-1].id == pend.id, "generating-first, pending last"
+
+    # plan_replicate_recovery: each terminal/running/unknown prediction status -> an action.
+    def t(tid, status, job="pred"):
+        return Take(id=tid, shot_id="s", status=status, backend_job_id=job)
+
+    orphan_list = [
+        t("succ",  STATUS_GENERATING),
+        t("fail",  STATUS_GENERATING),
+        t("canc",  STATUS_GENERATING),
+        t("run",   STATUS_GENERATING),
+        t("nojob", STATUS_GENERATING, job=None),   # never recorded a prediction id
+        t("down",  STATUS_GENERATING),             # poll failed -> None
+        t("pend",  STATUS_PENDING),                # never submitted, still pollable if id kept
+    ]
+    statuses = {
+        "succ": {"status": "succeeded", "output": "https://x/v.mp4"},
+        "fail": {"status": "failed", "error": "OOM in the model"},
+        "canc": {"status": "canceled"},
+        "run":  {"status": "processing"},
+        "nojob": None,
+        "down": None,
+        "pend": {"status": "starting"},
+    }
+    plans = {p.take_id: p for p in recovery.plan_replicate_recovery(orphan_list, statuses)}
+    assert plans["succ"].action == recovery.RECLAIM, "succeeded -> reclaim the paid-for output"
+    assert plans["succ"].prediction["output"] == "https://x/v.mp4", "carries the prediction to download"
+    assert plans["fail"].action == recovery.FAIL and "failed on Replicate" in plans["fail"].reason
+    assert "OOM" in plans["fail"].reason, "failure detail surfaced"
+    assert plans["canc"].action == recovery.CANCEL, "server-side cancel -> cancel"
+    assert plans["run"].action == recovery.FAIL, "still-running w/ no worker -> fail (restartable)"
+    assert plans["nojob"].action == recovery.FAIL, "no prediction id -> unverifiable -> fail"
+    assert plans["down"].action == recovery.FAIL, "network down (None) -> unverifiable -> fail"
+    assert plans["pend"].action == recovery.FAIL, "starting -> fail (restartable)"
+    # A take id simply absent from the statuses dict is treated as None (unverifiable).
+    missing = recovery.plan_replicate_recovery([t("gone", STATUS_GENERATING)], {})[0]
+    assert missing.action == recovery.FAIL, "absent from statuses -> unverifiable -> fail"
+    # No plan carries an output_path (that's the comfy field); hosted uses `prediction`.
+    assert all(p.output_path is None for p in plans.values())
+
+    # Execution integration: _execute_replicate_plans applies RECLAIM (download honestly, no
+    # spend - stub the download + probe), FAIL, and CANCEL, and sets the interrupted flag
+    # correctly (genuine `failed` prediction -> NOT interrupted; everything else lost/unverifiable
+    # -> interrupted, so the Restart-interrupted banner picks it up).
+    import backends.replicate_client as rc
+    import pipeline.extract as extract
+    from PySide6.QtWidgets import QApplication
+    from store.models import STATUS_CANCELLED
+    from ui.main_window import MainWindow
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - QWidgets need a QApplication
+    orig_dl, orig_probe = rc.download_output, extract.probe_media_fields
+    calls = {"n": 0}
+
+    def _fake_dl(prediction, out_path, token=None):
+        calls["n"] += 1
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"fake-mp4")     # a real file so update_take's path is valid
+
+    rc.download_output = _fake_dl
+    extract.probe_media_fields = lambda *a, **k: (24.0, 48)
+    try:
+        proj3 = Project.new()
+        sh3 = proj3.add_shot("k", model_id="seedance-2.0-std")
+        win = MainWindow(proj3)                     # built before an orphan exists -> no reconciler
+        r = proj3.add_take(sh3.id, status=STATUS_GENERATING, backend_job_id="predR",
+                           settings_snapshot=snap_hosted)
+        f = proj3.add_take(sh3.id, status=STATUS_GENERATING, backend_job_id="predF",
+                           settings_snapshot=snap_hosted)
+        c = proj3.add_take(sh3.id, status=STATUS_GENERATING, backend_job_id="predC",
+                           settings_snapshot=snap_hosted)
+        u = proj3.add_take(sh3.id, status=STATUS_GENERATING,       # unverifiable (network-down)
+                           settings_snapshot=snap_hosted)
+        win._execute_replicate_plans(recovery.plan_replicate_recovery([r, f, c, u], {
+            r.id: {"status": "succeeded", "output": "https://x/v.mp4"},
+            f.id: {"status": "failed", "error": "boom"},
+            c.id: {"status": "canceled"},
+            u.id: None,
+        }))
+        gr, gf, gc2, gu = (proj3.get_take(x.id) for x in (r, f, c, u))
+        assert gr.status == STATUS_DONE and gr.video_path and gr.fps == 24.0, (gr.status, gr.fps)
+        assert gr.interrupted is False, "a reclaimed DONE take is not interrupted"
+        assert calls["n"] == 1, "download called exactly once (only the succeeded take)"
+        assert gf.status == STATUS_FAILED and gf.interrupted is False, "genuine failure NOT interrupted"
+        assert gc2.status == STATUS_CANCELLED and gc2.interrupted is True, "server cancel interrupted"
+        assert gu.status == STATUS_FAILED and gu.interrupted is True, "unverifiable -> interrupted"
+    finally:
+        rc.download_output, extract.probe_media_fields = orig_dl, orig_probe
+    print("hosted orphan recovery OK: select + succeeded/failed/canceled/running/no-id/down "
+          "-> reclaim/fail/cancel, no spend; execution stamps DONE/interrupted correctly")
+
+
+def test_close_warning() -> None:
+    """closeEvent in-flight-render decision (L5): pure generating_takes + close_warning_text -
+    the message and the gate logic, tested without a window (no .exec, rule #4)."""
+    from ui.main_window import close_warning_text, generating_takes
+
+    class _FakeProj:
+        def __init__(self, takes):
+            self._takes = takes
+
+        def list_takes(self, shot_id=None, *, include_deleted=False):
+            return list(self._takes)
+
+    def t(status, backend="comfyui"):
+        return Take(id="x", shot_id="s", status=status, settings_snapshot={"backend": backend})
+
+    # No generating take -> no warning (close proceeds).
+    assert close_warning_text([]) is None
+    assert generating_takes(_FakeProj([t(STATUS_DONE), t(STATUS_PENDING)])) == []
+
+    # generating_takes picks up only GENERATING (either backend), ignores terminal/pending.
+    gens = generating_takes(_FakeProj([
+        t(STATUS_GENERATING, "replicate"), t(STATUS_GENERATING, "comfyui"),
+        t(STATUS_DONE), t(STATUS_PENDING)]))
+    assert len(gens) == 2, [g.status for g in gens]
+
+    # The message counts takes and calls out hosted ones as still-billing.
+    msg = close_warning_text(gens)
+    assert "2 takes are still rendering" in msg, msg
+    assert "1 is hosted (Replicate)" in msg and "billing" in msg, msg
+
+    # All-local: no billing sentence.
+    local_only = close_warning_text([t(STATUS_GENERATING), t(STATUS_GENERATING)])
+    assert "still rendering" in local_only and "billing" not in local_only, local_only
+
+    # Singular grammar.
+    one = close_warning_text([t(STATUS_GENERATING, "replicate")])
+    assert "1 take is still rendering" in one and "1 is hosted" in one, one
+    print("close warning OK: generating_takes filter + message (count + hosted-billing callout)")
+
+
 def test_crash_recovery() -> None:
     from backends.crash_recovery import (CRASH_INTERRUPTED_ATTR, QueueAbandoned, _looks_crashed,
                                          format_elapsed, run_with_crash_recovery)
@@ -2674,6 +2825,8 @@ if __name__ == "__main__":
     test_stop_work_targets_prompt()
     test_comfy_views()
     test_orphan_recovery()
+    test_hosted_orphan_recovery()
+    test_close_warning()
     test_crash_recovery()
     test_wait_until_responsive()
     test_restart_server()

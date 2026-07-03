@@ -1,4 +1,4 @@
-"""Orphan-take recovery for the local (ComfyUI) backend.
+"""Orphan-take recovery for the local (ComfyUI) AND hosted (Replicate) backends.
 
 A local render is polled by a worker thread *inside* AnimGen (comfy_client.submit's
 loop). The ComfyUI server is a separate, surviving process: if AnimGen is closed or
@@ -25,6 +25,13 @@ FAIL/CANCEL (interrupted, restartable via rule #17) rather than reclaiming the w
 video. `plan_comfy_recovery` is pure (it takes already-fetched, normalized history/queue
 plus the ambiguity set) so it can be unit-tested headless; the UI layer fetches off-thread
 and executes the returned plans.
+
+A hosted (Replicate) take orphans differently: the prediction keeps running (and billing) on
+Replicate's servers, so `replicate_orphans` + `plan_replicate_recovery` reconcile each stuck
+`generating` take against `replicate_client.get_prediction` (an idempotent GET - it OBSERVES,
+never re-runs or re-charges) - succeeded -> reclaim the paid-for output, failed/canceled ->
+mark failed/cancelled, still-running/unverifiable/no-job-id -> mark FAILED + interrupted
+(restartable) rather than leave a permanent, undismissable "running" row in the Queue.
 """
 from __future__ import annotations
 
@@ -45,9 +52,11 @@ class RecoveryPlan:
     take_id: str
     shot_id: str
     action: str
-    prompt_id: Optional[str] = None     # the matched ComfyUI prompt (reclaim/reattach)
-    output_path: Optional[str] = None   # absolute source file to copy in (reclaim only)
+    prompt_id: Optional[str] = None     # the matched ComfyUI prompt id / replicate prediction id
+    output_path: Optional[str] = None   # absolute source file to copy in (comfy reclaim only)
     reason: str = ""
+    prediction: Optional[dict] = None   # the succeeded replicate prediction to download from
+                                        # (hosted reclaim only; carries the output URL)
 
 
 def comfy_orphans(project) -> list:
@@ -171,6 +180,89 @@ def plan_comfy_recovery(orphans: list, history: list[dict], queue: list[dict],
             plans.append(RecoveryPlan(
                 o.id, o.shot_id, CANCEL, None, None,
                 "queued but not submitted before restart; re-Generate to run it" + ambiguous_note))
+    return plans
+
+
+def replicate_orphans(project) -> list:
+    """Takes a prior session left mid-flight on the HOSTED (Replicate) backend.
+
+    On load there are no live workers, so every replicate-backed take still at
+    `generating`/`pending` is orphaned. Unlike a local render, a hosted prediction keeps
+    running (and billing) on Replicate's servers; left frozen at `generating` it shows a
+    permanent, undismissable "running" row in the Queue and is never reconciled. This selects
+    those takes so `plan_replicate_recovery` can reconcile each against its prediction.
+
+    include_deleted=True for the same reason as `comfy_orphans` (H2): a take binned while
+    mid-flight would otherwise never be reconciled. Generating-before-pending, oldest-first."""
+    orphans = [t for t in project.list_takes(include_deleted=True)
+               if t.status in (STATUS_GENERATING, "pending")
+               and (t.settings_snapshot or {}).get("backend") == "replicate"]
+    orphans.sort(key=lambda t: (t.status != STATUS_GENERATING, t.created or ""))
+    return orphans
+
+
+# Replicate prediction statuses (https://replicate.com/docs). "starting"/"processing" are the
+# still-running states; the rest are terminal.
+_REPLICATE_RUNNING = ("starting", "processing")
+
+
+def plan_replicate_recovery(orphans: list, statuses: dict) -> list[RecoveryPlan]:
+    """Decide what to do with each orphaned HOSTED take. Pure: no I/O, no mutation, no spend.
+
+    `orphans`  - Take-like objects (.id/.shot_id/.status/.backend_job_id).
+    `statuses` - {take_id: prediction_dict_or_None}. The prediction dict is
+                 `replicate_client.get_prediction(backend_job_id)`'s result (its `status` is
+                 starting/processing/succeeded/failed/canceled), or `None` when the fetch could
+                 not be performed (no backend_job_id recorded, or the network was down / the
+                 poll raised). A take id absent from the dict is treated as `None` too.
+
+    Reconciliation NEVER creates spend - it only observes an already-running prediction, so:
+      - succeeded            -> RECLAIM (download the output the session already paid for)
+      - failed               -> FAIL    (genuine render failure; interrupted=False - see caller)
+      - canceled             -> CANCEL  (already stopped on the server)
+      - starting/processing  -> FAIL + interrupted (still billing on Replicate, but there's no
+                                worker to re-attach to and re-attaching would mean a fresh poll
+                                loop; mark it lost-to-restart and restartable rather than leave a
+                                permanent zombie row - the caller flags interrupted=True)
+      - status None (no job id / network down / poll error) -> FAIL + interrupted (can't verify;
+                                leave it restartable rather than a frozen "running" row)
+
+    The interrupted flag is set by the CALLER (main_window) per action: a genuine `failed`
+    prediction is NOT interrupted (a real render error), while the crash/unverifiable paths
+    (still-running, canceled, unknown) ARE - so the bulk "Restart interrupted takes" picks them
+    up (rule #17) exactly like the comfy side."""
+    plans: list[RecoveryPlan] = []
+    for o in orphans:
+        pred = statuses.get(o.id)
+        if pred is None:
+            reason = ("hosted render could not be verified on Replicate "
+                      "(no prediction id, or Replicate was unreachable at restart); "
+                      "re-Generate to run it again")
+            plans.append(RecoveryPlan(o.id, o.shot_id, FAIL, o.backend_job_id, None, reason))
+            continue
+        status = pred.get("status")
+        if status == "succeeded":
+            plans.append(RecoveryPlan(
+                o.id, o.shot_id, RECLAIM, o.backend_job_id, None,
+                f"reclaimed finished hosted render {str(o.backend_job_id or '')[:8]}",
+                prediction=pred))
+        elif status == "failed":
+            err = (pred.get("error") or "").strip()
+            reason = "hosted render failed on Replicate" + (f": {err[:200]}" if err else "")
+            # Carry the prediction so the executor can tell a GENUINE render failure (not
+            # interrupted) from the crash/unverifiable FAILs below (interrupted, restartable).
+            plans.append(RecoveryPlan(o.id, o.shot_id, FAIL, o.backend_job_id, None, reason,
+                                      prediction=pred))
+        elif status == "canceled":
+            plans.append(RecoveryPlan(
+                o.id, o.shot_id, CANCEL, o.backend_job_id, None,
+                "hosted render was cancelled on Replicate"))
+        else:  # starting/processing (or an unexpected status) - still (or maybe) billing, but
+               # there's no worker; mark it lost-to-restart + restartable, not a frozen zombie.
+            plans.append(RecoveryPlan(
+                o.id, o.shot_id, FAIL, o.backend_job_id, None,
+                f"hosted render still {status or 'running'} on Replicate at restart with no "
+                "live worker; re-Generate to run it again"))
     return plans
 
 
