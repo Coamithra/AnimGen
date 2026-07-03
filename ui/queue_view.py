@@ -519,8 +519,8 @@ class QueueView(QWidget):
 
     def _stop(self, take_ids: list) -> None:
         """Stop each in-flight render (best-effort, both backends) so spend/GPU halts. The
-        worker unwinds to CANCELLED asynchronously; status_changed then rebuilds the row, but
-        refresh() now keeps the view responsive immediately."""
+        worker unwinds to CANCELLED asynchronously - status_changed then rebuilds the row;
+        the immediate refresh() just keeps the view current, matching _cancel."""
         for tid in take_ids:
             self.jobs.request_stop(tid)
         self.refresh()
