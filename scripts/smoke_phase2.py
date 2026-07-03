@@ -2518,9 +2518,11 @@ def test_quiesce_on_switch() -> None:
         time.sleep(0.02)
     assert project.get_take(active.id).status == STATUS_GENERATING, "blocker never started"
 
-    # Seed stale id-set membership that quiesce must clear.
+    # Seed stale id-set membership that quiesce must prune, plus a live-worker stop flag it
+    # must PRESERVE (a request_stop just before the switch still records CANCELLED).
     jm._cancelled.add("stale-c")
     jm._stopping.add("stale-s")
+    jm._stopping.add(active.id)
     jm._requeue.add("stale-r")
     assert jm.has_in_flight_work() is True
 
@@ -2530,10 +2532,15 @@ def test_quiesce_on_switch() -> None:
     assert project.get_take(hq.id).status == STATUS_CANCELLED
     assert project.get_take(lq.id).interrupted is True, "switch-cancel must be restartable"
     assert project.get_take(active.id).status == STATUS_GENERATING, "running take must survive"
-    # Stale id sets are wiped; the GENERATING take's runner entry is KEPT for live_take_ids.
-    assert jm._cancelled == set() and jm._stopping == set() and jm._requeue == set()
+    # Stale ids are pruned; the just-cancelled ids stay in _cancelled (the same dequeue-race
+    # safety net as cancel_pending), the live worker keeps its _stopping flag, and the
+    # GENERATING take's runner entry is KEPT for live_take_ids.
+    assert jm._cancelled == {lq.id, hq.id}, jm._cancelled
+    assert jm._stopping == {active.id}, jm._stopping
+    assert jm._requeue == set(), jm._requeue
     assert active.id in jm.live_take_ids(), "generating take dropped from live set"
     assert lq.id not in jm.live_take_ids() and hq.id not in jm.live_take_ids()
+    jm._stopping.discard(active.id)   # let the blocker finish DONE below, not CANCELLED
 
     # The still-running worker finishes and records DONE via its own project reference.
     release.set()
@@ -2541,7 +2548,7 @@ def test_quiesce_on_switch() -> None:
     app.processEvents()
     assert project.get_take(active.id).status == STATUS_DONE, "left-running take must complete"
     assert active.id not in jm.live_take_ids(), "_on_job_done should drop the finished take"
-    print("quiesce OK: pending cancelled (interrupted), id sets cleared, running take survives")
+    print("quiesce OK: pending cancelled (interrupted), stale ids pruned, running take survives")
 
 
 def test_switch_skips_live_orphans() -> None:
@@ -2580,6 +2587,11 @@ def test_switch_resets_batch_and_pause() -> None:
     project = Project.new("A")
     shot = project.add_shot("kick", model_id="seedance-2.0-std")
     win = MainWindow(project)
+    # The batch below uses POWER_SLEEP so a regression is observable - but the power action
+    # must NEVER actually run in a test (it stops ComfyUI and puts the PC to sleep). Capture
+    # instead of executing; the assertion below proves the switch never reaches it.
+    power_calls = []
+    win._perform_power_action = power_calls.append
 
     # --- abort path: in-flight work + user says No -> switch is refused, project unchanged.
     take = project.add_take(shot.id, status=STATUS_PENDING,
@@ -2597,6 +2609,10 @@ def test_switch_resets_batch_and_pause() -> None:
     assert win._switch_project(other) is True
     assert win.project is other, "confirmed switch should swap the project"
     assert win._batch is None, "batch must be dropped on switch (no stale power action)"
+    # The batch must be dropped BEFORE quiesce's CANCELLED emits: otherwise cancelling the
+    # last pending take drains the batch to complete mid-switch and _finalize_batch fires
+    # the sleep/stop-ComfyUI power action while the user is switching projects.
+    assert power_calls == [], f"power action fired during switch: {power_calls}"
     assert win._stop_paused_local is False, "transient local pause must be lifted on switch"
     assert win.jobs.is_local_paused() is False
     # The old project's queued take was cancelled by quiesce and flagged restartable.
@@ -2605,7 +2621,7 @@ def test_switch_resets_batch_and_pause() -> None:
     assert project.get_take(take.id).interrupted is True
 
     win.close()
-    print("switch reset OK: abort leaves project intact; proceed drops batch + lifts pause")
+    print("switch reset OK: abort intact; proceed drops batch first (no power action) + lifts pause")
 
 
 if __name__ == "__main__":

@@ -854,11 +854,18 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
       True only if nothing is in flight (`jobs.has_in_flight_work()`, the pure predicate) or the
       user chose *Switch anyway*. On abort `_switch_project` returns False and `new_project`/
       `open_project` bail with the CURRENT project untouched.
-    - **`jobs.quiesce()` runs FIRST**, while `self.project`/`jobs.project` still point at the
-      OUTGOING project: it `clear()`s both pools, marks every still-PENDING take CANCELLED with
-      `interrupted=True` (an app-driven switch, so it's **restartable via rule #17**, not a
-      deliberate user cancel), and clears the stale `_cancelled`/`_stopping`/`_requeue` id sets so
-      a same-id take in the incoming project can't inherit them.
+    - **`jobs.quiesce()` runs while `self.project`/`jobs.project` still point at the
+      OUTGOING project** (but AFTER the batch drop — see below): it `clear()`s both pools, marks
+      every still-PENDING take CANCELLED with `interrupted=True` (an app-driven switch, so it's
+      **restartable via rule #17**, not a deliberate user cancel), and **prunes** the stale
+      `_cancelled`/`_stopping`/`_requeue` id sets by INTERSECTION, not a wholesale clear: each
+      just-cancelled id is first ADDED to `_cancelled` (the same dequeue-race safety net as
+      `cancel_pending` — a runnable the pool handed to a worker between the scan and `clear()`
+      must bail at its `tid in cancelled` check, not fire the backend), and an id still in
+      `_runners` (a live GENERATING worker) KEEPS its `_stopping`/`_requeue` membership so a
+      stop/halt requested just before the switch still records CANCELLED/PENDING, not FAILED.
+      `quiesce` also resets the jobs-level `_local_paused` flag (like `cancel_pending`), so
+      `_switch_project` only resets its own `_stop_paused_local`.
     - **The currently-GENERATING take is LEFT running.** Its `GenerationJob` captured the OLD
       `Project` instance at construction (verified: `GenerationJob.__init__` stores `self.project`),
       so its write-through keeps landing in the OLD project's `takes.json` and completes correctly
@@ -869,13 +876,19 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
       `recovery.comfy_orphans(project, skip=...)` excludes those ids, so on an A->B->A switch the
       take the original A worker still owns is NOT reconciled as an orphan (no double monitor, no
       write-through race). `_recover_orphans`/`_apply_recovery` pass `self.jobs.live_take_ids()`.
-    - **Batch + transient-pause state is reset on switch.** `_switch_project` drops `self._batch`
-      (its take ids resolve against a different document, so a stale batch would finalize with an
-      empty morning report and then fire the sleep/stop-ComfyUI power action while the user works in
-      the new project) and clears `_stop_paused_local` + `jobs.clear_local_pause()`.
+    - **Batch + transient-pause state is reset on switch — and the batch is dropped BEFORE
+      `quiesce()` fires (review blocker).** quiesce's per-take CANCELLED emits run
+      `_on_status_changed` synchronously on the GUI thread, so a still-set `self._batch` could
+      drain to complete mid-switch and fire `_finalize_batch`'s power action (stop ComfyUI /
+      sleep the PC) — the exact same ordering hazard `cancel_pending` already documents and
+      avoids. `_switch_project` therefore nulls `self._batch` and `_stop_paused_local` first,
+      then quiesces (which resets the jobs-level pause flag itself). A stale batch would
+      otherwise also finalize with an empty morning report, its take ids resolving against the
+      wrong document.
     Scope was `jobs.py` + the `main_window` switch path only. Smoke:
-    `smoke_phase2.test_quiesce_on_switch` (pending cancelled+restartable, id sets cleared, the
-    GENERATING take survives and completes, `live_take_ids` tracks it across the call),
-    `test_switch_skips_live_orphans` (the skip-set excludes a live-worker take), and
-    `test_switch_resets_batch_and_pause` (abort leaves the project intact; proceed drops the batch
-    + lifts the pause, headless prompt).
+    `smoke_phase2.test_quiesce_on_switch` (pending cancelled+restartable, stale ids pruned while a
+    live worker keeps its `_stopping` flag, the GENERATING take survives and completes,
+    `live_take_ids` tracks it across the call), `test_switch_skips_live_orphans` (the skip-set
+    excludes a live-worker take), and `test_switch_resets_batch_and_pause` (abort leaves the
+    project intact; proceed drops the batch BEFORE quiesce so the power action provably never
+    fires — asserted via a captured `_perform_power_action` — + lifts the pause, headless prompt).

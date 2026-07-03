@@ -240,7 +240,9 @@ class JobManager(QObject):
         Pure predicate driving the project-switch prompt (drain vs cancel) without touching Qt,
         so the switch decision path stays headless-testable. Scans the live project's takes
         (both backends) rather than pool thread counts, since a queued-but-unstarted local take
-        has no active thread yet but still needs quiescing."""
+        has no active thread yet but still needs quiescing. include_deleted=True deliberately:
+        a take binned while PENDING/GENERATING (H2) is still queue/spend until neutralized, so
+        it still warrants the prompt (unlike pending_count, which is a user-facing tally)."""
         return any(t.status in (STATUS_PENDING, STATUS_GENERATING)
                    for t in self.project.list_takes(include_deleted=True))
 
@@ -250,9 +252,15 @@ class JobManager(QObject):
         Called on `_switch_project` while `self.project` still points at the OUTGOING project.
         Drops the not-yet-started runnables from both pools and marks every still-PENDING take
         CANCELLED (interrupted=True: an app-driven switch cut it short, so it's restartable via
-        rule #17, not a deliberate user cancel), then clears the stale queued-take id sets so the
-        incoming project starts clean - a lingering `_cancelled`/`_stopping`/`_requeue` id would
-        make a same-id take in the new project misbehave.
+        rule #17, not a deliberate user cancel), then prunes the stale queued-take id sets so
+        they can't accumulate across switches. Pruning is an INTERSECTION, not a wholesale
+        clear:
+        - each just-cancelled id is ADDED to `_cancelled` first (the same dequeue race as
+          cancel_pending: a runnable the pool handed to a worker between our scan and clear()
+          must still bail at its `tid in cancelled` check rather than fire the backend);
+        - an id still in `_runners` (a live GENERATING worker) KEEPS its `_stopping`/`_requeue`
+          membership, so a stop/halt requested just before the switch still records
+          CANCELLED/PENDING when that worker unwinds, not a bogus FAILED.
 
         The currently-GENERATING take is deliberately LEFT running: its `GenerationJob` captured
         the OLD `Project` instance at construction, so its write-through still lands in the OLD
@@ -269,14 +277,16 @@ class JobManager(QObject):
         pending = [t for t in self.project.list_takes(include_deleted=True)
                    if t.status == STATUS_PENDING]
         for t in pending:
+            self._cancelled.add(t.id)
             self._runners.pop(t.id, None)
             self.project.update_take(t.id, status=STATUS_CANCELLED,
                                      error="cancelled: switched to another project",
                                      interrupted=True)   # app-driven switch, restartable
             self._signals.status_changed.emit(t.id, STATUS_CANCELLED)
-        self._cancelled.clear()
-        self._stopping.clear()
-        self._requeue.clear()
+        live = set(self._runners)
+        self._cancelled &= live | {t.id for t in pending}
+        self._stopping &= live
+        self._requeue &= live
         return len(pending)
 
     def enqueue(self, take_id: str, backend: str, runner: Runner) -> None:

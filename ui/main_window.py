@@ -414,21 +414,23 @@ class MainWindow(QMainWindow):
         """Swap the open project. Returns False if the user aborted (queued work in flight)."""
         if not self._confirm_switch_with_queued_work():
             return False
-        # Quiesce the OUTGOING project FIRST (self.project/self.jobs.project still point at it):
-        # cancel its queued takes and clear stale queue id sets. The in-flight render is left to
+        # Drop the batch BEFORE quiesce fires its per-take CANCELLED signals (the same order
+        # cancel_pending uses, for the same reason): quiesce's emits run _on_status_changed
+        # synchronously on this thread, so a still-set self._batch could drain to complete
+        # mid-switch and fire _finalize_batch's power action (stop ComfyUI / sleep the PC).
+        # A batch tracked against the OUTGOING project is meaningless anyway - its take ids
+        # resolve against a different document.
+        if self._batch is not None:
+            self._batch = None
+            self._log("switching project: active batch dropped (no power action will run)")
+        self._stop_paused_local = False   # the jobs-level pause flag is reset inside quiesce
+        # Quiesce the OUTGOING project (self.project/self.jobs.project still point at it):
+        # cancel its queued takes and prune stale queue id sets. The in-flight render is left to
         # finish under its original Project instance (its worker holds that reference), whose
         # write-through keeps landing in the OLD takes.json. See jobs.quiesce.
         cancelled = self.jobs.quiesce()
         if cancelled:
             self._log(f"switching project: cancelled {cancelled} queued take(s)")
-        # A batch/transient-stop tracked against the OUTGOING project is now meaningless: its
-        # take ids resolve against a different document. Drop them so a stale batch can't finalize
-        # (empty report + a sleep/stop-ComfyUI power action) while the user works in the new one.
-        if self._batch is not None:
-            self._batch = None
-            self._log("switching project: active batch dropped (no power action will run)")
-        self._stop_paused_local = False
-        self.jobs.clear_local_pause()
         # Both shot tabs and take-viewer tabs reference the old project's shots/takes - close
         # them before swapping the document so nothing dangles.
         for tab in list(self.shot_tabs.values()):
