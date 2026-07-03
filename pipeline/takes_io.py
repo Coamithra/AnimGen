@@ -22,8 +22,15 @@ def _under(p: Path, base: Path) -> bool:
 
 
 def move_to_bin(take, project) -> None:
+    # Per-move atomicity (M13): flip deleted and write through each successful move's new
+    # path AS IT HAPPENS, not once at the end. A transient AV/indexer lock on a later move
+    # (a documented Windows failure mode) then leaves the record consistent with disk - a
+    # file already moved into .bin has its new path recorded and the take is flagged deleted,
+    # rather than the video sitting in .bin while the record still points at the vanished old
+    # path and is never marked deleted. restore_from_bin restores such a partial bin cleanly
+    # (it moves back only files actually under .bin, skipping any that never moved).
     dest_dir = project.bin_dir / take.id
-    updates: dict = {"deleted": True}
+    project.update_take(take.id, deleted=True)
     for field in _FILE_FIELDS:
         val = getattr(take, field)
         if not val:
@@ -33,8 +40,7 @@ def move_to_bin(take, project) -> None:
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / p.name
             shutil.move(str(p), str(dest))
-            updates[field] = str(dest)
-    project.update_take(take.id, **updates)
+            project.update_take(take.id, **{field: str(dest)})
 
 
 def restore_from_bin(take, project) -> None:
