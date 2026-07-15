@@ -29,7 +29,7 @@ Card -> worktree -> PR runbook: follow `~/.claude/CONTRIBUTING.md` (the global g
 
 - **Board:** Animation Generator Tool (https://trello.com/b/7SycR6UZ), id `6a2d752eee5f9d7478ad3250`, remote `trello` backend. Lists: To Do -> In Progress -> Done (plus a Notes / Decisions list). Atomic pickup: `trello --board 6a2d752eee5f9d7478ad3250 grab --from "To Do" --to "In Progress"`.
 - **Default branch:** `main`. **GitHub:** `Coamithra/AnimGen` (public; unprotected `main` -> PR + self-merge, no approval needed).
-- **Worktrees:** `.trees/wt<k>` (fixed slots `wt1`..`wt8`, gitignored). Bootstrap before running anything: `python -m venv .venv` then `.venv/Scripts/python.exe -m pip install -r requirements.txt`. A fresh worktree also lacks `data/` (runtime projects) - re-seed the starter project if the card needs it. From a worktree, smoke phase 6 needs the real Fighter root - prefix `ANIMGEN_FIGHTER_ROOT=C:/Programming/Fighter`.
+- **Worktrees:** `.trees/wt<k>` (fixed slots `wt1`..`wt8`, gitignored). Bootstrap before running anything: `python -m venv .venv` then `.venv/Scripts/python.exe -m pip install -r requirements.txt`. A fresh worktree also lacks `data/` (runtime projects) - re-seed the starter project if the card needs it. From a worktree, smoke phase 6 needs the real Fighter root - prefix `ANIMGEN_FIGHTER_ROOT=C:/Programming/Fighterproto/sprite-lab` (the source project lives at `../Fighterproto`, and its seed manifest + keypose assets were reorganized under `sprite-lab/`, so the var must point at that subdir - the repo root no longer has `scripts/game_sprites_manifest.json` or `assets/`).
 - **Verification gate:** the headless smoke suite IS the gate (no typecheck/build). Run phases 1-7 and **gate on the EXIT CODE, not the "PASS" line** (a teardown segfault after PASS still exits 139): `QT_QPA_PLATFORM=offscreen PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/smoke_phase<n>.py` for n in 1..7, breaking on a non-zero rc. Add/extend a phase for behaviour you changed; smoke tests stay headless (never `.exec()` a modal). Phase 8 (offline mock-ComfyUI integration) is opt-in. Manual UI verification via the built-in control server (`ANIMGEN_REMOTE=1` + `scripts/remote_cli.py`), NOT desktop computer-use.
 - **Cost/GPU gate:** a live hosted (Replicate) or local (ComfyUI) take spends money / GPU - fire one ONLY with the user's explicit go-ahead for that card. Driving the UI is free; verify backends offline (`scripts/mock_comfy.py` is the GPU-free harness). The cost-confirm gate still appears and must be driven, never bypassed.
 
@@ -298,7 +298,9 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
 
 ## External wiring (overridable env vars)
 
-- `ANIMGEN_FIGHTER_ROOT` (default `../Fighter`) — keypose assets + the seed manifest.
+- `ANIMGEN_FIGHTER_ROOT` (code default `../Fighter`) — keypose assets + the seed manifest.
+  On this machine the source project is `../Fighterproto` and its manifest/assets sit under
+  `sprite-lab/`, so point it at `C:/Programming/Fighterproto/sprite-lab` to seed / run phase 6.
 - `ANIMGEN_COMFY_DIR` (default `../comfyui`) — local ComfyUI (input/output dirs).
 - **`REPLICATE_TOKEN`** — read from the environment, then a repo-local `.env`, then
   the source project's `.env`. The token is **never committed** (`.env` is gitignored).
