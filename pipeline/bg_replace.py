@@ -65,12 +65,12 @@ def nearest_chroma(rgb: tuple[int, int, int], max_dist: float = 90.0) -> Optiona
     """Snap an (r, g, b) to the nearest SUPPORTED_CHROMA name, or None if none is within
     `max_dist` (Euclidean in RGB) — the caller then prefills AUTO."""
     best: Optional[str] = None
-    best_d: Optional[float] = None
+    best_d = float("inf")
     for name, c in SUPPORTED_CHROMA.items():
         d = ((rgb[0] - c[0]) ** 2 + (rgb[1] - c[1]) ** 2 + (rgb[2] - c[2]) ** 2) ** 0.5
-        if best_d is None or d < best_d:
+        if d < best_d:
             best, best_d = name, d
-    return best if best_d is not None and best_d <= max_dist else None
+    return best if best_d <= max_dist else None
 
 
 def unmix_chroma(px: np.ndarray, bg_rgb, fg_max: int = _FG_MAX, bg_min: int = _BG_MIN) -> np.ndarray:

@@ -994,9 +994,10 @@ spend — but the cost-confirm gate (rule #1) still appears and must be driven.
     `Image.open().convert("RGB")` would drop alpha unpredictably. **Both flows persist the clean
     transparent sprite** as the asset's reusable reference (`Project.store_transparent_ref` →
     `.assets/.originals/<name>.png` + `assets_meta.json`), so a later re-fill **reuses that
-    transparent original** (`transparent_ref` → `composite_over`) instead of re-keying the
-    background we just added — the reuse path must NOT call `key_to_transparent` (spied in the
-    smoke test). The generalized unmix is magenta/green/blue-capable but the analytic assumption
+    transparent original** (`transparent_ref` → `composite_over`, recording only the new fill via
+    `set_asset_meta`) instead of re-keying the background we just added — the reuse path must NOT
+    call `key_to_transparent` (spied in the smoke test) and must NOT record a `source_chroma` it
+    never applied. The dialog disables its source selector when reusing. The generalized unmix is magenta/green/blue-capable but the analytic assumption
     is "fg must not lean the screen colour" (documented in `unmix_chroma`), same constraint as
     the TS original. Generation-time keying was deliberately left alone (a follow-up could have
     `render_keyposes` prefer the stored soft-alpha `transparent_ref`, but that touches the

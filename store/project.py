@@ -293,13 +293,19 @@ class Project:
     def _assets_meta_path(self) -> Path:
         return self._assets_dir / "assets_meta.json"
 
-    def _load_assets_meta(self) -> dict:
+    def _load_assets_meta(self, strict: bool = False) -> dict:
+        """Read the {filename: entry} map. `strict=True` (mutating callers) RAISES on a
+        present-but-unreadable file so a read-modify-write can't clobber every other asset's
+        entry on a transient Windows AV/indexer lock (rule #20); `strict=False` (read-only
+        accessors) tolerates it and falls back to empty."""
         try:
             doc = json.loads(self._assets_meta_path().read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {}
         except (OSError, ValueError):
-            return {}                                   # unreadable -> treat as empty (read-only)
+            if strict:
+                raise
+            return {}
         m = doc.get("assets")
         return m if isinstance(m, dict) else {}
 
@@ -315,7 +321,7 @@ class Project:
         """Merge `fields` into the asset's metadata entry (None values are skipped)."""
         name = Path(asset_path).name
         with self._lock:
-            meta = self._load_assets_meta()
+            meta = self._load_assets_meta(strict=True)
             entry = meta.get(name, {})
             entry.update({k: v for k, v in fields.items() if v is not None})
             meta[name] = entry
@@ -327,10 +333,10 @@ class Project:
         name = Path(asset_path).name
         rel = f".originals/{_safe_name(name)}.png"
         with self._lock:
-            dest = self._assets_dir / rel
+            meta = self._load_assets_meta(strict=True)  # before the image write: a strict raise
+            dest = self._assets_dir / rel               # must not leave an orphan .originals png
             dest.parent.mkdir(parents=True, exist_ok=True)
             image.save(dest)                            # PNG preserves alpha
-            meta = self._load_assets_meta()
             entry = meta.get(name, {})
             entry["transparent_ref"] = rel
             entry.update({k: v for k, v in fields.items() if v is not None})
@@ -356,7 +362,10 @@ class Project:
         """Drop an asset's metadata entry and unlink its stored transparent reference."""
         name = Path(asset_path).name
         with self._lock:
-            meta = self._load_assets_meta()
+            try:
+                meta = self._load_assets_meta(strict=True)
+            except (OSError, ValueError):
+                return                                  # unreadable: leave it, don't clobber
             entry = meta.pop(name, None)
             if not entry:
                 return

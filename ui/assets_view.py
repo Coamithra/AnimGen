@@ -146,7 +146,10 @@ class AssetsView(QWidget):
             prefill = bg_replace.nearest_chroma(corner) or bg_replace.AUTO
         except Exception:  # noqa: BLE001
             prefill = bg_replace.AUTO
-        dlg = BackgroundReplaceDialog(prefill, parent=self)
+        # A stored transparent reference is reused (a re-fill), so the source screen won't be
+        # re-keyed - reflect that in the dialog instead of offering an inert source choice.
+        reusing = bool(self.project.asset_meta(targets[0]).get("transparent_ref"))
+        dlg = BackgroundReplaceDialog(prefill, reusing=reusing, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._apply_replace_background(targets, dlg.source(), dlg.fill_rgb())
@@ -154,22 +157,32 @@ class AssetsView(QWidget):
     def _apply_replace_background(self, targets, source, fill_rgb) -> None:
         """Key `source` out of each target and composite onto `fill_rgb`, overwriting the asset
         in place (same path, so shots keep referencing it). Reuses a stored transparent
-        reference when present (a lossless re-fill), else keys the current asset and stores the
-        result as the reference."""
+        reference when present (a lossless re-fill that does NOT re-key, so it records only the
+        new fill - never a `source_chroma` that wasn't actually applied), else keys the current
+        asset and stores the result as the reference."""
         from pipeline import bg_replace
+        done = 0
         for pth in targets:
             try:
                 transparent = self.project.transparent_ref(pth)
                 if transparent is not None:
                     opaque = bg_replace.composite_over(transparent, fill_rgb)
+                    opaque.save(pth)
+                    self.project.set_asset_meta(pth, target_fill=list(fill_rgb))
                 else:
                     img = bg_replace.load_image(pth)
                     opaque, transparent = bg_replace.replace_background(img, source, fill_rgb)
-                opaque.save(pth)
-                self.project.store_transparent_ref(
-                    pth, transparent, source_chroma=source, target_fill=list(fill_rgb))
+                    opaque.save(pth)
+                    self.project.store_transparent_ref(
+                        pth, transparent, source_chroma=source, target_fill=list(fill_rgb))
+                done += 1
             except Exception:  # noqa: BLE001 - one asset's failure shouldn't abort the rest
                 pass
+        if done < len(targets):
+            QMessageBox.warning(
+                self, "Replace background",
+                f"Replaced the background on {done} of {len(targets)} asset(s); "
+                "the rest could not be processed.")
         self.load()
         self.changed.emit()
 

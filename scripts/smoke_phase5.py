@@ -1995,6 +1995,20 @@ def test_asset_meta() -> None:
     ref_path = reopened.assets_dir / reopened.asset_meta(victim)["transparent_ref"]
     assert ref_path.is_file()
 
+    # rule #20: a mutating op must REFUSE to clobber a present-but-unreadable meta file rather
+    # than read {} and wipe every other asset's entry (M11). Corrupt it, prove set_asset_meta
+    # raises and leaves the bytes untouched, then restore for the remove check below.
+    meta_file = reopened._assets_meta_path()
+    good = meta_file.read_bytes()
+    meta_file.write_text("{ not json", encoding="utf-8")
+    raised = False
+    try:
+        reopened.set_asset_meta(victim, target_fill=[0, 0, 0])
+    except ValueError:
+        raised = True
+    assert raised and meta_file.read_bytes() == b"{ not json", "unreadable meta not clobbered"
+    meta_file.write_bytes(good)
+
     # remove_asset clears the metadata entry AND unlinks its stored transparent ref
     reopened.remove_asset(victim)
     assert reopened.asset_meta(victim) == {} and not ref_path.is_file()

@@ -359,7 +359,10 @@ def test_bg_replace() -> None:
 
     from pipeline import bg_replace
 
-    def _screen(chroma, fg=(70, 55, 60)):
+    # fg (60,63,58) leans none of the six screens (every channel within ~8 of the others), so
+    # it stays clean foreground under each - exercising both the 2-hi (magenta/cyan/yellow) and
+    # 1-hi (red/green/blue) spill branches.
+    def _screen(chroma, fg=(60, 63, 58)):
         # 64x64: flat chroma bg | an AA blend column | a large opaque fg block (>min_blob)
         arr = np.zeros((64, 64, 3), np.uint8)
         arr[:] = chroma
@@ -367,7 +370,7 @@ def test_bg_replace() -> None:
         arr[:, 23] = [(c + f) // 2 for c, f in zip(chroma, fg)]
         return Image.fromarray(arr, "RGB")
 
-    for name in ("Magenta", "Green", "Blue"):
+    for name in bg_replace.SUPPORTED_CHROMA:
         img = _screen(bg_replace.SUPPORTED_CHROMA[name])
         assert bg_replace.nearest_chroma(bg_replace.sample_corner(img)) == name, name
         opaque, transparent = bg_replace.replace_background(img, name, (255, 0, 255))

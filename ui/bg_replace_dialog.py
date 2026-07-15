@@ -19,7 +19,8 @@ from pipeline import bg_replace
 
 
 class BackgroundReplaceDialog(QDialog):
-    def __init__(self, prefill_source: str, initial_fill=bg_replace.CONTRACT_FILL, parent=None):
+    def __init__(self, prefill_source: str, initial_fill=bg_replace.CONTRACT_FILL,
+                 reusing: bool = False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Replace background")
         self._fill = (int(initial_fill[0]), int(initial_fill[1]), int(initial_fill[2]))
@@ -29,6 +30,13 @@ class BackgroundReplaceDialog(QDialog):
         self.source_combo.addItems(list(bg_replace.SUPPORTED_CHROMA))
         i = self.source_combo.findText(prefill_source)
         self.source_combo.setCurrentIndex(i if i >= 0 else 0)
+        if reusing:
+            # The asset already has a stored transparent sprite; Replace only re-fills it, so
+            # the source screen is not re-keyed. Disable the selector rather than imply it does.
+            self.source_combo.setEnabled(False)
+            self.source_combo.setToolTip(
+                "This asset already has a cleaned transparent sprite — Replace background will "
+                "reuse it and only change the fill (the source screen is not re-keyed).")
 
         self.fill_btn = QPushButton()
         self.fill_btn.clicked.connect(self._pick_fill)
