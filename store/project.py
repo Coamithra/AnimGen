@@ -281,6 +281,103 @@ class Project:
         p = Path(path)
         if _under(p, self._assets_dir) and p.is_file():
             p.unlink(missing_ok=True)
+        self.clear_asset_meta(p)
+
+    # ---- asset background metadata (assets_meta.json + .originals/ sidecar) ----------
+    # Per-asset record written by the Assets tab's "Replace background" / transparent import.
+    # Kept in a sidecar (NOT the .animproj) keyed by asset filename; the stored transparent
+    # reference lets a later re-fill reuse the clean transparent sprite instead of re-keying
+    # the background we just added. Both files live under assets_dir, so save_as carries them
+    # along and the relative transparent_ref needs no path remap. Read on demand (low-frequency
+    # UI actions), not cached in memory.
+    def _assets_meta_path(self) -> Path:
+        return self._assets_dir / "assets_meta.json"
+
+    def _load_assets_meta(self, strict: bool = False) -> dict:
+        """Read the {filename: entry} map. `strict=True` (mutating callers) RAISES on a
+        present-but-unreadable file so a read-modify-write can't clobber every other asset's
+        entry on a transient Windows AV/indexer lock (rule #20); `strict=False` (read-only
+        accessors) tolerates it and falls back to empty."""
+        try:
+            doc = json.loads(self._assets_meta_path().read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            if strict:
+                raise
+            return {}
+        m = doc.get("assets")
+        return m if isinstance(m, dict) else {}
+
+    def _write_assets_meta(self, meta: dict) -> None:
+        _atomic_write_json(self._assets_meta_path(), {"version": VERSION, "assets": meta})
+
+    def asset_meta(self, asset_path: Path | str) -> dict:
+        name = Path(asset_path).name
+        with self._lock:
+            return dict(self._load_assets_meta().get(name, {}))
+
+    def set_asset_meta(self, asset_path: Path | str, **fields) -> None:
+        """Merge `fields` into the asset's metadata entry (None values are skipped)."""
+        name = Path(asset_path).name
+        with self._lock:
+            meta = self._load_assets_meta(strict=True)
+            entry = meta.get(name, {})
+            entry.update({k: v for k, v in fields.items() if v is not None})
+            meta[name] = entry
+            self._write_assets_meta(meta)
+
+    def store_transparent_ref(self, asset_path: Path | str, image, **fields) -> Path:
+        """Save `image` (a transparent RGBA PIL image) under .originals/ as this asset's
+        reusable transparent reference, record it (+ any extra `fields`), and return its path."""
+        name = Path(asset_path).name
+        rel = f".originals/{_safe_name(name)}.png"
+        with self._lock:
+            meta = self._load_assets_meta(strict=True)  # before the image write: a strict raise
+            dest = self._assets_dir / rel               # must not leave an orphan .originals png
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            image.save(dest)                            # PNG preserves alpha
+            entry = meta.get(name, {})
+            entry["transparent_ref"] = rel
+            entry.update({k: v for k, v in fields.items() if v is not None})
+            meta[name] = entry
+            self._write_assets_meta(meta)
+            return dest
+
+    def transparent_ref(self, asset_path: Path | str):
+        """The stored transparent sprite for this asset as a PIL image, or None if none is
+        recorded / the file is missing."""
+        rel = self.asset_meta(asset_path).get("transparent_ref")
+        if not rel:
+            return None
+        p = self._assets_dir / rel
+        if not p.is_file():
+            return None
+        from PIL import Image
+        img = Image.open(p)
+        img.load()                                      # decode now so the file handle closes
+        return img
+
+    def clear_asset_meta(self, asset_path: Path | str) -> None:
+        """Drop an asset's metadata entry and unlink its stored transparent reference."""
+        name = Path(asset_path).name
+        with self._lock:
+            try:
+                meta = self._load_assets_meta(strict=True)
+            except (OSError, ValueError):
+                return                                  # unreadable: leave it, don't clobber
+            entry = meta.pop(name, None)
+            if not entry:
+                return
+            rel = entry.get("transparent_ref")
+            if rel:
+                ref = self._assets_dir / rel
+                if _under(ref, self._assets_dir) and ref.is_file():
+                    try:
+                        ref.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            self._write_assets_meta(meta)
 
     def _migrate_flatten_keyposes(self) -> None:
         """Old projects baked per-shot keyposes into .assets/keyposes/<shot_id>/. Re-point

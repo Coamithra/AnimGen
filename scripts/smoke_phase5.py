@@ -1963,6 +1963,58 @@ def test_purge_cancelled_action_live_on_cancel() -> None:
     print("MainWindow OK: purge-cancelled action enables on queue status change (L12)")
 
 
+def test_asset_meta() -> None:
+    from PIL import Image as PImage
+
+    tmp = Path(tempfile.mkdtemp())
+    project = Project.new()
+    a = tmp / "char.png"
+    PImage.new("RGB", (8, 8), (10, 20, 30)).save(a)
+    asset = project.import_asset(a)
+
+    tr = PImage.new("RGBA", (8, 8), (10, 20, 30, 100))
+    project.store_transparent_ref(asset, tr, source_chroma="Magenta",
+                                  target_fill=[255, 0, 255], imported_transparent=True)
+    meta = project.asset_meta(asset)
+    assert meta["source_chroma"] == "Magenta" and meta["imported_transparent"] is True
+    got = project.transparent_ref(asset)
+    assert got is not None and got.mode == "RGBA" and got.getchannel("A").getextrema()[0] == 100
+
+    # sidecar files are never surfaced as assets
+    names = [p.name for p in project.list_assets()]
+    assert names == ["char.png"], names
+
+    # metadata + the stored ref survive a Save As (the whole .assets sidecar is copied/moved)
+    dest = tmp / "saved.animproj"
+    project.save_as(dest)
+    assert project.asset_meta(project.list_assets()[0])["source_chroma"] == "Magenta"
+    reopened = Project.load(dest)
+    victim = reopened.list_assets()[0]
+    assert reopened.asset_meta(victim)["source_chroma"] == "Magenta"
+    assert reopened.transparent_ref(victim) is not None
+    ref_path = reopened.assets_dir / reopened.asset_meta(victim)["transparent_ref"]
+    assert ref_path.is_file()
+
+    # rule #20: a mutating op must REFUSE to clobber a present-but-unreadable meta file rather
+    # than read {} and wipe every other asset's entry (M11). Corrupt it, prove set_asset_meta
+    # raises and leaves the bytes untouched, then restore for the remove check below.
+    meta_file = reopened._assets_meta_path()
+    good = meta_file.read_bytes()
+    meta_file.write_text("{ not json", encoding="utf-8")
+    raised = False
+    try:
+        reopened.set_asset_meta(victim, target_fill=[0, 0, 0])
+    except ValueError:
+        raised = True
+    assert raised and meta_file.read_bytes() == b"{ not json", "unreadable meta not clobbered"
+    meta_file.write_bytes(good)
+
+    # remove_asset clears the metadata entry AND unlinks its stored transparent ref
+    reopened.remove_asset(victim)
+    assert reopened.asset_meta(victim) == {} and not ref_path.is_file()
+    print("asset_meta OK: transparent ref store/read, survives Save As, remove clears both")
+
+
 if __name__ == "__main__":
     test_save_as_over_neighbour_preserves_doc()
     test_load_corrupt_takes_json_degrades()
@@ -2002,4 +2054,5 @@ if __name__ == "__main__":
     test_purge_cancelled_action_live_on_cancel()
     test_export_starred_takes()
     test_shot_tab_missing_model_commit_and_generate()
+    test_asset_meta()
     print("PHASE 5 SMOKE: PASS")

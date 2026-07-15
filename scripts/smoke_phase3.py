@@ -354,6 +354,47 @@ def test_scale_relative_to_original() -> None:
     print("render_placement OK: scale is relative to the original image, not the cutout")
 
 
+def test_bg_replace() -> None:
+    import numpy as np
+
+    from pipeline import bg_replace
+
+    # fg (60,63,58) leans none of the six screens (every channel within ~8 of the others), so
+    # it stays clean foreground under each - exercising both the 2-hi (magenta/cyan/yellow) and
+    # 1-hi (red/green/blue) spill branches.
+    def _screen(chroma, fg=(60, 63, 58)):
+        # 64x64: flat chroma bg | an AA blend column | a large opaque fg block (>min_blob)
+        arr = np.zeros((64, 64, 3), np.uint8)
+        arr[:] = chroma
+        arr[:, 24:] = fg
+        arr[:, 23] = [(c + f) // 2 for c, f in zip(chroma, fg)]
+        return Image.fromarray(arr, "RGB")
+
+    for name in bg_replace.SUPPORTED_CHROMA:
+        img = _screen(bg_replace.SUPPORTED_CHROMA[name])
+        assert bg_replace.nearest_chroma(bg_replace.sample_corner(img)) == name, name
+        opaque, transparent = bg_replace.replace_background(img, name, (255, 0, 255))
+        a = np.array(transparent)[..., 3]
+        assert a[0, 0] == 0, (name, "bg fully transparent")
+        assert a[0, 40] == 255, (name, "clean fg stays opaque")
+        assert 0 < a[0, 23] < 255, (name, a[0, 23], "AA edge -> soft alpha, not binary")
+        assert opaque.mode == "RGB"
+        assert tuple(int(x) for x in np.array(opaque)[0, 0]) == (255, 0, 255), name
+
+    # non-chroma (grey) corner -> nearest_chroma None -> AUTO binary-threshold fallback
+    arr = np.full((64, 64, 3), 200, np.uint8)
+    arr[16:48, 16:48] = (20, 40, 60)
+    grey = Image.fromarray(arr, "RGB")
+    assert bg_replace.nearest_chroma(bg_replace.sample_corner(grey)) is None
+    ga = np.array(bg_replace.key_to_transparent(grey, bg_replace.AUTO))[..., 3]
+    assert ga[0, 0] == 0 and ga[32, 32] == 255, "AUTO keys the flat corner, keeps the blob"
+
+    assert bg_replace.has_transparency(Image.new("RGBA", (4, 4), (0, 0, 0, 0)))
+    assert not bg_replace.has_transparency(Image.new("RGB", (4, 4), (9, 9, 9)))
+    print("bg_replace OK: analytic unmix soft alpha (magenta/green/blue), AUTO fallback, "
+          "transparency detect")
+
+
 if __name__ == "__main__":
     test_framing()
     test_placement_canvas()
@@ -362,4 +403,5 @@ if __name__ == "__main__":
     test_mode_widget_live_enum()
     test_render_keyposes()
     test_scale_relative_to_original()
+    test_bg_replace()
     print("PHASE 3 SMOKE: PASS")
