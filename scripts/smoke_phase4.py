@@ -316,6 +316,91 @@ def test_assets_view() -> None:
     print("AssetsView OK: import (grid + flat in .assets), remove")
 
 
+def test_replace_background_ui() -> None:
+    import numpy as np
+
+    from PySide6.QtWidgets import QApplication
+
+    from pipeline import bg_replace
+    from ui.assets_view import AssetsView
+    from ui.bg_replace_dialog import BackgroundReplaceDialog
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    tmp = Path(tempfile.mkdtemp())
+    arr = np.zeros((64, 64, 3), np.uint8)
+    arr[:] = (0, 255, 0)                 # green screen
+    arr[16:48, 16:48] = (200, 120, 60)   # opaque character block
+    src = tmp / "greenscreen.png"; Image.fromarray(arr, "RGB").save(src)
+
+    project = Project.new()
+    av = AssetsView(project)
+    av._import_files([str(src)])
+    asset = str(project.list_assets()[0])
+
+    # dialog prefills the source from the corner sample; default fill is the contract magenta
+    prefill = bg_replace.nearest_chroma(bg_replace.sample_corner(Image.open(asset))) or bg_replace.AUTO
+    dlg = BackgroundReplaceDialog(prefill)          # no exec() - headless
+    assert dlg.source() == "Green" and dlg.fill_rgb() == (255, 0, 255)
+
+    # context menu offers Replace background… (built without exec)
+    _menu, acts = av._build_context_menu([asset])
+    assert set(acts) == {"replace_bg", "delete"}
+
+    av._apply_replace_background([asset], dlg.source(), dlg.fill_rgb())
+    corner = tuple(int(x) for x in np.array(Image.open(asset).convert("RGB"))[0, 0])
+    assert corner == (255, 0, 255), corner
+    meta = project.asset_meta(asset)
+    assert meta["source_chroma"] == "Green" and project.transparent_ref(asset) is not None
+
+    # a re-fill REUSES the stored transparent ref instead of re-keying our added magenta:
+    # spy on key_to_transparent - it must not be called on the reuse path
+    calls = []
+    orig = bg_replace.key_to_transparent
+    bg_replace.key_to_transparent = lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+    try:
+        av._apply_replace_background([asset], "Green", (0, 0, 255))
+    finally:
+        bg_replace.key_to_transparent = orig
+    assert calls == [], "re-fill must reuse the stored transparent sprite, not re-key"
+    corner2 = tuple(int(x) for x in np.array(Image.open(asset).convert("RGB"))[0, 0])
+    assert corner2 == (0, 0, 255), corner2
+    print("Replace background OK: prefill, key+fill, re-fill reuses transparent ref (no re-key)")
+
+
+def test_transparent_import_forces_bg() -> None:
+    import numpy as np
+
+    from PySide6.QtWidgets import QApplication
+
+    from pipeline import bg_replace
+    from ui.assets_view import AssetsView
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    tmp = Path(tempfile.mkdtemp())
+    ta = np.zeros((32, 32, 4), np.uint8)
+    ta[8:24, 8:24] = (30, 60, 90, 255)   # opaque char on a transparent background
+    src = tmp / "sprite.png"; Image.fromarray(ta, "RGBA").save(src)
+
+    project = Project.new()
+    av = AssetsView(project)
+    av._import_files([str(src)])
+    asset = next(p for p in project.list_assets() if p.name == "sprite.png")
+
+    im = Image.open(asset)
+    assert not bg_replace.has_transparency(im), "transparent import must be flattened opaque"
+    corner = tuple(int(x) for x in np.array(im.convert("RGB"))[0, 0])
+    assert corner == (255, 0, 255), corner
+    meta = project.asset_meta(asset)
+    assert meta.get("imported_transparent") is True and project.transparent_ref(asset) is not None
+
+    # a fully-opaque import is left untouched (no forced composite, no stored ref)
+    flat = tmp / "flat.png"; Image.new("RGB", (16, 16), (5, 6, 7)).save(flat)
+    av._import_files([str(flat)])
+    fasset = next(p for p in project.list_assets() if p.name == "flat.png")
+    assert "transparent_ref" not in project.asset_meta(fasset)
+    print("Transparent import OK: alpha flattened onto magenta + ref stored; opaque left as-is")
+
+
 def test_asset_picker() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -1305,6 +1390,8 @@ if __name__ == "__main__":
     test_takes_view_stop_rendering_menu()
     test_cancel_remote_spend_on_terminal_failure()
     test_assets_view()
+    test_replace_background_ui()
+    test_transparent_import_forces_bg()
     test_asset_picker()
     test_card_and_window()
     test_framed_row_thumbs()

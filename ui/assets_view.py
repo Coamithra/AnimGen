@@ -11,7 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QIcon, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
-    QFileDialog, QHBoxLayout, QLabel, QListView, QMenu, QMessageBox, QPushButton,
+    QDialog, QFileDialog, QHBoxLayout, QLabel, QListView, QMenu, QMessageBox, QPushButton,
     QVBoxLayout, QWidget,
 )
 
@@ -86,22 +86,92 @@ class AssetsView(QWidget):
         added = 0
         for f in files:
             try:
-                self.project.import_asset(f)
-                added += 1
+                dest = self.project.import_asset(f)
             except Exception:  # noqa: BLE001 - skip unreadable drops
+                continue
+            try:
+                self._prepare_imported_asset(dest)   # force a bg composite if it's transparent
+            except Exception:  # noqa: BLE001 - a prep failure must not lose the import
                 pass
+            added += 1
         if added:
             self.load()
             self.changed.emit()
+
+    def _prepare_imported_asset(self, dest) -> None:
+        """Video models can't take transparency, so an imported RGBA-with-alpha asset gets its
+        transparent areas composited onto the contract magenta at import time (no keying — it's
+        already transparent). The original transparent sprite is stored as this asset's
+        reference so a later Replace background can re-fill it losslessly."""
+        from pipeline import bg_replace
+        img = bg_replace.load_image(dest)
+        if not bg_replace.has_transparency(img):
+            return
+        transparent = img.convert("RGBA")
+        opaque = bg_replace.composite_over(transparent, bg_replace.CONTRACT_FILL)
+        opaque.save(dest)
+        self.project.store_transparent_ref(
+            dest, transparent, imported_transparent=True,
+            target_fill=list(bg_replace.CONTRACT_FILL))
 
     def _context_menu(self, pos) -> None:
         idxs = self.view.selectedIndexes()
         if not idxs:
             return
+        targets = [self.model.itemFromIndex(i).data(_USER_ROLE) for i in idxs]
+        menu, acts = self._build_context_menu(targets)
+        chosen = menu.exec(self.view.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is acts["delete"]:
+            self._delete(targets)
+        elif chosen is acts["replace_bg"]:
+            self._replace_background(targets)
+
+    def _build_context_menu(self, targets):
+        """Build the right-click menu (no .exec(), so it's headless-testable). Returns
+        (menu, {action_key: QAction})."""
         menu = QMenu(self)
-        act_del = menu.addAction(f"Delete {len(idxs)} asset(s)")
-        if menu.exec(self.view.mapToGlobal(pos)) == act_del:
-            self._delete([self.model.itemFromIndex(i).data(_USER_ROLE) for i in idxs])
+        acts = {"replace_bg": menu.addAction("Replace background…")}
+        menu.addSeparator()
+        acts["delete"] = menu.addAction(f"Delete {len(targets)} asset(s)")
+        return menu, acts
+
+    # ---- replace background ---------------------------------------------
+    def _replace_background(self, targets) -> None:
+        from pipeline import bg_replace
+        from ui.bg_replace_dialog import BackgroundReplaceDialog
+        try:
+            corner = bg_replace.sample_corner(bg_replace.load_image(targets[0]))
+            prefill = bg_replace.nearest_chroma(corner) or bg_replace.AUTO
+        except Exception:  # noqa: BLE001
+            prefill = bg_replace.AUTO
+        dlg = BackgroundReplaceDialog(prefill, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._apply_replace_background(targets, dlg.source(), dlg.fill_rgb())
+
+    def _apply_replace_background(self, targets, source, fill_rgb) -> None:
+        """Key `source` out of each target and composite onto `fill_rgb`, overwriting the asset
+        in place (same path, so shots keep referencing it). Reuses a stored transparent
+        reference when present (a lossless re-fill), else keys the current asset and stores the
+        result as the reference."""
+        from pipeline import bg_replace
+        for pth in targets:
+            try:
+                transparent = self.project.transparent_ref(pth)
+                if transparent is not None:
+                    opaque = bg_replace.composite_over(transparent, fill_rgb)
+                else:
+                    img = bg_replace.load_image(pth)
+                    opaque, transparent = bg_replace.replace_background(img, source, fill_rgb)
+                opaque.save(pth)
+                self.project.store_transparent_ref(
+                    pth, transparent, source_chroma=source, target_fill=list(fill_rgb))
+            except Exception:  # noqa: BLE001 - one asset's failure shouldn't abort the rest
+                pass
+        self.load()
+        self.changed.emit()
 
     def _delete(self, targets) -> None:
         if QMessageBox.question(
